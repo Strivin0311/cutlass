@@ -1,0 +1,4 @@
+*.nsys-rep
+*.ncu-rep
+*.log
+build/
