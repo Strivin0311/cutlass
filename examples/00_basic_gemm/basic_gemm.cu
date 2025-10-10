@@ -464,7 +464,7 @@ int main(int argc, const char *arg[]) {
   //
 
   // GEMM problem dimensions.
-  int problem[3] = { 128, 128, 128 };
+  int problem[3] = { 4096, 2048, 1024 };
 
   for (int i = 1; i < argc && i < 4; ++i) {
     std::stringstream ss(arg[i]);
@@ -472,23 +472,27 @@ int main(int argc, const char *arg[]) {
   }
 
   // Scalars used for linear scaling the result of the matrix product.
-  float scalars[2] = { 1, 0 };
+  float scalars[2] = { 0.25, 1.75 };
 
   for (int i = 4; i < argc && i < 6; ++i) {
     std::stringstream ss(arg[i]);
     ss >> scalars[i - 4];
   }
 
-  std::cout << "Running basic GEMM test." << std::endl;
+  std::cout << "Running basic GEMM test with the following configuration: " << std::endl;
   std::cout << "  M = " << problem[0] << std::endl;
   std::cout << "  N = " << problem[1] << std::endl;
   std::cout << "  K = " << problem[2] << std::endl;
   std::cout << "  alpha = " << scalars[0] << std::endl;
   std::cout << "  beta = " << scalars[1] << std::endl;
+  std::cout << std::endl;
 
   //
   // Run the CUTLASS GEMM test.
   //
+
+  std::cout << "Running CUTLASS SGEMM test (C=alpha*A*B + beta*C, where A,B,C are all column-major matrix)." << std::endl;
+  std::cout << std::endl;
 
   cudaError_t result = TestCutlassGemm(
     problem[0],     // GEMM M dimension

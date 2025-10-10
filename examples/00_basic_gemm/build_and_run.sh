@@ -41,8 +41,8 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "Building ${TARGET}"
     echo "$SEP"
 
-    cd $BUILD_ROOT
-    make $TARGET
+    cd $BUILD_ROOT || exit
+    make $TARGET || exit
     cd -
 else
     echo "$SEP"
