@@ -76,6 +76,8 @@
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Define a CUTLASS GEMM template and launch a GEMM kernel.
+// Applys C = alpha * A * B + beta * C
+// where A,B,C are all col-major
 cudaError_t CutlassSgemmNN(
   int M,
   int N,
@@ -116,8 +118,9 @@ cudaError_t CutlassSgemmNN(
   // in host code and passed to kernels by value. These may include pointers, strides, scalars,
   // and other arguments needed by Gemm and its components.
   //
-  // The benefits of this pattern are (1.) a structured, composable strategy for passing host-constructible
-  // arguments to kernels and (2.) minimized initialization overhead on kernel entry.
+  // The benefits of this pattern are: 
+  //  (1.) a structured, composable strategy for passing host-constructible arguments to kernels
+  //  (2.) minimized initialization overhead on kernel entry.
   //
   CutlassGemm::Arguments args({M , N, K},  // Gemm Problem dimensions
                               {A, lda},    // Tensor-ref for source matrix A
@@ -228,6 +231,8 @@ cudaError_t AllocateMatrix(float **matrix, int rows, int columns, int seed = 0) 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Naive reference GEMM computation.
+// Applys C = alpha * A * B + beta * C
+// where A,B,C are all col-major
 __global__ void ReferenceGemm_kernel(
   int M,
   int N,
@@ -282,8 +287,8 @@ cudaError_t ReferenceGemm(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Allocate several matrices in GPU device memory and call a single-precision
-/// CUTLASS GEMM kernel.
+/// Allocate several matrices in GPU device memory 
+// and call a single-precision CUTLASS GEMM kernel.
 cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   cudaError_t result;
 
@@ -292,9 +297,9 @@ cudaError_t TestCutlassGemm(int M, int N, int K, float alpha, float beta) {
   //
 
   // Compute leading dimensions for each matrix.
-  int lda = M;
-  int ldb = K;
-  int ldc = M;
+  int lda = M; // A.shape=(M, K), col-major
+  int ldb = K; // B.shape=(K, N), col-major
+  int ldc = M; // C.shape=(M, N), col-major
 
   // Compute size in bytes of the C matrix.
   size_t sizeof_C = sizeof(float) * ldc * N;
@@ -473,6 +478,13 @@ int main(int argc, const char *arg[]) {
     std::stringstream ss(arg[i]);
     ss >> scalars[i - 4];
   }
+
+  std::cout << "Running basic GEMM test." << std::endl;
+  std::cout << "  M = " << problem[0] << std::endl;
+  std::cout << "  N = " << problem[1] << std::endl;
+  std::cout << "  K = " << problem[2] << std::endl;
+  std::cout << "  alpha = " << scalars[0] << std::endl;
+  std::cout << "  beta = " << scalars[1] << std::endl;
 
   //
   // Run the CUTLASS GEMM test.
