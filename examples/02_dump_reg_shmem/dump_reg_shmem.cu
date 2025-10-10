@@ -30,8 +30,7 @@
  **************************************************************************************************/
 
 /*! \file
-  \brief Demonstrate CUTLASS debugging tool for dumping fragments and shared
-  memory
+  \brief Demonstrate CUTLASS debugging tool for dumping fragments and shared memory
  */
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -89,20 +88,24 @@ __global__ void kernel_dump(typename GmemIterator::Params params,
 
   // Call dump_fragment() with different parameters.
   if (threadIdx.x == 0 && blockIdx.x == 0)
-    printf("\nAll threads dump all the elements:\n");
+    printf("\nAll threads in any block dump all the elements:\n");
   cutlass::debug::dump_fragment(frag);
 
   if (threadIdx.x == 0 && blockIdx.x == 0)
-    printf("\nFirst thread dumps all the elements:\n");
+    printf("\nFirst thread in any block dumps all the elements:\n");
   cutlass::debug::dump_fragment(frag, /*N = */ 1);
 
   if (threadIdx.x == 0 && blockIdx.x == 0)
-    printf("\nFirst thread dumps first 16 elements:\n");
+    printf("\nFirst thread in any block dumps first 16 elements:\n");
   cutlass::debug::dump_fragment(frag, /*N = */ 1, /*M = */ 16);
 
   if (threadIdx.x == 0 && blockIdx.x == 0)
-    printf("\nFirst thread dumps first 16 elements with a stride of 8:\n");
+    printf("\nFirst thread in any block dumps first 16 elements with a stride of 8:\n");
   cutlass::debug::dump_fragment(frag, /*N = */ 1, /*M = */ 16, /*S = */ 8);
+
+  if (threadIdx.x == 0 && blockIdx.x == 0)
+    printf("\nFirst two threads in any block dumps first 8 elements with a stride of 2:\n");
+  cutlass::debug::dump_fragment(frag, /*N = */ 2, /*M = */ 8, /*S = */ 2);
 
   // Construct the shared iterator and store the data to the shared memory.
   SmemIterator smem_iterator(
@@ -114,12 +117,13 @@ __global__ void kernel_dump(typename GmemIterator::Params params,
   smem_iterator.store(frag);
 
   // Call dump_shmem() with different parameters.
-  if (threadIdx.x == 0 && blockIdx.x == 0) printf("\nDump all the elements:\n");
+  if (threadIdx.x == 0 && blockIdx.x == 0) 
+    printf("\nDump all the elements in the shared memory:\n");
   cutlass::debug::dump_shmem(shared_storage,
                              EXAMPLE_MATRIX_ROW * EXAMPLE_MATRIX_COL);
 
   if (threadIdx.x == 0 && blockIdx.x == 0)
-    printf("\nDump all the elements with a stride of 8:\n");
+    printf("\nDump all the elements in the shared memory with a stride of 8:\n");
   cutlass::debug::dump_shmem(
       shared_storage, EXAMPLE_MATRIX_ROW * EXAMPLE_MATRIX_COL, /*S = */ 8);
 }
@@ -127,6 +131,9 @@ __global__ void kernel_dump(typename GmemIterator::Params params,
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Entry point for dump_reg_shmem example.
+// 
+// NOTE: the `TileIterator` concept has been deprecated since CUTLASS 3.0, 
+// and been replaced by CuTe's `cute::Tensor`
 //
 // usage:
 //
@@ -143,10 +150,10 @@ int main() {
                                                 matrix.capacity());
 
   // Dump the matrix.
-  std::cout << "Matrix:\n" << matrix.host_view() << "\n";
+  std::cout << "Matrix (M=" << EXAMPLE_MATRIX_ROW << ", N=" << EXAMPLE_MATRIX_COL << ", col-major):\n" << matrix.host_view() << "\n";
 
   // Copy the matrix to the device.
-  matrix.sync_device();
+  matrix.sync_device(); // H2D
 
   // Define a global iterator, a shared iterator and their thread map.
   using ThreadMap = cutlass::transform::PitchLinearWarpRakedThreadMap<
