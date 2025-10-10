@@ -102,6 +102,7 @@ cudaError_t CutlassSgemmNN(
 
   using ColumnMajor = cutlass::layout::ColumnMajor;
 
+  // Applys C = alpha * A * B + beta * C
   using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
                                                   ColumnMajor,  // Layout of A matrix
                                                   float,        // Data-type of B matrix
@@ -479,7 +480,7 @@ int main(int argc, const char *arg[]) {
     ss >> scalars[i - 4];
   }
 
-  std::cout << "Running basic GEMM test with the following configuration: " << std::endl;
+  std::cout << "Running basic GEMM example with the following configuration: " << std::endl;
   std::cout << "  M = " << problem[0] << std::endl;
   std::cout << "  N = " << problem[1] << std::endl;
   std::cout << "  K = " << problem[2] << std::endl;
@@ -491,7 +492,7 @@ int main(int argc, const char *arg[]) {
   // Run the CUTLASS GEMM test.
   //
 
-  std::cout << "Running CUTLASS SGEMM test (C=alpha*A*B + beta*C, where A,B,C are all column-major matrix)." << std::endl;
+  std::cout << "Running CUTLASS SGEMM test (C=alpha*A*B + beta*C, where A,B,C are all column-major matrices)." << std::endl;
   std::cout << std::endl;
 
   cudaError_t result = TestCutlassGemm(

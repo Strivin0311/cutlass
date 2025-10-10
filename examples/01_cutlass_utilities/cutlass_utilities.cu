@@ -115,10 +115,12 @@
 // Defines cutlass::reference::host::Gemm()
 #include "cutlass/util/reference/host/gemm.h"
 
-#pragma warning( disable : 4503)
+#pragma warning( disable : 4503) // disable the warning: `warning C4503: decorated name length exceeded, name was truncated`
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Define a CUTLASS GEMM template and launch a GEMM kernel.
+// Applys C = alpha * A * B + beta * C
+// where A,B,C are all col-major
 cudaError_t cutlass_hgemm_nn(
   int M,
   int N,
@@ -133,6 +135,7 @@ cudaError_t cutlass_hgemm_nn(
   cutlass::layout::ColumnMajor::Stride::Index ldc) {
 
   // Define the GEMM operation
+  // Applys C = alpha * A * B + beta * C
   using Gemm = cutlass::gemm::device::Gemm<
     cutlass::half_t,                           // ElementA
     cutlass::layout::ColumnMajor,              // LayoutA
@@ -143,15 +146,17 @@ cudaError_t cutlass_hgemm_nn(
   >;
 
   Gemm gemm_op;
-  
-  cutlass::Status status = gemm_op({
-    {M, N, K},
-    {A, lda},
-    {B, ldb},
-    {C, ldc},
-    {C, ldc},
-    {alpha, beta}
+
+  Gemm::Arguments args({
+    {M, N, K}, // Gemm Problem dimensions
+    {A, lda}, // Tensor-ref for source matrix A
+    {B, ldb}, // Tensor-ref for source matrix B
+    {C, ldc}, // Tensor-ref for source matrix C
+    {C, ldc}, // Tensor-ref for destination matrix D (may be different memory than source C matrix)
+    {alpha, beta} // Scalars used in the Epilogue
   });
+  
+  cutlass::Status status = gemm_op(args);
 
   if (status != cutlass::Status::kSuccess) {
     return cudaErrorUnknown;
@@ -202,8 +207,9 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
   // to be non-zero. A value of "0" here truncates random values to integers
   int bits_less_than_one = 0;
 
+  // Initialize device data with random guassian values
   cutlass::reference::device::TensorFillRandomGaussian(
-    A.device_view(),
+    A.device_view(), // get the TensorView for the device-side tensor
     seed,
     mean,
     stddev,
@@ -211,7 +217,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
   );
   
   cutlass::reference::device::TensorFillRandomGaussian(
-    B.device_view(),
+    B.device_view(), // get the TensorView for the device-side tensor
     seed * 2019,
     mean,
     stddev,
@@ -219,7 +225,7 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
   );
   
   cutlass::reference::device::TensorFillRandomGaussian(
-    C_cutlass.device_view(),
+    C_cutlass.device_view(), // get the TensorView for the device-side tensor
     seed * 1993,
     mean,
     stddev,
@@ -228,13 +234,14 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
 
 
   // Copy C_cutlass into C_reference so the GEMM is correct when beta != 0.
-  cutlass::device_memory::copy_device_to_device(
-    C_reference.device_data(), 
-    C_cutlass.device_data(), 
-    C_cutlass.capacity());
+  cutlass::device_memory::copy_device_to_device( // D2D
+    C_reference.device_data(),  // get the device ptr
+    C_cutlass.device_data(), // get the device ptr
+    C_cutlass.capacity()
+  );
 
   // Copy the device-side view into host memory
-  C_reference.sync_host();
+  C_reference.sync_host(); // D2H
 
   //
   // Launch the CUTLASS GEMM kernel
@@ -246,12 +253,12 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
     K,
     alpha,
     A.device_data(),
-    A.stride(0),
+    A.stride(0), // lda, due to column-major layout
     B.device_data(),
-    B.stride(0),
+    B.stride(0), // ldb, due to column-major layout
     beta,
     C_cutlass.device_data(),
-    C_cutlass.stride(0)
+    C_cutlass.stride(0) // ldc, due to column-major layout
   );
 
   if (result != cudaSuccess) {
@@ -264,13 +271,14 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
 
   // A and B were initialized using device-side procedures. The intent of this example is to
   // use the host-side reference GEMM, so we must perform a device-to-host copy.
-  A.sync_host();
-  B.sync_host();
+  A.sync_host(); // D2H
+  B.sync_host(); // D2H
 
   // Copy CUTLASS's GEMM results into host memory.
-  C_cutlass.sync_host();
+  C_cutlass.sync_host(); // D2H
 
   // Compute the reference result using the host-side GEMM reference implementation.
+  // Applys C = alpha * A * B + beta * C
   cutlass::reference::host::Gemm<
     cutlass::half_t,                           // ElementA
     cutlass::layout::ColumnMajor,              // LayoutA
@@ -293,8 +301,9 @@ cudaError_t TestCutlassGemm(int M, int N, int K, cutlass::half_t alpha, cutlass:
 
   // Compare reference to computed results.
   if (!cutlass::reference::host::TensorEquals(
-    C_reference.host_view(), 
-    C_cutlass.host_view())) {
+    C_reference.host_view(),
+    C_cutlass.host_view()
+  )) {
 
     char const *filename = "errors_01_cutlass_utilities.csv";
 
@@ -356,7 +365,7 @@ int main(int argc, const char *arg[]) {
   //
 
   // GEMM problem dimensions: <M> <N> <K>
-  int problem[3] = { 128, 128, 128 };
+  int problem[3] = { 1024, 512, 256 };
 
   for (int i = 1; i < argc && i < 4; ++i) {
     std::stringstream ss(arg[i]);
@@ -368,7 +377,7 @@ int main(int argc, const char *arg[]) {
   //
   // Values outside the range of IEEE FP16 will overflow to infinity or underflow to zero.
   //
-  cutlass::half_t scalars[2] = { 1.0_hf, 0.0_hf };
+  cutlass::half_t scalars[2] = { 0.25_hf, 1.75_hf };
 
   for (int i = 4; i < argc && i < 6; ++i) {
     std::stringstream ss(arg[i]);
@@ -376,9 +385,20 @@ int main(int argc, const char *arg[]) {
     ss >> scalars[i - 4];   // lexical cast to cutlass::half_t
   }
 
+  std::cout << "Running CuTLASS utilities example with the following configuration: " << std::endl;
+  std::cout << "  M = " << problem[0] << std::endl;
+  std::cout << "  N = " << problem[1] << std::endl;
+  std::cout << "  K = " << problem[2] << std::endl;
+  std::cout << "  alpha = " << scalars[0] << std::endl;
+  std::cout << "  beta = " << scalars[1] << std::endl;
+  std::cout << std::endl;
+
   //
   // Run the CUTLASS GEMM test.
   //
+
+  std::cout << "Running CUTLASS SGEMM test (C=alpha*A*B + beta*C, where A,B,C are all column-major matrices)." << std::endl;
+  std::cout << std::endl;
 
   result = TestCutlassGemm(
     problem[0],     // GEMM M dimension
