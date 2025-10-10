@@ -1,13 +1,14 @@
 
 #!/bin/bash
 
+# NOTE: you should run `cmake_all.sh` in the root directory first before running this script
+
 SEP="--------------------------------------------------------------------"
 
-BUILD_ROOT=build
-SRC_ROOT=.
-COMMON_INCLUDE=../common
+BUILD_ROOT=../../build
+SRC_ROOT=examples/00_basic_gemm
 
-TARGET=basic_gemm
+TARGET=00_basic_gemm
 
 # default not skip any step except profiling
 SKIP_BUILD=false
@@ -40,14 +41,9 @@ if [ "$SKIP_BUILD" = false ]; then
     echo "Building ${TARGET}"
     echo "$SEP"
 
-    rm -rf $BUILD_ROOT && mkdir -p $BUILD_ROOT || exit
-
-    NVCC_GENCODE="arch=compute_90,code=sm_90"
-
-    nvcc -ccbin g++ -gencode=$NVCC_GENCODE \
-    -lcuda -lcudart \
-    -I${COMMON_INCLUDE} \
-    -o $BUILD_ROOT/$TARGET $SRC_ROOT/$TARGET.cu
+    cd $BUILD_ROOT
+    make $TARGET
+    cd -
 else
     echo "$SEP"
     echo "Skipping build process"
@@ -56,7 +52,7 @@ fi
 
 # run
 
-CMD=$BUILD_ROOT/$TARGET
+CMD=$BUILD_ROOT/$SRC_ROOT/$TARGET
 
 if [ "$SKIP_RUN" = false ]; then
     echo "$SEP"
