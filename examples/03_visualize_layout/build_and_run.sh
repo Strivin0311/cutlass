@@ -52,8 +52,9 @@ fi
 
 # run
 
-CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET RowMajor --extent=16,8 --output-shape=8 --vectorize=1"
+# CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET RowMajor --extent=16,8 --output-shape=8 --vectorize=1"
 # CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET ColumnMajor --extent=16,8 --output-shape=16 --vectorize=1"
+CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET PitchLinear --extent=16,8 --output-shape=8 --vectorize=1"
 
 # CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET RowMajorInterleaved<1> --extent=16,8 --output-shape=8 --vectorize=1"
 # CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET RowMajorInterleaved<1> --extent=16,8 --output-shape=8 --vectorize=4"
