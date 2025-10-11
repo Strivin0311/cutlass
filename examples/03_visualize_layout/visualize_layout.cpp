@@ -104,17 +104,17 @@ void print_usage(std::ostream &out) {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Entry point
-int main(int argc, char const *arg[]) {
+int main(int argc, char const *argv[]) {
 
   RegisterLayouts(layouts);
 
-  if (argc == 1 || (std::string(arg[0]) == "-h" || std::string(arg[1]) == "--help")) {
+  if (argc == 1 || (std::string(argv[0]) == "-h" || std::string(argv[1]) == "--help")) {
     print_usage(std::cout);
     return 0;
   }
 
   // parse command line, skipping layout name
-  cutlass::CommandLine cmd_line(argc - 1, arg + 1);
+  cutlass::CommandLine cmd_line(argc - 1, argv + 1);
   Options options(cmd_line);
 
   if (options.help) {
@@ -126,13 +126,19 @@ int main(int argc, char const *arg[]) {
     return -1;
   }
 
-  std::string layout_name = arg[1];
+  std::string layout_name = argv[1];
 
   auto layout_it = layouts.find(layout_name);
   if (layout_it == layouts.end()) {
     std::cerr << "Layout '" << layout_name << "' not supported." << std::endl;
     return -1;
   }
+
+  std::cout << "Visualizing layout: " << layout_name;
+  std::cout << "(extent=[" << options.extent[0] << ", " << options.extent[1] << "]";
+  std::cout << ", vectorize=" << options.vectorize;
+  std::cout << ")" << std::endl;
+  std::cout << std::endl;
 
   bool passed  = layout_it->second->visualize(options);
   if (!passed) {

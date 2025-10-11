@@ -53,73 +53,100 @@ void RegisterLayouts(std::map<std::string, std::unique_ptr<VisualizeLayoutBase> 
     char const *name;
     VisualizeLayoutBase *ptr;
   } layout_pairs[] = {
-
       {"PitchLinear", new VisualizeLayout<cutlass::layout::PitchLinear>},
       {"ColumnMajor", new VisualizeLayout<cutlass::layout::ColumnMajor>},
       {"RowMajor", new VisualizeLayout<cutlass::layout::RowMajor>},
-      {"ColumnMajorInterleaved<4>",
-       new VisualizeLayout<cutlass::layout::ColumnMajorInterleaved<4>>},
+      {"RowMajorInterleaved<1>",
+       new VisualizeLayout<cutlass::layout::RowMajorInterleaved<1>>},
+       {"RowMajorInterleaved<2>",
+       new VisualizeLayout<cutlass::layout::RowMajorInterleaved<2>>},
       {"RowMajorInterleaved<4>",
        new VisualizeLayout<cutlass::layout::RowMajorInterleaved<4>>},
+      {"RowMajorInterleaved<8>",
+       new VisualizeLayout<cutlass::layout::RowMajorInterleaved<8>>},
+      {"ColumnMajorInterleaved<1>",
+       new VisualizeLayout<cutlass::layout::ColumnMajorInterleaved<1>>},
+      {"ColumnMajorInterleaved<2>",
+       new VisualizeLayout<cutlass::layout::ColumnMajorInterleaved<2>>},
+      {"ColumnMajorInterleaved<4>",
+       new VisualizeLayout<cutlass::layout::ColumnMajorInterleaved<4>>},
+      {"ColumnMajorInterleaved<8>",
+       new VisualizeLayout<cutlass::layout::ColumnMajorInterleaved<8>>},
+      
       // All Ampere/Turing H/Integer matrix multiply tensor core kernels uses the same swizzling
       // layout implementation with different templates.
-      //
+      
       // mma.sync.aligned.m8n8k128.s32.b1.b1.s32 Interleaved-256
       // mma.sync.aligned.m16n8k256.s32.b1.b1.s32 Interleaved-256
       {"TensorOpMultiplicand<1,256>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<1, 256>>},
+      
       // mma.sync.aligned.m8n8k128.s32.b1.b1.s32 TN kblock512
       // mma.sync.aligned.m16n8k256.s32.b1.b1.s32 TN kblock512
       {"TensorOpMultiplicand<1,512>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<1, 512>>},
+      
       // mma.sync.aligned.m16n8k256.s32.b1.b1.s32 TN kblock1024
       {"TensorOpMultiplicand<1,1024>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<1, 1024>>},
+      
       // Integer matrix multiply.int4 8832  Interleaved-64
       // Integer matrix multiply.int4 16864 Interleaved-64
       {"TensorOpMultiplicand<4,64>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<4, 64>>},
+      
       // Integer matrix multiply.int4 8832  TN kblock128
       // Integer matrix multiply.int4 16864 TN kblock128
       {"TensorOpMultiplicand<4,128>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<4, 128>>},
+      
       // Integer matrix multiply.int4 16864 TN kblock256
       {"TensorOpMultiplicand<4,256>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<4, 256>>},
+      
       // Integer matrix multiply 8816  Interleaved-32
       // Integer matrix multiply 16832 Interleaved-32
       {"TensorOpMultiplicand<8,32>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<8, 32>>},
+      
       // Integer matrix multiply 8816  TN kblock64
       // Integer matrix multiply 16832 TN kblock64
       {"TensorOpMultiplicand<8,64>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<8, 64>>},
+      
       // Integer matrix multiply 16832 TN kblock128
       {"TensorOpMultiplicand<8,128>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<8, 128>>},
+      
       // Matrix Multiply 1688  TN kblock32
       // Matrix multiply 16816 TN kblock32
       {"TensorOpMultiplicand<16,32>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<16, 32>>},
+      
       // Matrix multiply 1688  NT
       // Matrix multiply 16816 NT
       // Matrix multiply 16816 TN kblock64
       {"TensorOpMultiplicand<16,64>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<16, 64>>},
+      
       // Matrix multiply 1688.TF32 TN kblock16
       {"TensorOpMultiplicand<32,16>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<32, 16>>},
+      
       // Matrix multiply 1688.TF32 TN kblock32
       {"TensorOpMultiplicand<32,32>",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand<32, 32>>},
+      
       // Matrix multiply 1688 NT
       {"TensorOpMultiplicandCongruous<32,32>",
        new VisualizeLayout<
            cutlass::layout::TensorOpMultiplicandCongruous<32, 32>>},
+      
       // Matrix multiply 884 NT
       {"TensorOpMultiplicandCongruous<64,16>",
        new VisualizeLayout<
            cutlass::layout::TensorOpMultiplicandCongruous<64, 16>>},
+      
       // Matrix multiply 884 TN
       {"TensorOpMultiplicand64bCrosswise",
        new VisualizeLayout<cutlass::layout::TensorOpMultiplicand64bCrosswise>},
