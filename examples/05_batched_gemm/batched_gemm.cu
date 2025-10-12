@@ -121,15 +121,19 @@ cudaError_t cutlass_array_sgemm(
 
   Gemm gemm_op;
 
-  cutlass::Status status = gemm_op({
-    {m, n, k},
-    A, lda,
-    B, ldb,
-    C, ldc,
-    C, ldc,
-    {alpha, beta},
-    batch_count
+  Gemm::EpilogueOutputOp::Params params({alpha, beta});
+
+  Gemm::Arguments args({
+    {m, n, k}, // problem_size
+    A, lda, // ptrA, lda
+    B, ldb, // ptrB, ldb
+    C, ldc, // ptrC, ldc
+    C, ldc, // ptrD, ldd
+    params, // epilogue
+    batch_count // num_batchs
   });
+
+  cutlass::Status status = gemm_op(args);
 
   if (status != cutlass::Status::kSuccess) {
     return cudaErrorUnknown;
@@ -163,19 +167,23 @@ cudaError_t cutlass_strided_batched_sgemm(
 
   Gemm gemm_op;
 
-  cutlass::Status status = gemm_op({
-    {m, n, k},
-    {A, lda}, 
-    batch_stride_A,
-    {B, ldb}, 
-    batch_stride_B,
-    {C, ldc}, 
-    batch_stride_C,
-    {C, ldc}, 
-    batch_stride_C,
-    {alpha, beta},
-    batch_count
+  Gemm::EpilogueOutputOp::Params params({alpha, beta});
+
+  Gemm::Arguments args({
+    {m, n, k}, // problem_size
+    {A, lda},  // ptrA, lda
+    batch_stride_A, // stride of each batch in A
+    {B, ldb},  // ptrB, ldb
+    batch_stride_B, // stride of each batch in B
+    {C, ldc}, // ptrC, ldc
+    batch_stride_C, // stride of each batch in D
+    {C, ldc}, // ptrD, ldd
+    batch_stride_C, // stride of each batch in D
+    params, // epilogue
+    batch_count // num_batchs
   });
+
+  cutlass::Status status = gemm_op(args);
 
   if (status != cutlass::Status::kSuccess) {
     return cudaErrorUnknown;
@@ -244,20 +252,27 @@ cudaError_t run_batched_gemm(bool use_array) {
   std::cout << "Running " << gemm_desc << " gemm" << std::endl;
 
   // Arbitrary matrix shape
-  int const m = 520;
-  int const n = 219;
-  int const k = 129;
-
+  int const m = 1024;
+  int const n = 512;
+  int const k = 256;
   int const batch_count = 17;
+
+  std::cout << "m = " << m << std::endl;
+  std::cout << "n = " << n << std::endl;
+  std::cout << "k = " << k << std::endl;
+  std::cout << "batch_count = " << batch_count << std::endl;
+
+  int const batch_k = k * batch_count;
+  int const batch_n = n * batch_count;
 
   // A, B are non-transpose, column major
   int const lda = m;
-  int const ldb = k * batch_count;
+  int const ldb = batch_k;
   int const ldc = m;
 
-  int const count_A = batch_count * lda * k;
-  int const count_B = ldb * n;
-  int const count_C = batch_count * ldc * n;
+  int const count_A = m * batch_k;
+  int const count_B = batch_k * n;
+  int const count_C = m * batch_n;
 
   // the memory is batched along K dimension
   long long int batch_stride_A = static_cast<long long int>(lda) * static_cast<long long int>(k);
@@ -353,7 +368,8 @@ cudaError_t run_batched_gemm(bool use_array) {
     std::vector<float*> host_ptr_B(batch_count);
     std::vector<float*> host_ptr_C(batch_count);
 
-    // permute the batch elements to emphasize that GemmArray does not depend on matrices being separated by a fixed stride
+    // permute the batch elements to emphasize that 
+    // GemmArray does not depend on matrices being separated by a fixed stride
     std::vector<size_t> permutation = {14, 11, 3, 10, 1, 13, 9, 4, 6, 16, 8, 15, 7, 12, 0, 2, 5};
     for (size_t b_idx = 0; b_idx < batch_count; b_idx++) {
       host_ptr_A[b_idx] = A + permutation[b_idx] * batch_stride_A;
@@ -456,7 +472,9 @@ int main() {
   for (bool use_array : {false, true}) {
     result = run_batched_gemm(use_array);
     if (result == cudaSuccess) {
+      std::cout << std::endl;
       std::cout << "Passed." << std::endl;
+      std::cout << std::endl;
     } else {
       break;
     }
