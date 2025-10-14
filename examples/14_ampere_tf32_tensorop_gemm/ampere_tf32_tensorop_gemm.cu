@@ -39,10 +39,9 @@ architecture, most concept still holds.  The two main differences are
 2. NVIDIA Ampere architecture uses cp_async() to build multistage software pipeline to better hide
    latency (see include/cutlass/gemm/threadblock/mma_multistage.h)
 
-Moreover, NVIDIA Ampere architecture starts supporting tfloat32 (see include/cutlass/tfloat32.h)
-data types in tensor cores.  One big advantage is that we can load in fp32 data and convert them
-implicitly to tf32 inside the GEMM kernel which means no change is needed to accelerate traditional
-fp32 data by using NVIDIA Ampere architecture.
+Moreover, NVIDIA Ampere architecture starts supporting tfloat32 (see include/cutlass/tfloat32.h) data types in tensor cores.  
+One big advantage is that we can load in fp32 data and convert them implicitly to tf32 inside the GEMM kernel 
+which means no change is needed to accelerate traditional fp32 data by using NVIDIA Ampere architecture.
 */
 
 #include <iostream>
@@ -66,7 +65,7 @@ fp32 data by using NVIDIA Ampere architecture.
 struct Result {
 
   double runtime_ms;
-  double gflops;
+  double tflops;
   cutlass::Status status;
   cudaError_t error;
   bool passed;
@@ -77,11 +76,11 @@ struct Result {
 
   Result(
     double runtime_ms = 0,
-    double gflops = 0,
+    double tflops = 0,
     cutlass::Status status = cutlass::Status::kSuccess,
     cudaError_t error = cudaSuccess
   ):
-    runtime_ms(runtime_ms), gflops(gflops), status(status), error(error), passed(true) { }
+    runtime_ms(runtime_ms), tflops(tflops), status(status), error(error), passed(true) { }
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -152,14 +151,14 @@ struct Options {
     return out;
   }
 
-  /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const {
+  /// Compute performance in TFLOP/s
+  double tflops(double runtime_s) const {
 
     // Number of real-valued multiply-adds 
     int64_t fmas = problem_size.product() * batch_count;
     
     // Two flops per multiply-add
-    return 2.0 * double(fmas) / double(1.0e9) / runtime_s;
+    return 2.0 * double(fmas) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -183,7 +182,7 @@ using LayoutOutput = cutlass::layout::RowMajor;
 using MMAOp = cutlass::arch::OpClassTensorOp;
 
 // This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
+using SmArch = cutlass::arch::Sm80; // Ampere
 
 // This code section describes the tile size a thread block will compute
 using ShapeMMAThreadBlock =
@@ -369,9 +368,9 @@ int run(Options &options) {
     return -1;
   }
 
-  // Compute average runtime and GFLOPs.
+  // Compute average runtime and TFLOPs.
   result.runtime_ms = double(runtime_ms) / double(options.iterations);
-  result.gflops = options.gflops(result.runtime_ms / 1000.0);
+  result.tflops = options.tflops(result.runtime_ms / 1000.0);
 
   // Cleanup
   for (auto event : events) {
@@ -412,7 +411,7 @@ int run(Options &options) {
 
   if (passed) {
     std::cout << "Runtime: " << result.runtime_ms << " ms" << std::endl;
-    std::cout << " GFLOPs: " << result.gflops << std::endl;
+    std::cout << " TFLOPs: " << result.tflops << std::endl;
   }
 
   std::cout << (passed ? "Passed" : "Failed") << std::endl;
