@@ -31,18 +31,16 @@
 
 /**
 In the normal GEMM, the fast changing dimension of a matrix always has stride 
-equals to 1, e.g. ColumnMajor and RowMajor matrix.  Affine2 matrix can have 
-larger than 1 stride in both dimensions.  To support such layout, we need to 
-change to method to visit the global memory:
+equals to 1, e.g. ColumnMajor and RowMajor matrix.
+Affine2 matrix can have larger than 1 stride in both dimensions.
+To support such layout, we need to change to method to visit the global memory:
 
   1. We can only visit 1 element a time because elements are not stored
      consecutively anymore.  Vectorized load/store is not possible.
-  2. One extra multiplication is needed in calculating the global memory
-     address
+  2. One extra multiplication is needed in calculating the global memory address
      addr = base_pointer + coord1 * stride1 + coord2 * stride2
 
-The rest part of GEMM which includes shared memory load/store, mma comutation
-is the same.
+The rest part of GEMM which includes shared memory load/store, mma comutation is the same.
 
 This example uses Ampere fp64 tensore core Affine2 GEMM as an example.  SIMT 
 (e.g. sgemm, dgemm) has support Affine2 layout.
@@ -93,7 +91,7 @@ using LayoutOutput = cutlass::layout::AffineRankN<2>;
 using MMAOp = cutlass::arch::OpClassTensorOp;
 
 // This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
+using SmArch = cutlass::arch::Sm80; // Ampere
 
 // This code section describes the tile size a thread block will compute
 using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 16>;  // Threadblock tile shape
