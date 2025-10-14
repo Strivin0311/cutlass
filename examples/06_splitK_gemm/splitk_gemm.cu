@@ -185,8 +185,8 @@ int run() {
     return -1;
   }
 
-  if (props.major != 7) {
-    std::cerr << "Volta Tensor Ops must be run on a machine with compute capability of 70, 72, or 75."
+  if (props.major < 7) {
+    std::cerr << "Volta Tensor Ops must be run on a machine with compute capability at least 70."
               << std::endl;
 
     // Return 0 so tests pass if run on unsupported architectures or CUDA Toolkits.
@@ -250,15 +250,15 @@ int run() {
   tensor_ref_d.sync_device();
 
   // Initialize alpha and beta for dot product computation
-  ElementComputeEpilogue alpha = ElementComputeEpilogue(1);
-  ElementComputeEpilogue beta = ElementComputeEpilogue(0);
+  ElementComputeEpilogue alpha(1.5);
+  ElementComputeEpilogue beta(0.75);
 
   // Split K dimension into 16 partitions
   int split_k_slices = 16;
 
   // Create a tuple of gemm kernel arguments. This is later passed as arguments to launch
   // instantiated CUTLASS kernel
-  typename Gemm::Arguments arguments{problem_size,  // <- problem size of matrix multiplication
+  Gemm::Arguments arguments{problem_size,  // <- problem size of matrix multiplication
                                      tensor_a.device_ref(),  // <- reference to matrix A on device
                                      tensor_b.device_ref(),  // <- reference to matrix B on device
                                      tensor_c.device_ref(),  // <- reference to matrix C on device
