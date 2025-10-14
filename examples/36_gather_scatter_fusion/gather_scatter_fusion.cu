@@ -90,7 +90,7 @@
 struct Result {
 
   double runtime_ms;
-  double gflops;
+  double tflops;
   cutlass::Status status;
   cudaError_t error;
   bool passed;
@@ -101,11 +101,11 @@ struct Result {
 
   Result(
     double runtime_ms = 0,
-    double gflops = 0,
+    double tflops = 0,
     cutlass::Status status = cutlass::Status::kSuccess,
     cudaError_t error = cudaSuccess
   ):
-    runtime_ms(runtime_ms), gflops(gflops), status(status), error(error), passed(true) { }
+    runtime_ms(runtime_ms), tflops(tflops), status(status), error(error), passed(true) { }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -171,13 +171,13 @@ struct Options {
   }
 
   /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const {
+  double tflops(double runtime_s) const {
 
     // Number of real-valued multiply-adds
     int64_t fmas = problem_size.m() * int64_t(index_size) * problem_size.k();
     
     // Two flops per multiply-add
-    return 2.0 * double(fmas) / double(1.0e9) / runtime_s;
+    return 2.0 * double(fmas) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -489,9 +489,9 @@ int run(Options &options) {
     return -1;
   }
 
-  // Compute average runtime and GFLOPs.
+  // Compute average runtime and TFLOPs.
   result.runtime_ms = double(runtime_ms) / double(options.iterations);
-  result.gflops = options.gflops(result.runtime_ms / 1000.0);
+  result.tflops = options.tflops(result.runtime_ms / 1000.0);
 
   // Cleanup
   for (auto event : events) {
@@ -499,7 +499,7 @@ int run(Options &options) {
   }
 
   std::cout << "Runtime: " << result.runtime_ms << " ms\n";
-  std::cout << " GFLOPs: " << result.gflops << "\n";
+  std::cout << " TFLOPs: " << result.tflops << "\n";
 
   return 0;
 }
