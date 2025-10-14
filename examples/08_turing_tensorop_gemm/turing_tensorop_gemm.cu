@@ -150,7 +150,7 @@ using LayoutOutput = cutlass::layout::RowMajor;
 using MMAOp = cutlass::arch::OpClassTensorOp;
 
 // This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm75;
+using SmArch = cutlass::arch::Sm75; // Turing
 
 // This code section describes the tile size a thread block will compute
 using ShapeMMAThreadBlock =
