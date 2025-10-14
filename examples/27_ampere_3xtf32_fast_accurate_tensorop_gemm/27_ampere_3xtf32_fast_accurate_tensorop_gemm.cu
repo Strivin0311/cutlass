@@ -87,7 +87,7 @@ Now, we have several different flavors of sgemm now in the profiler for Ampere. 
 struct Result {
 
   double runtime_ms;
-  double gflops;
+  double tflops;
   cutlass::Status status;
   cudaError_t error;
 
@@ -99,12 +99,12 @@ struct Result {
   // ctor
   Result(
     int m, int n, int k,
-    double runtime_ms, double gflops,
+    double runtime_ms, double tflops,
     double l2_norm_3xtf32_vs_fp64,
     double l2_norm_1xtf32_vs_fp64,
     double l2_norm_fp32_vs_fp64) :
     m(m), n(n), k(k),
-    runtime_ms(runtime_ms), gflops(gflops),
+    runtime_ms(runtime_ms), tflops(tflops),
     l2_norm_3xtf32_vs_fp64(l2_norm_3xtf32_vs_fp64),
     l2_norm_1xtf32_vs_fp64(l2_norm_1xtf32_vs_fp64),
     l2_norm_fp32_vs_fp64(l2_norm_fp32_vs_fp64)   {}
@@ -115,7 +115,7 @@ struct Result {
   // Methods
   //
   static void print_csv_header() {
-    std::cout << "M,N,K,Runtime(ms),GFLOPS,3xTF32_vs_FP64,1xTF32_vs_FP64,FP32_vs_FP64" << std::endl;
+    std::cout << "M,N,K,Runtime(ms),TFLOPS,3xTF32_vs_FP64,1xTF32_vs_FP64,FP32_vs_FP64" << std::endl;
   }
 
   void print_csv_row() {
@@ -123,7 +123,7 @@ struct Result {
               << n << ","
               << k << ","
               << runtime_ms << ","
-              << gflops << ","
+              << tflops << ","
               << l2_norm_3xtf32_vs_fp64 << ","
               << l2_norm_1xtf32_vs_fp64 << ","
               << l2_norm_fp32_vs_fp64 << std::endl;
@@ -225,13 +225,13 @@ struct Options {
   }
 
   /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const {
+  double tflops(double runtime_s) const {
 
     // Number of real-valued multiply-adds
     int64_t fmas = problem_size.product();
 
     // Two flops per multiply-add
-    return 2.0 * double(fmas) / double(1.0e9) / runtime_s;
+    return 2.0 * double(fmas) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -247,7 +247,7 @@ using LayoutOutput = cutlass::layout::RowMajor;
 using MMAOp = cutlass::arch::OpClassTensorOp;
 
 // This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
+using SmArch = cutlass::arch::Sm80; // Ampere
 
 // This code section describes the tile size a thread block will compute
 using ShapeMMAThreadBlock =
@@ -532,12 +532,12 @@ bool run(Options &options) {
     return false;
   }
 
-  // Compute average runtime and GFLOPs.
+  // Compute average runtime and TFLOPs.
   result.m = problem_size.m();
   result.n = problem_size.n();
   result.k = problem_size.k();
   result.runtime_ms = double(runtime_ms) / double(options.iterations);
-  result.gflops = options.gflops(result.runtime_ms / 1000.0);
+  result.tflops = options.tflops(result.runtime_ms / 1000.0);
 
   // Cleanup
   for (auto event : events) {
@@ -661,7 +661,7 @@ bool run(Options &options) {
   std::cout.precision(4);
   std::cout << "Runtime: " << result.runtime_ms << " ms" << std::endl;
   std::cout.precision(2);
-  std::cout << "GFLOPs: " << result.gflops << std::endl;
+  std::cout << "TFLOPs: " << result.tflops << std::endl;
   std::cout << "Normalized L2 norm of" << std::endl;
   std::cout.precision(8);
   std::cout << std::scientific
