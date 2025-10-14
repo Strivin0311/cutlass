@@ -100,7 +100,7 @@ struct Result {
 
   double runtime_ms;
   double initialization_time_ms;
-  double gflops;
+  double tflops;
   cutlass::Status status;
   cudaError_t error;
   bool passed;
@@ -112,11 +112,11 @@ struct Result {
   Result(
     double runtime_ms = 0,
     double initialization_time_ms = 0,
-    double gflops = 0,
+    double tflops = 0,
     cutlass::Status status = cutlass::Status::kSuccess,
     cudaError_t error = cudaSuccess
   ):
-    runtime_ms(runtime_ms), initialization_time_ms(initialization_time_ms), gflops(gflops),
+    runtime_ms(runtime_ms), initialization_time_ms(initialization_time_ms), tflops(tflops),
     status(status), error(error), passed(true) { }
 };
 
@@ -268,7 +268,7 @@ struct Options {
       output_file.open(output_path.c_str(), open_mode);
 
       if (output_file.good() && open_mode != std::ios_base::app) {
-        output_file << "Tag,Provider,Kind,Groups,Runtime,GFLOPs\n";
+        output_file << "Tag,Provider,Kind,Groups,Runtime,TFLOPs\n";
       }
     }
 
@@ -453,7 +453,7 @@ struct Options {
   }
 
   /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const {
+  double tflops(double runtime_s) const {
 
     // Number of real-valued multiply-adds
     int64_t fmas = int64_t();
@@ -463,7 +463,7 @@ struct Options {
     }
 
     // Two flops per multiply-add
-    return 2.0 * double(fmas) / double(1.0e9) / runtime_s;
+    return 2.0 * double(fmas) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -1118,9 +1118,9 @@ public:
       return result;
     }
 
-    // Compute average runtime and GFLOPs.
+    // Compute average runtime and TFLOPs.
     result.runtime_ms = double(runtime_ms) / double(this->options.iterations);
-    result.gflops = this->options.gflops(result.runtime_ms / 1000.0);
+    result.tflops = this->options.tflops(result.runtime_ms / 1000.0);
 
     //
     // Cleanup
@@ -1139,13 +1139,13 @@ public:
     std::cout << "    " << this->options.problem_bins.size() << " batched GEMMs launched" << std::endl;
     std::cout << std::endl;
     std::cout << "    " << "Batched Runtime: " << result.runtime_ms << " ms" << std::endl;
-    std::cout << "    " << "Batched  GFLOPs: " << result.gflops << std::endl;
+    std::cout << "    " << "Batched  TFLOPs: " << result.tflops << std::endl;
 
     std::string provider = "CUTLASS";
 
     if (this->options.output_file.good()) {
       this->options.output_file << this->options.output_tag << "," << provider << ",batched,"
-        << this->options.problem_count << "," << result.runtime_ms << "," << result.gflops << std::endl;
+        << this->options.problem_count << "," << result.runtime_ms << "," << result.tflops << std::endl;
     }
 
     result.passed = true;
@@ -1380,9 +1380,9 @@ public:
       return result;
     }
 
-    // Compute average runtime and GFLOPs.
+    // Compute average runtime and TFLOPs.
     result.runtime_ms = double(runtime_ms) / double(this->options.iterations);
-    result.gflops = this->options.gflops(result.runtime_ms / 1000.0);
+    result.tflops = this->options.tflops(result.runtime_ms / 1000.0);
 
     //
     // Cleanup
@@ -1413,14 +1413,14 @@ public:
 
     std::cout << std::endl;
     std::cout << "    " << "Grouped Runtime: " << result.runtime_ms << " ms" << std::endl;
-    std::cout << "    " << "Grouped  GFLOPs: " << result.gflops << std::endl;
+    std::cout << "    " << "Grouped  TFLOPs: " << result.tflops << std::endl;
     if (this->options.profile_initialization) {
       std::cout << "    " << "Init    Runtime: " << result.initialization_time_ms << " ms" << std::endl;
     }
 
     if (this->options.output_file.good()) {
       this->options.output_file << this->options.output_tag << ",CUTLASS,grouped-" << sched_mode << ","
-        << this->options.problem_count << "," << result.runtime_ms << "," << result.gflops << std::endl;
+        << this->options.problem_count << "," << result.runtime_ms << "," << result.tflops << std::endl;
     }
 
     std::cout << "\nPassed\n";
@@ -1492,7 +1492,7 @@ int main(int argc, char const **args) {
     ElementOutput,   LayoutC,
     ElementAccumulator,
     cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm80,
+    cutlass::arch::Sm80, // Ampere
     cutlass::gemm::GemmShape<128, 128, 32>,
     cutlass::gemm::GemmShape<64, 64, 32>,
     cutlass::gemm::GemmShape<16, 8, 16>,
