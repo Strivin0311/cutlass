@@ -204,12 +204,12 @@ int run() {
     return -1;
   }
 
-  if (props.major != 7) {
-    std::cerr << "Volta Tensor Ops must be run on a machine with compute capability of 70, 72, or 75."
+  if (props.major < 7) {
+    std::cerr << "Volta Tensor Ops must be run on a machine with compute capability at least 70."
               << std::endl;
 
-    // Return 0 so tests are considered passing if run on unsupported architectures or CUDA Toolkits.
-    return 0;
+    // Return -1 so tests fail if run on unsupported architectures or CUDA Toolkits.
+    return -1;
   }
 
   const int length_m = 5120;
@@ -347,8 +347,8 @@ int main() {
   if (!(__CUDACC_VER_MAJOR__ > 10 || (__CUDACC_VER_MAJOR__ == 10 && __CUDACC_VER_MINOR__ >= 1))) {
     std::cerr << "Volta Tensor Core operations must be compiled with CUDA 10.1 Toolkit or later." << std::endl;
 
-    // Returning zero when built on older Toolkits so tests pass. The actions of this SDK example are no-op.
-    return 0;
+    // Returning -1, so this test fail when built with older CUDA Toolkits. Its action are no-op.
+    return -1;
   }
   else {
     return run();
