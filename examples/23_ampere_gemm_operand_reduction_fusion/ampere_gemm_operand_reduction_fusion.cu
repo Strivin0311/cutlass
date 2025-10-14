@@ -81,7 +81,7 @@ using LayoutGemmKReduction = cutlass::layout::PitchLinear;
 using MMAOp = cutlass::arch::OpClassTensorOp;
 
 // This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
+using SmArch = cutlass::arch::Sm80; // Ampere
 
 // This code section describes the tile size a thread block will compute
 using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;  // Threadblock tile shape
