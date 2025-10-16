@@ -663,7 +663,7 @@ struct Testbed {
       (cutlass::sizeof_bits<ElementD>::value * 2 + cutlass::sizeof_bits<ElementSoftmax>::value) *
       options.problem_size.m() * options.problem_size.n());
 
-    double gflops_per_second = double(flops) * kIterations * options.batch_count / double(elapsed_ms / 1000.0f) / double(1.0e9);
+    double tflops_per_second = double(flops) * kIterations * options.batch_count / double(elapsed_ms / 1000.0f) / double(1.0e12);
     double gbytes_per_second = double(bytes) * kIterations * options.batch_count / double(elapsed_ms / 1000.0f) / double(1 << 30);
 
     double elapsed_ms_per_iter = double(elapsed_ms) / kIterations;
@@ -675,7 +675,7 @@ struct Testbed {
 
     std::cout << "         Runtime: " << elapsed_ms_per_iter << " ms\n" << std::endl;
 
-    std::cout << "          GFLOPs: " << gflops_per_second << "  GFLOPs" << std::endl;
+    std::cout << "          TFLOPs: " << tflops_per_second << "  TFLOPs" << std::endl;
     std::cout << "Memory bandwidth: " << gbytes_per_second << "  GiB/s" << std::endl;
 
     return true;
