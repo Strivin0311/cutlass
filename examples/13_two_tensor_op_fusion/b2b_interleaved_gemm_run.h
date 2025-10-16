@@ -236,7 +236,7 @@ struct B2bInterleavedNonFusedGemmRun
     // Initialize the GEMM operator
     //
 
-    typename Gemm0::Arguments arguments_0{
+    typename Gemm0::Arguments arguments_0{ // Uniform Initialization
       problem_size_0,
       tensor_A0.device_ref(),
       tensor_B0_reordered.device_ref(),
@@ -568,7 +568,7 @@ struct B2bInterleavedFusedGemmRun
     CHECK_TRUE(initialize_tensor(tensor_A0.host_view(), init_A, seed + 2019));
     CHECK_TRUE(initialize_tensor(tensor_B0.host_view(), init_B, seed + 2018));
     CHECK_TRUE(initialize_tensor(tensor_C0.host_view(), init_C, seed + 2017));
-    if(alpha0 == ElementCompute(0)) //per-channel scale
+    if(alpha0 == ElementCompute(0)) // per-channel scale
       CHECK_TRUE(initialize_tensor(tensor_Scale0.host_view(), init_Scale, seed + 2014));
     CHECK_TRUE(initialize_tensor(tensor_Bias0.host_view(), init_Bias, seed + 2013));
     CHECK_TRUE(initialize_tensor(tensor_B1.host_view(), init_B, seed + 2016));
@@ -592,7 +592,7 @@ struct B2bInterleavedFusedGemmRun
     tensor_B0.sync_device();
     tensor_B0_reordered.sync_device();
     tensor_C0.sync_device();
-    if(alpha0 == ElementCompute(0)) //per-channel scale
+    if(alpha0 == ElementCompute(0)) // per-channel scale
         tensor_Scale0.sync_device();
     tensor_Bias0.sync_device();
     tensor_B1.sync_device();
@@ -689,12 +689,12 @@ struct B2bInterleavedFusedGemmRun
       ElementAccumulator, ElementAccumulator
     >(
       problem_size_0,
-      ElementAccumulator(1), //intermediate alpha=1
+      ElementAccumulator(1), // intermediate alpha=1
       tensor_A0.device_ref(),
       cutlass::ComplexTransform::kNone,
       tensor_B0.device_ref(),
       cutlass::ComplexTransform::kNone,
-      ElementAccumulator(0), //beta = 0
+      ElementAccumulator(0), // beta = 0
       reference_Z0.device_ref(),
       reference_Z0.device_ref(),
       ElementAccumulator(0),
@@ -733,12 +733,12 @@ struct B2bInterleavedFusedGemmRun
       ElementCompute, ElementAccumulator
     >(
       problem_size_1,
-      alpha1, //intermediate alpha=1
+      alpha1, // intermediate alpha=1
       reference_D0.device_ref(),
       cutlass::ComplexTransform::kNone,
       tensor_B1.device_ref(),
       cutlass::ComplexTransform::kNone,
-      beta1, //beta = 0
+      beta1, // beta = 0
       {tensor_Bias1.device_data(), typename B2bGemm::LayoutC::Stride(0)},
       reference_D1.device_ref(),
       ElementAccumulator(0),

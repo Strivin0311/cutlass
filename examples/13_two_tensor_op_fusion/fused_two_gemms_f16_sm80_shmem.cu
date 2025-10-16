@@ -207,7 +207,16 @@ int main() {
     &run_fused_gemm_f16_sm80_shmem
   };
 
-  return testRun(80, funcs, "gemm f16 shmem staging");
+  int arch = 80;
+  const char* arch_str = std::getenv("EXAMPLE_13_SM_ARCH");
+  if (arch_str != nullptr) {
+    arch = std::atoi(arch_str);
+    std::cout << "EXAMPLE_13_SM_ARCH set to " << arch << std::endl;
+  } else {
+    std::cout << "EXAMPLE_13_SM_ARCH not set, using 80" << std::endl;
+  }
+
+  return testRun(arch, funcs, "gemm f16 shmem staging");
 
 
 }
