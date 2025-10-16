@@ -876,7 +876,7 @@ struct Testbed {
     int64_t flops = int64_t(options.problem_size0.m()) * options.problem_size0.n() * options.problem_size0.k() * 2 \
                    + int64_t(options.problem_size1.m()) * options.problem_size1.n() * options.problem_size1.k() * 2;
 
-    double gflops_per_second = double(flops) * kIterations / double(elapsed_ms / 1000.0f) / double(1.0e9);
+    double tflops_per_second = double(flops) * kIterations / double(elapsed_ms / 1000.0f) / double(1.0e12);
 
     std::cout << "    1st  GEMM: "
               << options.problem_size0.m() << "-by-" << options.problem_size0.n() << "-by-" << options.problem_size0.k() << "\n"
@@ -885,7 +885,7 @@ struct Testbed {
               << std::endl;
 
     std::cout << " Runtime / iteration: " << elapsed_ms_per_iter << " ms\n" << std::endl;
-    std::cout << "              GFLOPs: " << gflops_per_second << "  GFLOPs" << std::endl;
+    std::cout << "              TFLOPs: " << tflops_per_second << "  TFLOPs" << std::endl;
 
     return true;
   }
