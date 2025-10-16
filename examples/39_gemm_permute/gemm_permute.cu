@@ -52,7 +52,7 @@
       cutlass::gemm::GemmUniversalMode::kBatched instead of kArray.
 
       2) When the contiguous dimension is touched in permute op (for example [0, 2, 3, 1] for row-major matrix 
-      or [1, 0, 2, 3] for column-major), Alignment should be set to 1 for the corresponding matrix. 
+      or [1, 0, 2, 3] for column-major), Alignment should be set to 1 for the corresponding matrix.
       If the last dimension is untouched,  one can set Alignment to be larger like 8 in our example.
       As a result, permute op without touching the unit stride dimension is recommended to obtain the best performance.
 
@@ -269,7 +269,7 @@ struct Options {
   }
 
   /// Compute performance in GFLOP/s
-  double gflops(double runtime_s, bool batched) const {
+  double tflops(double runtime_s, bool batched) const {
 
     // Number of real-valued multiply-adds 
     int64_t fmas = int64_t();
@@ -277,7 +277,7 @@ struct Options {
     fmas += problem_each.product() * (batched ? batch_count : 1);
     
     // Two flops per multiply-add
-    return 2.0 * double(fmas) / double(1.0e9) / runtime_s;
+    return 2.0 * double(fmas) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -755,9 +755,9 @@ public:
     float runtime_total_ms = 0;
     CHECK_CUDA_CALL(cudaEventElapsedTime(&runtime_total_ms, events[0], events[1]), return false);
 
-    // Compute average runtime and GFLOPs.
+    // Compute average runtime and TFLOPs.
     double runtime_avg_ms = double(runtime_total_ms) / double(options.iterations);
-    double gflops = options.gflops(runtime_avg_ms / 1000.0, kBatched);
+    double tflops = options.tflops(runtime_avg_ms / 1000.0, kBatched);
 
     // Cleanup
     for (auto event : events) {
@@ -765,7 +765,7 @@ public:
     }
 
     std::cout << "    Runtime: " << runtime_avg_ms << " ms\n"
-                 "     GFLOPs: " << gflops << std::endl;
+                 "     TFLOPs: " << tflops << std::endl;
 
     return true;
   }
