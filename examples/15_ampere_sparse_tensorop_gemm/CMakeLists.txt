@@ -28,17 +28,18 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-cutlass_example_add_executable(
-  15_ampere_sparse_tensorop_gemm
-  ampere_sparse_tensorop_gemm.cu
+add_custom_target(15_ampere_sparse_tensorop_gemm_all)
+
+foreach(SPARSE_GEMM_EXAMPLE
+  ampere_sparse_tensorop_gemm
+  ampere_sparse_tensorop_gemm_universal
+  ampere_sparse_tensorop_gemm_with_visitor
+)
+  cutlass_example_add_executable(
+    15_${SPARSE_GEMM_EXAMPLE}
+    ${SPARSE_GEMM_EXAMPLE}.cu
   )
 
-cutlass_example_add_executable(
-  15_ampere_sparse_tensorop_gemm_universal
-  ampere_sparse_tensorop_gemm_universal.cu
-  )
+  add_dependencies(15_ampere_sparse_tensorop_gemm_all 15_${SPARSE_GEMM_EXAMPLE})
 
-cutlass_example_add_executable(
-  15_ampere_sparse_tensorop_gemm_with_visitor
-  ampere_sparse_tensorop_gemm_with_visitor.cu
-  )
+endforeach()

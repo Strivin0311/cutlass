@@ -34,8 +34,9 @@ Please check example 07, 08 and 17 for the basics of dense tensor op gemm kernel
 architecture also supports structured sparse tensor op for tf32, fp16, int8 and int4.
 
 Sparse GEMM kernels needs to takes an additional E matrix which stores the meta data.  The format of
-meta data is different for every data types.   CUTLASS templates can automatically infer it based on
-input A and B.  Check code below.
+meta data is different for every data types.   
+
+CUTLASS templates can automatically infer it based on input A and B.  Check code below.
 
 Moreover, matrix E needs to be preprocessed so that it can use ldmatrix to load into the registers
 efficiently.
@@ -189,8 +190,7 @@ int run() {
   cutlass::reference::host::TensorFill(
       tensor_ref_d.host_view());  // <- fill matrix D for reference on host with zeros
 
-  // Reorder the meta data matrix so that we can use ldmatrix to load them to tensor core
-  // instructions.
+  // Reorder the meta data matrix so that we can use ldmatrix to load them to tensor core instructions.
   cutlass::reorder_meta(tensor_e_reordered.host_ref(), tensor_e.host_ref(),                         
                         {problem_size.m(), problem_size.n(),                                        
                          problem_size.k() / kSparse / kElementsPerElementE});
@@ -284,8 +284,7 @@ int main() {
   
   bool notSupported = false;
 
-  // Ampere Sparse Tensor Core operations exposed with mma.sync and ldmatrix are first available
-  // in CUDA 11.1. 
+  // Ampere Sparse Tensor Core operations exposed with mma.sync and ldmatrix are first available in CUDA 11.1. 
   //
   // CUTLASS must be compiled with CUDA 11.1 Toolkit to run these examples.
   
