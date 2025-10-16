@@ -63,29 +63,29 @@
         Basic data-parallel GEMM
           Disposition: Passed
           Avg runtime: 0.112633 ms
-          GFLOPs: 152530
+          TFLOPs: 152.530
 
         StreamK GEMM with default load-balancing
           Disposition: Passed
           Avg runtime: 0.0941929 ms
-          GFLOPs: 182390
+          TFLOPs: 182.390
           Speedup vs Basic-DP: 1.196
 
         StreamK emulating basic data-parallel GEMM
           Disposition: Passed
           Avg runtime: 0.113119 ms
-          GFLOPs: 151875
+          TFLOPs: 151.875
           Speedup vs Basic-DP: 0.996
 
         Basic split-K GEMM with tile-splitting factor 2
           Disposition: Passed
           Avg runtime: 0.104772 ms
-          GFLOPs: 163973
+          TFLOPs: 163.973
 
         StreamK emulating Split-K GEMM with tile-splitting factor 2
           Disposition: Passed
           Avg runtime: 0.105379 ms
-          GFLOPs: 163029
+          TFLOPs: 163.029
           Speedup vs Basic-SplitK: 0.994
 
  **************************************************************************************************/
@@ -197,18 +197,18 @@ using DeviceGemmStreamK = cutlass::gemm::device::GemmUniversal<
 struct Result
 {
   double avg_runtime_ms;
-  double gflops;
+  double tflops;
   cutlass::Status status;
   cudaError_t error;
   bool passed;
 
   Result(
     double avg_runtime_ms = 0,
-    double gflops = 0,
+    double tflops = 0,
     cutlass::Status status = cutlass::Status::kSuccess,
     cudaError_t error = cudaSuccess)
   :
-    avg_runtime_ms(avg_runtime_ms), gflops(gflops), status(status), error(error), passed(true)
+    avg_runtime_ms(avg_runtime_ms), tflops(tflops), status(status), error(error), passed(true)
   {}
 
 };
@@ -292,10 +292,10 @@ struct Options
   }
 
   /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const
+  double tflops(double runtime_s) const
   {
     // Two flops per multiply-add
-    return 2.0 * double(problem_size.product()) / double(1.0e9) / runtime_s;
+    return 2.0 * double(problem_size.product()) / double(1.0e12) / runtime_s;
   }
 };
 
@@ -421,13 +421,13 @@ Result run(std::string description, Options &options)
     }
     timer.stop();
 
-    // Compute average runtime and GFLOPs.
+    // Compute average runtime and TFLOPs.
     float elapsed_ms = timer.elapsed_millis();
     result.avg_runtime_ms = double(elapsed_ms) / double(options.iterations);
-    result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
+    result.tflops = options.tflops(result.avg_runtime_ms / 1000.0);
 
     std::cout << "  Avg runtime: " << result.avg_runtime_ms << " ms" << std::endl;
-    std::cout << "  GFLOPs: " << result.gflops << std::endl;
+    std::cout << "  TFLOPs: " << result.tflops << std::endl;
   }
 
   if (!result.passed) {

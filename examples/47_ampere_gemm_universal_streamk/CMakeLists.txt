@@ -28,10 +28,14 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+add_custom_target(47_ampere_gemm_universal_streamk_all)
+
 cutlass_example_add_executable(
   47_ampere_gemm_universal_streamk
   ampere_gemm_universal_streamk.cu
   )
+
+add_dependencies(47_ampere_gemm_universal_streamk_all 47_ampere_gemm_universal_streamk)
 
 # Deliberately test non-square sizes to ensure that internal transpose is
 # not triggered when using SM80 EVT
@@ -43,3 +47,5 @@ cutlass_example_add_executable(
   TEST_COMMAND_OPTIONS
   TEST_COMMAND_00
   )
+
+add_dependencies(47_ampere_gemm_universal_streamk_all 47_ampere_gemm_universal_streamk_broadcast)
