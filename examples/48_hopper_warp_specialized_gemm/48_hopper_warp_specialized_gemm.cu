@@ -54,6 +54,9 @@
       $ ./examples/48_hopper_warp_specialized_gemm/48_hopper_warp_specialized_gemm --m=2048 --n=2048 --k=2048 --rasterization=N --swizzle=2
 */
 
+#define __CUDA_ARCH_FEAT_SM90_ALL 1
+#define CUTLASS_ARCH_MMA_SM90_SUPPORTED 1
+
 #include <iostream>
 
 #include "cutlass/cutlass.h"
