@@ -26,12 +26,19 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+
+add_custom_target(67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling_all)
+
 cutlass_example_add_executable(
   67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
   67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling.cu
   )
 
+add_dependencies(67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling_all 67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling)
+
 cutlass_example_add_executable(
   67_hopper_fp8_warp_specialized_gemm_with_groupwise_scaling
   67_hopper_fp8_warp_specialized_gemm_with_groupwise_scaling.cu
   )
+
+add_dependencies(67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling_all 67_hopper_fp8_warp_specialized_gemm_with_groupwise_scaling)
