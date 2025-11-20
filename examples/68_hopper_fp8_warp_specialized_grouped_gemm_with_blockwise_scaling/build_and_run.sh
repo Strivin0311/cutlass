@@ -6,12 +6,12 @@
 SEP="--------------------------------------------------------------------"
 
 BUILD_ROOT=../../build
-SRC_ROOT=examples/67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
+SRC_ROOT=examples/68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling
 
-BUILD_TARGET=67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling_all
+BUILD_TARGET=68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_all
 
-RUN_TARGET=67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
-# RUN_TARGET=67_hopper_fp8_warp_specialized_gemm_with_groupwise_scaling
+RUN_TARGET=68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling
+# RUN_TARGET=68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_with_sparse_groups
 
 # default not skip any step except profiling
 SKIP_BUILD=false

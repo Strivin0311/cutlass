@@ -47,6 +47,8 @@ set(TEST_SMALL_LARGE_GROUP --m=128 --n=128 --groups=500 --iterations=0)         
 set(TEST_K_16B_ALIGNED --m=256 --n=512 --k=960 --groups=10 --iterations=0)
 set(TEST_K_16B_ALIGNED_LARGE_GROUP --m=256 --n=512 --k=960 --groups=512 --iterations=0)
 
+add_custom_target(68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_all)
+
 cutlass_example_add_executable(
   68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling
   68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling.cu
@@ -64,6 +66,8 @@ cutlass_example_add_executable(
   TEST_K_16B_ALIGNED
   TEST_K_16B_ALIGNED_LARGE_GROUP
   )
+
+add_dependencies(68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_all 68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling)
 
 # MSVC will fail to compile this example with the following error:
 # fatal error C1083: Cannot open source file: <Some Mojibake>: No such file or directory [...\examples\68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling\68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_with_sparse_groups.vcxproj]
@@ -85,5 +89,7 @@ cutlass_example_add_executable(
   TEST_SMALL
   TEST_SMALL_LARGE_GROUP
   )
+
+add_dependencies(68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_all 68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling_with_sparse_groups)
 
 endif()
