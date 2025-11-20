@@ -50,6 +50,9 @@ set(TEST_RANDOM_PERF --iterations=10)                                           
 set(TEST_RANDOM_PERF_LARGE_GROUP --groups=50 --iterations=10)                       # Random problem sizes
 
 if(CUTLASS_NVCC_ARCHS STREQUAL "100a")
+
+add_custom_target(75_blackwell_grouped_gemm_all)
+
 cutlass_example_add_executable(
   75_blackwell_grouped_gemm
   75_blackwell_grouped_gemm.cu
@@ -68,6 +71,8 @@ cutlass_example_add_executable(
   TEST_RANDOM_PERF_LARGE_GROUP
   )
 
+add_dependencies(75_blackwell_grouped_gemm_all 75_blackwell_grouped_gemm)
+
 cutlass_example_add_executable(
   75_blackwell_grouped_gemm_block_scaled
   75_blackwell_grouped_gemm_block_scaled.cu
@@ -85,4 +90,6 @@ cutlass_example_add_executable(
   TEST_RANDOM_PERF
   TEST_RANDOM_PERF_LARGE_GROUP
   )
+
+add_dependencies(75_blackwell_grouped_gemm_all 75_blackwell_grouped_gemm_block_scaled)
 endif()
