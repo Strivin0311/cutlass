@@ -436,7 +436,7 @@ int main(int argc, char const **args) {
 
   // CUTLASS must be compiled with CUDA 12.8 Toolkit to run this example
   // and must have compute capability at least 100a.
-  bool is_correct_cuda_version = (__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 8);
+  bool is_correct_cuda_version = (__CUDACC_VER_MAJOR__ > 12) || ((__CUDACC_VER_MAJOR__ == 12) && (__CUDACC_VER_MINOR__ >= 8));
   if (!is_correct_cuda_version) {
     std::cerr << "Version is " << __CUDACC_VER_MINOR__ << "\n";
     std::cerr << "This example requires CUDA 12.8 or newer.\n";
