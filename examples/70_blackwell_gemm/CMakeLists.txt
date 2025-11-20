@@ -34,6 +34,9 @@ set(TEST_SWIZZLE_5 --swizzle=5)
 set(TEST_SWIZZLE_5_UNEVEN --swizzle=5 --m=4096 --n=16384)
 
 if(CUTLASS_NVCC_ARCHS STREQUAL "100a" OR CUTLASS_NVCC_ARCHS STREQUAL "100f" OR CUTLASS_NVCC_ARCHS STREQUAL "101a" OR CUTLASS_NVCC_ARCHS STREQUAL "101f" OR CUTLASS_NVCC_ARCHS STREQUAL "103a" OR CUTLASS_NVCC_ARCHS STREQUAL "103f")
+
+add_custom_target(70_blackwell_gemm_all)
+
 cutlass_example_add_executable(
   70_blackwell_fp16_gemm
   70_blackwell_fp16_gemm.cu
@@ -44,6 +47,8 @@ cutlass_example_add_executable(
   TEST_SWIZZLE_5_UNEVEN
 )
 
+add_dependencies(70_blackwell_gemm_all 70_blackwell_fp16_gemm)
+
 cutlass_example_add_executable(
   70_blackwell_fp8_gemm
   70_blackwell_fp8_gemm.cu
@@ -53,4 +58,6 @@ cutlass_example_add_executable(
   TEST_SWIZZLE_5
   TEST_SWIZZLE_5_UNEVEN
 )
+
+add_dependencies(70_blackwell_gemm_all 70_blackwell_fp8_gemm)
 endif()
