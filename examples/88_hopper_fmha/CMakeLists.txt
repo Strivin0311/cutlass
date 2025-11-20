@@ -26,10 +26,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+add_custom_target(88_hopper_fmha_all)
+
 cutlass_example_add_executable(
   88_hopper_fmha
   88_hopper_fmha.cu
   )
+
+add_dependencies(88_hopper_fmha_all 88_hopper_fmha)
 
 if(NOT WIN32 AND NOT CUTLASS_CLANG_HOST_COMPILE)
 
@@ -46,5 +50,7 @@ cutlass_example_add_executable(
 target_compile_definitions(
   88_hopper_fmha_fp8
   PRIVATE FP8)
+
+add_dependencies(88_hopper_fmha_all 88_hopper_fmha_fp8)
 
 endif()
