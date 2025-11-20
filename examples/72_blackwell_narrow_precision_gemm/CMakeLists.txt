@@ -29,18 +29,27 @@
 
 
 if(CUTLASS_NVCC_ARCHS STREQUAL "100a" OR CUTLASS_NVCC_ARCHS STREQUAL "100f" OR CUTLASS_NVCC_ARCHS STREQUAL "101a" OR CUTLASS_NVCC_ARCHS STREQUAL "101f" OR CUTLASS_NVCC_ARCHS STREQUAL "103a" OR CUTLASS_NVCC_ARCHS STREQUAL "103f")
+
+add_custom_target(72_blackwell_narrow_precision_gemm_all)
+
 cutlass_example_add_executable(
   72a_blackwell_nvfp4_bf16_gemm
   72a_blackwell_nvfp4_bf16_gemm.cu
   )
+
+add_dependencies(72_blackwell_narrow_precision_gemm_all 72a_blackwell_nvfp4_bf16_gemm)
 
 cutlass_example_add_executable(
   72b_blackwell_nvfp4_nvfp4_gemm
   72b_blackwell_nvfp4_nvfp4_gemm.cu
   )
 
+add_dependencies(72_blackwell_narrow_precision_gemm_all 72b_blackwell_nvfp4_nvfp4_gemm)
+
 cutlass_example_add_executable(
   72c_blackwell_mixed_mxfp8_bf16_gemm
   72c_blackwell_mixed_mxfp8_bf16_gemm.cu
   )
+
+add_dependencies(72_blackwell_narrow_precision_gemm_all 72c_blackwell_mixed_mxfp8_bf16_gemm)
 endif()
