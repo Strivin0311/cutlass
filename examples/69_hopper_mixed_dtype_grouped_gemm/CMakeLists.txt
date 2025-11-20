@@ -52,6 +52,8 @@ set(TEST_DIRECT_BATCHED --m=2048 --n=5120 --k=8192 --mode=0 --iterations=0)     
 set(TEST_SCALE_PERCOL --m=4096 --n=5120 --k=8192 --c=8192 --mode=1 --iterations=0)       # Per Column scaling
 set(TEST_SCALE_GROUP --m=2048 --n=5120 --k=8192 --c=512 --mode=1 --iterations=0)         # Group-wise scaling
 
+add_custom_target(69_hopper_mixed_dtype_grouped_gemm_all)
+
 cutlass_example_add_executable(
   69_hopper_mixed_dtype_grouped_gemm
   69_hopper_mixed_dtype_grouped_gemm.cu
@@ -72,6 +74,8 @@ cutlass_example_add_executable(
   TEST_SCALE_PERCOL
   TEST_SCALE_GROUP
 )
+
+add_dependencies(69_hopper_mixed_dtype_grouped_gemm_all 69_hopper_mixed_dtype_grouped_gemm)
 
 cutlass_example_add_executable(
   69_hopper_int4_fp8_grouped_gemm
@@ -94,6 +98,8 @@ cutlass_example_add_executable(
   TEST_SCALE_GROUP
 )
 
+add_dependencies(69_hopper_mixed_dtype_grouped_gemm_all 69_hopper_int4_fp8_grouped_gemm)
+
 cutlass_example_add_executable(
   69_hopper_int4_bf16_grouped_gemm
   69_hopper_int4_bf16_grouped_gemm.cu
@@ -114,3 +120,5 @@ cutlass_example_add_executable(
   TEST_SCALE_PERCOL
   TEST_SCALE_GROUP
 )
+
+add_dependencies(69_hopper_mixed_dtype_grouped_gemm_all 69_hopper_int4_bf16_grouped_gemm)
