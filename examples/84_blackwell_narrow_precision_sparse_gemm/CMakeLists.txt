@@ -29,13 +29,20 @@
 
 
 if (CUTLASS_NVCC_ARCHS MATCHES 100a)
+
+add_custom_target(84_blackwell_narrow_precision_sparse_gemm_all)
+
 cutlass_example_add_executable(
   84a_blackwell_nvfp4_bf16_sparse_gemm
   84a_blackwell_nvfp4_bf16_sparse_gemm.cu
   )
 
+add_dependencies(84_blackwell_narrow_precision_sparse_gemm_all 84a_blackwell_nvfp4_bf16_sparse_gemm)
+
 cutlass_example_add_executable(
   84b_blackwell_mixed_mxfp8_bf16_sparse_gemm
   84b_blackwell_mixed_mxfp8_bf16_sparse_gemm.cu
   )
+
+add_dependencies(84_blackwell_narrow_precision_sparse_gemm_all 84b_blackwell_mixed_mxfp8_bf16_sparse_gemm)
 endif()
