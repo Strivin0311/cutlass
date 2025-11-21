@@ -37,6 +37,9 @@ set(TEST_DEEPSEEK_B_FP4 --m=7168 --n=1 --k=512 --l=256)
 set(TEST_IRREGULAR_MNK_FP4 --m=4080 --n=9 --k=4160 --l=8)
 
 if (CUTLASS_NVCC_ARCHS MATCHES 100a)
+
+add_custom_target(92_blackwell_moe_gemm_all)
+
 cutlass_example_add_executable(
   92_blackwell_moe_gemm_regular
   92_blackwell_moe_gemm_regular.cu
@@ -48,10 +51,14 @@ cutlass_example_add_executable(
   TEST_IRREGULAR_MNK
 )
 
+add_dependencies(92_blackwell_moe_gemm_all 92_blackwell_moe_gemm_regular)
+
 cutlass_example_add_executable(
   92_blackwell_moe_gemm_grouped
   92_blackwell_moe_gemm_grouped.cu
 )
+
+add_dependencies(92_blackwell_moe_gemm_all 92_blackwell_moe_gemm_grouped)
 
 cutlass_example_add_executable(
   92_blackwell_moe_gemm_fp4_regular
@@ -63,8 +70,13 @@ cutlass_example_add_executable(
   TEST_DEEPSEEK_B_FP4
   TEST_IRREGULAR_MNK_FP4
 )
+
+add_dependencies(92_blackwell_moe_gemm_all 92_blackwell_moe_gemm_fp4_regular)
+
 cutlass_example_add_executable(
   92_blackwell_moe_gemm_fp4_grouped
   92_blackwell_moe_gemm_fp4_grouped.cu
 )
+
+add_dependencies(92_blackwell_moe_gemm_all 92_blackwell_moe_gemm_fp4_grouped)
 endif()
