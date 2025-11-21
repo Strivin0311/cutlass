@@ -55,7 +55,7 @@ fi
 
 # run
 
-CMD=$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET
+CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --m=8192 --n=8192 --k=2048"
 
 if [ "$SKIP_RUN" = false ]; then
     echo "$SEP"
