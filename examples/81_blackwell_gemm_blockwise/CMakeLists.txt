@@ -36,6 +36,8 @@ set(TEST_EPILOGUE --alpha=0.5 --beta=0.5 --iterations=0)                        
 
 set(TEST_SMALL --m=256 --n=128 --k=128 --iterations=0)                              # Small problem sizes
 
+add_custom_target(81_blackwell_gemm_blockwise_all)
+
 cutlass_example_add_executable(
   81_blackwell_gemm_blockwise 
   81_blackwell_gemm_blockwise.cu
@@ -44,6 +46,8 @@ cutlass_example_add_executable(
   TEST_EPILOGUE
   TEST_SMALL
 )
+
+add_dependencies(81_blackwell_gemm_blockwise_all 81_blackwell_gemm_blockwise)
 
 cutlass_example_add_executable(
   81_blackwell_gemm_groupwise 
@@ -54,6 +58,8 @@ cutlass_example_add_executable(
   TEST_SMALL
 )
 
+add_dependencies(81_blackwell_gemm_blockwise_all 81_blackwell_gemm_groupwise)
+
 cutlass_example_add_executable(
   81_blackwell_grouped_gemm_blockwise 
   81_blackwell_grouped_gemm_blockwise.cu
@@ -61,11 +67,15 @@ cutlass_example_add_executable(
   TEST_SMALL
 )
 
+add_dependencies(81_blackwell_gemm_blockwise_all 81_blackwell_grouped_gemm_blockwise)
+
 cutlass_example_add_executable(
   81_blackwell_grouped_gemm_groupwise 
   81_blackwell_grouped_gemm_groupwise.cu
   TEST_COMMAND_OPTIONS
   TEST_SMALL
 )
+
+add_dependencies(81_blackwell_gemm_blockwise_all 81_blackwell_grouped_gemm_groupwise)
 
 endif()
