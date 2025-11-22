@@ -11,7 +11,7 @@ SRC_ROOT=examples/83_blackwell_sparse_gemm
 TARGET=83_blackwell_sparse_gemm
 
 # default not skip any step except profiling
-SKIP_BUILD=true
+SKIP_BUILD=false
 SKIP_RUN=false
 SKIP_PROFILE=true
 
