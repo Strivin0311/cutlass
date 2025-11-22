@@ -568,6 +568,8 @@ struct BwdRunner {
         cumulative_seqlen_q.push_back(cumulative_seqlen_q.back() + seqlen_q);
         cumulative_seqlen_kv.push_back(cumulative_seqlen_kv.back() + seqlen_kv);
       }
+      std::cout << "Q max: " << max_seqlen_q << " total: " << total_seqlen_q << " batch_size: " << num_batches << std::endl;
+      std::cout << "KV max: " << max_seqlen_kv << " total: " << total_seqlen_kv << " batch_size: " << num_batches << std::endl;
 
       block_cumulative_seqlen_q.reset(cumulative_seqlen_q.size());
       block_cumulative_seqlen_q.copy_from_host(cumulative_seqlen_q.data(), cumulative_seqlen_q.size());

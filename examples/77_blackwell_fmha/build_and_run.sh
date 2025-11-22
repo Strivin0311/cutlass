@@ -24,7 +24,7 @@ RUN_TARGET=77_blackwell_fmha_fp16
 # RUN_TARGET=77_blackwell_mla_fwd_fp16
 
 # default not skip any step except profiling
-SKIP_BUILD=false
+SKIP_BUILD=true
 SKIP_RUN=false
 SKIP_PROFILE=true
 
@@ -65,13 +65,71 @@ fi
 
 # run
 
-CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --q=4096 --k=4096 --h=48 --h_k=8 --d=128 --b=1 --mask=no"
+mask_type="full"
+# mask_type="causal"
+# mask_type="varlen-full"
+# mask_type="varlen-causal"
+
+k=1024
+nk=8
+seqlen=$(( nk * k ))
+
+if [[ $RUN_TARGET == *"bwd"* ]]; then
+    wd="bwd"
+else
+    wd="fwd"
+fi
+
+# uneven
+# FIXME: not well supported by current implementation
+# varlen="256:64:512:128:64"
+# varlen_batch_size=5
+
+# even
+if [[ $seqlen -le 4096 ]] then
+    varlen_unit=512
+elif [[ $seqlen -le 16384 ]]; then
+    varlen_unit=1024
+else
+    varlen_unit=2048
+fi
+
+varlen_q="${varlen_unit}"
+varlen_k="${varlen_unit}"
+varlen_batch_size=$(( seqlen / varlen_unit ))
+for (( i=1; i<$varlen_batch_size; i++ )); do
+    varlen_q="${varlen_q}:${varlen_unit}"
+    varlen_k="${varlen_k}:${varlen_unit}"
+done
+
+echo "Final varlen_q: $varlen_q"
+echo "Final varlen_k: $varlen_k"
+echo "Final varlen_batch_size: $varlen_batch_size"
+
+
+if [[ $mask_type == "full" ]]; then
+    CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --q=${seqlen} --k=${seqlen} --h=8 --h_k=8 --d=128 --b=1 --mask=no"
+elif [[ $mask_type == "causal" ]]; then
+    CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --q=${seqlen} --k=${seqlen} --h=8 --h_k=8 --d=128 --b=1 --mask=causal"
+elif [[ $mask_type == "varlen-full" ]]; then
+    CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --varlen --varlen-q=${varlen_q} --varlen-k=${varlen_k} --h=8 --h_k=8 --d=128 --b=${varlen_batch_size} --mask=no"
+elif [[ $mask_type == "varlen-causal" ]]; then
+    CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --varlen --varlen-q=${varlen_q} --varlen-k=${varlen_k} --h=8 --h_k=8 --d=128 --b=${varlen_batch_size} --mask=causal"
+else
+    echo "Unknown mask type: $mask_type"
+    exit 1
+fi
+
+LOG_ROOT=logs/${mask_type}/${wd}/
+mkdir -p $LOG_ROOT
+LOG_PATH=$LOG_ROOT/${RUN_TARGET}_${nk}k.log
+echo "Log path: $LOG_PATH"
 
 if [ "$SKIP_RUN" = false ]; then
     echo "$SEP"
     echo "Running ${RUN_TARGET}"
     echo "$SEP"
-    $CMD
+    $CMD > $LOG_PATH 2>&1
 else
     echo "$SEP"
     echo "Skipping run process"
