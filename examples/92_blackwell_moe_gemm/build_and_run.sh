@@ -10,9 +10,9 @@ SRC_ROOT=examples/92_blackwell_moe_gemm
 
 BUILD_TARGET=92_blackwell_moe_gemm_all
 
-RUN_TARGET=92_blackwell_moe_gemm_regular
+# RUN_TARGET=92_blackwell_moe_gemm_regular
 # RUN_TARGET=92_blackwell_moe_gemm_grouped
-# RUN_TARGET=92_blackwell_moe_gemm_fp4_regular
+RUN_TARGET=92_blackwell_moe_gemm_fp4_regular
 # RUN_TARGET=92_blackwell_moe_gemm_fp4_grouped
 
 # default not skip any step except profiling
@@ -57,13 +57,31 @@ fi
 
 # run
 
-CMD=$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET
+k=1024
+nk=8
+g=8
+M=$(( nk * k ))
+N=$(( nk * k ))
+K=$(( nk * k ))
+
+if [[ $K -lt 1024 ]]; then
+    nk_k=$K
+else
+    nk_k="$(( K / k ))k"
+fi
+
+CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --m=$M --n=$N --k=$K --l=$g --no_verif"
+
+LOG_ROOT=logs
+mkdir -p $LOG_ROOT
+LOG_PATH=$LOG_ROOT/${RUN_TARGET}_M${nk}k_N${nk}k_K${nk_k}_G${g}.log
+echo "Log path: $LOG_PATH"
 
 if [ "$SKIP_RUN" = false ]; then
     echo "$SEP"
     echo "Running ${RUN_TARGET}"
     echo "$SEP"
-    $CMD
+    $CMD > $LOG_PATH 2>&1
 else
     echo "$SEP"
     echo "Skipping run process"
