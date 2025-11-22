@@ -132,6 +132,8 @@ using namespace cute;
 using TP = _8;
 static constexpr int TP_ = TP{};
 
+#define CUTLASS_ARCH_MMA_SM100A_ENABLED 1
+
 #if defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && \
   (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
 

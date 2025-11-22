@@ -52,13 +52,31 @@ fi
 
 # run
 
-CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET --m=2048 --n=2048 --k=2048 --rasterization=N --swizzle=2"
+tp=8
+k=1024
+nk=4
+M=$(( nk * k ))
+N=$(( nk * k ))
+K=$(( nk * k ))
+
+if [[ $K -lt 1024 ]]; then
+    nk_k=$K
+else
+    nk_k="$(( K / k ))k"
+fi
+
+CMD="$BUILD_ROOT/$SRC_ROOT/$TARGET --m=$((M * tp)) --n=$((N * tp)) --k=$((K * tp))"
+
+LOG_ROOT=logs
+mkdir -p $LOG_ROOT
+LOG_PATH=$LOG_ROOT/${TARGET}_M${nk}k_N${nk}k_K${nk_k}_tp${tp}.log
+echo "Log path: $LOG_PATH"
 
 if [ "$SKIP_RUN" = false ]; then
     echo "$SEP"
     echo "Running ${TARGET}"
     echo "$SEP"
-    $CMD
+    $CMD > $LOG_PATH 2>&1
 else
     echo "$SEP"
     echo "Skipping run process"
