@@ -24,7 +24,7 @@ RUN_TARGET=77_blackwell_fmha_fp16
 # RUN_TARGET=77_blackwell_mla_fwd_fp16
 
 # default not skip any step except profiling
-SKIP_BUILD=true
+SKIP_BUILD=false
 SKIP_RUN=false
 SKIP_PROFILE=true
 
