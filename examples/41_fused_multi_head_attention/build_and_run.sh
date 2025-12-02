@@ -59,7 +59,7 @@ fi
 if [[ $RUN_TARGET == "41_fused_multi_head_attention_backward" ]]; then
     CMD="python fmha_backward_test.py $BUILD_ROOT/$SRC_ROOT/$RUN_TARGET"
 else
-    CMD=$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET
+    CMD="$BUILD_ROOT/$SRC_ROOT/$RUN_TARGET --head_number=8 --batch_size=1 --head_size=128 --head_size_v=128 --seq_length=8192 --seq_length_kv=8192 --causal=false"
 fi
 
 if [ "$SKIP_RUN" = false ]; then
