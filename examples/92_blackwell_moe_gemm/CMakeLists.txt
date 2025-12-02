@@ -36,7 +36,7 @@ set(TEST_DEEPSEEK_A_FP4 --m=1024 --n=1 --k=7168 --l=256)     # TP=1 shape is too
 set(TEST_DEEPSEEK_B_FP4 --m=7168 --n=1 --k=512 --l=256)
 set(TEST_IRREGULAR_MNK_FP4 --m=4080 --n=9 --k=4160 --l=8)
 
-if (CUTLASS_NVCC_ARCHS MATCHES 100a)
+if (CUTLASS_NVCC_ARCHS MATCHES 100a OR CUTLASS_NVCC_ARCHS MATCHES 103a)
 
 add_custom_target(92_blackwell_moe_gemm_all)
 
