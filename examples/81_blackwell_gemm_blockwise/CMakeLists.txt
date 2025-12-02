@@ -28,7 +28,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-if (CUTLASS_NVCC_ARCHS MATCHES 100a)
+if (CUTLASS_NVCC_ARCHS MATCHES 100a OR CUTLASS_NVCC_ARCHS MATCHES 103a)
 
 set(TEST_RANDOM --iterations=0)                                                     # Random problem sizes
 
