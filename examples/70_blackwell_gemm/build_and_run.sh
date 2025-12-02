@@ -10,8 +10,8 @@ SRC_ROOT=examples/70_blackwell_gemm
 
 BUILD_TARGET=70_blackwell_gemm_all
 
-# RUN_TARGET=70_blackwell_fp16_gemm
-RUN_TARGET=70_blackwell_fp8_gemm
+RUN_TARGET=70_blackwell_fp16_gemm
+# RUN_TARGET=70_blackwell_fp8_gemm
 
 # default not skip any step except profiling
 SKIP_BUILD=false
