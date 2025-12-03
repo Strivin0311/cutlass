@@ -49,7 +49,7 @@ set(TEST_SMALL_LARGE_GROUP --m=128 --n=128 --groups=50 --iterations=0)          
 set(TEST_RANDOM_PERF --iterations=10)                                               # Random problem sizes
 set(TEST_RANDOM_PERF_LARGE_GROUP --groups=50 --iterations=10)                       # Random problem sizes
 
-if(CUTLASS_NVCC_ARCHS STREQUAL "100a")
+if(CUTLASS_NVCC_ARCHS STREQUAL "100a" OR CUTLASS_NVCC_ARCHS STREQUAL "103a")
 
 add_custom_target(75_blackwell_grouped_gemm_all)
 
