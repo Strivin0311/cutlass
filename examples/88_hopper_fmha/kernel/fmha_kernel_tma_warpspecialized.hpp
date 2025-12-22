@@ -38,6 +38,10 @@
 
 #include "../kernel/fmha_options.hpp"
 
+#ifndef CUTLASS_ARCH_MMA_SM90A_ENABLED
+#define CUTLASS_ARCH_MMA_SM90A_ENABLED 1
+#endif
+
 namespace cutlass::fmha::kernel {
 
 using namespace cute;
