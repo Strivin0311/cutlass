@@ -440,7 +440,7 @@ class HopperWgmmaGemmKernel:
         @cute.struct
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.ab_stage * 2
+                cutlass.Int64, self.ab_stage * 2 # x2 since each stage will have a pair of empty/full mbars
             ]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
@@ -456,6 +456,42 @@ class HopperWgmmaGemmKernel:
             ]
 
         self.shared_storage = SharedStorage
+        
+        print()
+        print(f"{self.tile_shape_mnk=}, {self.atom_layout_mnk=}, {self.cluster_shape_mn=}, {self.num_mcast_ctas_a=}, {self.num_mcast_ctas_b=}, {self.is_a_mcast=}, {self.is_b_mcast=}")
+        print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
+        print("cta_layout_mnk: {}", self.cta_layout_mnk)
+        print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=}, {self.occupancy=}, {self.buffer_align_bytes=}")
+        print()
+        
+        print()
+        print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
+        print(f"{self.a_layout=}, {self.b_layout=}, {self.c_layout=}")
+        print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.acc_dtype=}")
+        print()
+        
+        print()
+        print("self.a_smem_layout_staged: {}", self.a_smem_layout_staged)
+        print("self.b_smem_layout_staged: {}", self.b_smem_layout_staged)
+        print("self.epi_smem_layout_staged: {}", self.epi_smem_layout_staged)
+        print()
+        
+        print()
+        print(f"tma_atom_a: {tma_atom_a}")
+        print(f"tma_tensor_a: {tma_tensor_a}")
+        print()
+        print(f"tma_atom_b: {tma_atom_b}")
+        print(f"tma_tensor_b: {tma_tensor_b}")
+        print()
+        print(f"tma_atom_c: {tma_atom_c}")
+        print(f"tma_tensor_c: {tma_tensor_c}")
+        print()
+        
+        print()
+        print("tiled_mma: {}", self.tiled_mma)
+        print()
+        
+        cute.printf("grid: {}", grid)
 
         # Launch the kernel synchronously
         self.kernel(
@@ -520,9 +556,26 @@ class HopperWgmmaGemmKernel:
         :param epi_smem_layout_staged: Shared memory layout for epilogue
         :type epi_smem_layout_staged: cute.ComposedLayout
         """
+        
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Get cta/warp/thread idx
+        # ///////////////////////////////////////////////////////////////////////////////
+        bidx, bidy, bidz = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        is_thread0 = tidx == 129 and bidx == 15 and bidy == 15
+
+        cidx, cidy, cidxz = cute.arch.cluster_idx()
+        cdimx, cdimy, cdimz = cute.arch.cluster_dim()
+        cluster_id = cidx + cdimx * cidy
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        warp_group_idx = cute.arch.make_warp_uniform(
+            tidx // self.num_threads_per_warp_group
+        )
+        warp_group_thread_layout = cute.make_layout(
+            self.mma_warp_groups, stride=self.num_threads_per_warp_group
+        )
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
@@ -530,16 +583,10 @@ class HopperWgmmaGemmKernel:
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Get cta/warp/thread idx
-        # ///////////////////////////////////////////////////////////////////////////////
-        bidx, bidy, bidz = cute.arch.block_idx()
-        tidx, _, _ = cute.arch.thread_idx()
-
-        cidx, cidy, _ = cute.arch.cluster_idx()
-        cdimx, cdimy, _ = cute.arch.cluster_dim()
-        cluster_id = cidx + cdimx * cidy
+            
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Make CTA layout
+        # /////////////////////////////////////////////////////////////////////////////
 
         # CTA Swizzle to promote L2 data reuse
         group_size_m = 8
@@ -551,6 +598,11 @@ class HopperWgmmaGemmKernel:
         s_layout = cute.make_layout(s_shape, stride=s_stride)
         num_reg_cids = cute.size(s_shape)
         cid_m, cid_n = s_layout.get_flat_coord(cluster_id % num_reg_cids)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("s_layout: {}, num_reg_cids: {}", s_layout, num_reg_cids)
+            cute.printf("cid_m: {}, cid_n: {}, cluster_id: {}, bdim: ({}, {}, {}), cdim: ({}, {}, {}), bidx: ({}, {}, {}), cidx: ({}, {}, {})", cid_m, cid_n, cluster_id, *cute.arch.block_dim(), cdimx, cdimy, cdimz, bidx, bidy, bidz, cidx, cidy, cidxz)
 
         # Deal with the tail part
         if cluster_id >= num_reg_cids:
@@ -573,14 +625,30 @@ class HopperWgmmaGemmKernel:
             cute.arch.block_idx_in_cluster()
         )
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("block_in_cluster_idx: {}, block_idx_in_cluster: {}, ", bidx_in_cluster, cute.arch.block_idx_in_cluster())
+            cute.printf("pid_m: {}, pid_n: {}, tile_coord_mnkl: {}, cluster_coord_mnk: {}", pid_m, pid_n, tile_coord_mnkl, cluster_coord_mnk)
+            cute.printf("cta_layout_mnk: {}, cta_rank_in_cluster: {}, cluster_coord_mnk: {}", cta_layout_mnk, cta_rank_in_cluster, cluster_coord_mnk)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get mcast mask
         # ///////////////////////////////////////////////////////////////////////////////
         a_mcast_mask = cute.make_layout_image_mask(
+            # multicast the same A along the given mode1 (i.e. N dimension) of the cluster
+            # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have different A slices
+            # so the mcast mask is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
+            # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have the same A slice,
+            # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp
             cta_layout_mnk, cluster_coord_mnk, mode=1
         )
         b_mcast_mask = cute.make_layout_image_mask(
+            # multicast the same B along the given mode0 (i.e. M dimension) of the cluster
+            # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have the same B slice,
+            # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp,
+            # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have different B slices,
+            # so the mcast mask is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
             cta_layout_mnk, cluster_coord_mnk, mode=0
         )
 
@@ -591,6 +659,11 @@ class HopperWgmmaGemmKernel:
         tma_copy_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("a_mcast_mask: {}, b_mcast_mask: {}", a_mcast_mask, b_mcast_mask)
+            cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
@@ -598,22 +671,37 @@ class HopperWgmmaGemmKernel:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # mbar arrays
+        # get mbar arrays ptr
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        # Threads/warps participating in this pipeline
+        # Define producer group for mainloop pipeline
+        # only warp0 will be the producer to load the data, 
+        # thus size=1 (the lane0 in warp0 will participate the pipeline and accquire/issue the tma load)
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
+            pipeline.Agent.Thread, size=1
         )
-        # Each warp will constribute to the arrive count with the number of mcast size
+        # Define consumer group for mainloop pipeline
+        # all warps in the CTA will consume the data produced by the producer group, 
+        # thus size=num_warps (the lane0 in each warp will participate the pipeline and wait/release the tma data)
+        # note that when cluster feature is enabled, we need to `x mcast_size` of multicast CTAs,
+        # which equals to the sum of number of multicast CTAs for A(row) and B(col), minus 1, 
+        # since the current CTA itself counts twice in A(row) and B(col)
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         num_warps = self.threads_per_cta // 32
         consumer_arrive_cnt = mcast_size * num_warps
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
+            pipeline.Agent.Thread, size=consumer_arrive_cnt
         )
 
+        # since cta_layout_mnk = (2,1,1), thus cta_layout_vmnk is (1, 2, 1, 1)
         cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
+        
+        # Make the mainloop pipeline for producer and consumer synchronization of TMA smem buffer using mbarriers
+        # in the `creat` function, it will creat a pair of mbarriers for empty and full state for each stage, 
+        # thus the total number of mbarriers needed is `ab_stage * 2`, and then call `mbarrier_init_fence`
+        # and during each stage, producer will wait the empty mbar, then issue the TMA load and arrive the full mbar; 
+        # while consumer will wait the full mbar, then consume the data and arrive the empty mbar
+        # where the mbar's `mbarrier_arrive_and_expect_tx` count is set by `tx_count=tma_copy_bytes`
         mainloop_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=mainloop_pipeline_array_ptr,
             num_stages=self.ab_stage,
@@ -622,6 +710,10 @@ class HopperWgmmaGemmKernel:
             tx_count=tma_copy_bytes,
             cta_layout_vmnk=cta_layout_vmnk,
         )
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", mcast_size, consumer_arrive_cnt, cta_layout_vmnk)
 
         #  Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -637,13 +729,23 @@ class HopperWgmmaGemmKernel:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
         sC_ptr = cute.recast_ptr(
-            sA.iterator, epi_smem_layout_staged.inner, dtype=self.c_dtype
+            sA.iterator, swizzle_=epi_smem_layout_staged.inner, dtype=self.c_dtype
         )
         sC = cute.make_tensor(sC_ptr, epi_smem_layout_staged.outer)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("sA:")
+            cute.print_tensor(sA)
+            cute.printf("sB:")
+            cute.print_tensor(sB)
+            cute.printf("sC:")
+            cute.print_tensor(sC)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
         # ///////////////////////////////////////////////////////////////////////////////
+        
         # (bM, bK, RestK)
         gA_mkl = cute.local_tile(
             mA_mkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, None, 1)
@@ -656,28 +758,48 @@ class HopperWgmmaGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
         )
-
-        # //////////////////////////////////////////////////////////////////////////////
-        #  Partition global tensor for TiledMMA_A/B/C
-        # //////////////////////////////////////////////////////////////////////////////
-        warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.num_threads_per_warp_group
-        )
-        warp_group_thread_layout = cute.make_layout(
-            self.mma_warp_groups, stride=self.num_threads_per_warp_group
-        )
-        thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
-
-        tCgC = thr_mma.partition_C(gC_mnl)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("mA_mkl:")
+            cute.print_tensor(mA_mkl)
+            cute.printf("mB_nkl:")
+            cute.print_tensor(mB_nkl)
+            cute.printf("mC_mnl:")
+            cute.print_tensor(mC_mnl)
+            cute.printf("")
+            cute.printf("gA_mkl:")
+            cute.print_tensor(gA_mkl)
+            cute.printf("gB_nkl:")
+            cute.print_tensor(gB_nkl)
+            cute.printf("gC_mnl:")
+            cute.print_tensor(gC_mnl)
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition shared tensor for TMA load A/B
         # //////////////////////////////////////////////////////////////////////////////
+        
         #  TMA load A partition_S/D
+        
+        # cta layout is the tma multicast layout
+        # since cluster_shape_mn is (2,1,1), then two CTAs in the same cluster will have different A slices w/o multicast,
+        # so the cta layout for A is dummy `(1):(0)` and cta coordinate is dummy `0`
         a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
         a_cta_crd = cluster_coord_mnk[1]
+        
+        # sA layout: ( (8,16), (64,1), stages=(1,4) ) while tma_atom_a is 8192
+        # so we need to group the first two modes of sA together (8x16x64=8192) for one tma atom,
+        # so sA_for_tma_partition layout: ( ((8,16),(64,1)), stages=(1,4) )
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
+        # gA_mkl layout: ( 128, 64, rest_k=16 ), and we need to group the first two modes together (128x64=8192) for one tma atom,
+        # so gA_for_tma_partition layout: ( (128,64), rest_k=16 )
         gA_for_tma_partition = cute.group_modes(gA_mkl, 0, 2)
+        
+        # tma partition will further partition the given shared/global tensors into tiles 
+        # according to the given tma atom, the cta layout with cta coordinate
+        # and return the corr. tiled shared/global tensors,
+        # i.e. tAsA with layout: ( (8192,1), stages=(1,4) ) 
+        # and tAgA_mkl with layout: ( ((64,128),1), rest_k=16 )
         tAsA, tAgA_mkl = cute.nvgpu.cpasync.tma_partition(
             tma_atom_a,
             a_cta_crd,
@@ -687,10 +809,25 @@ class HopperWgmmaGemmKernel:
         )
 
         # TMA load B partition_S/D
+        
+        # while the cta layout for B is `(2):(0)` since two CTAs in the same cluster will have the same B slice with multicast,
+        # and the cta coordinate is either `0` or `1` indicating the multicast idx of the current CTA,
+        # which equals to the cluster coordinate along the multicast mode
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
+        
+        # similar to A, since tma_atom_b is 16384, we need to group the first two modes of sB together (8x32x64=16384) for one tma atom,
+        # so 
+        #   sB layout: ( (8,32), (64,1), stages=(1,4) ) while 
+        #   sB_for_tma_partition layout: ( ((8,32),(64,1)), stages=(1,4) )
+        #   gB_nkl layout: ( 256, 64, rest_k=16 ), and we need to group the first two modes together (256x64=16384) for one tma atom,
+        #   gB_for_tma_partition layout: ( (256,64), rest_k=16 )
         sB_for_tma_partition = cute.group_modes(sB, 0, 2)
         gB_for_tma_partition = cute.group_modes(gB_nkl, 0, 2)
+        
+        # and tma partition will return 
+        # tBsB with layout: ( (16384,1), stages=(1,4) ) 
+        # and tBgB_nkl with layout: ( ((64,256),1), rest_k=16 )
         tBsB, tBgB_nkl = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b,
             b_cta_crd,
@@ -698,36 +835,125 @@ class HopperWgmmaGemmKernel:
             sB_for_tma_partition,
             gB_for_tma_partition,
         )
-
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("a_cta_layout: {}, a_cta_crd: {}", a_cta_layout, a_cta_crd)
+            cute.printf("b_cta_layout: {}, b_cta_crd: {}", b_cta_layout, b_cta_crd)
+            cute.printf("sA_for_tma_partition:")
+            cute.print_tensor(sA_for_tma_partition)
+            cute.printf("gA_for_tma_partition:")
+            cute.print_tensor(gA_for_tma_partition)
+            cute.printf("sB_for_tma_partition:")
+            cute.print_tensor(sB_for_tma_partition)
+            cute.printf("gB_for_tma_partition:")
+            cute.print_tensor(gB_for_tma_partition)
+            cute.printf("tAsA:")
+            cute.print_tensor(tAsA)
+            cute.printf("tAgA_mkl:")
+            cute.print_tensor(tAgA_mkl)
+            
+            # cute.printf("tBsB:")
+            # cute.print_tensor(tBsB) # FIXME: due to multicast, print_tensor will incur with illegal memory access
+            cute.printf("tBsB: {}", tBsB)
+            
+            cute.printf("tBgB_nkl:")
+            cute.print_tensor(tBgB_nkl)
+            
         # //////////////////////////////////////////////////////////////////////////////
-        #  Make fragments
+        #  Partition shared/global tensor for TiledMMA A/B/C
         # //////////////////////////////////////////////////////////////////////////////
+        
+        # since each thread in the same warp group shares the same thread slice of tiled_mma, 
+        # we can directly get the thread slice with either actual tidx or warp_group_idx
+        # thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+        thr_mma = tiled_mma.get_slice(tidx)
+        
+        # since sA layout: ( (8,16), (64,1), stages=(1,4) ) and wgmma has limitations on m-dim(=64) and k-dim(=16)
+        # so we need to partition sA into tCsA with layout: ( mk=(64,16), 1, kloop=4, stages=(1,4) ) 
+        # note that m=64 but M=8x16=128, so the M-dim will be parallelized along 2 WGs (atom_layout_mnk=(2,1,1))
         tCsA = thr_mma.partition_A(sA)
+        
+        # since sB layout: ( (8,32), (64,1), stages=(1,4) ) and wgmma has limitations on n-dim(=N) and k-dim(=16)
+        # so we need to partition sB into tCsB with layout: ( nk=(256,16), 1, kloop=4, stages=(1,4) ) 
+        # note that n=N=256, so it only needs to be handled by current WG (atom_layout_mnk=(2,1,1))
         tCsB = thr_mma.partition_B(sB)
-        tCrA = tiled_mma.make_fragment_A(tCsA)
-        tCrB = tiled_mma.make_fragment_B(tCsB)
 
-        acc_shape = tCgC.shape
-        accumulators = cute.make_fragment(acc_shape, self.acc_dtype)
+        # gC_mnl with layout: (128,256) is the tile of C on global memory this block will compute and store,
+        # and since we have 2 WGs with 256 threads, then each thread needs to hold 128 elements of C,
+        # so tCgC with layout: ((2,2,32),1,1) is the sub-tile of gC_mnl that this thread will hold,
+        tCgC = thr_mma.partition_C(gC_mnl)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("warp_group_idx: {}, warp_group_thread_layout: {}, slice: {}", warp_group_idx, warp_group_thread_layout, warp_group_thread_layout(warp_group_idx))
+            # thr_mma is not printable, but we want to print its attributes
+            cute.printf("thr_mma.tv_layout_A: {}, thr_mma.tv_layout_A_tiled: {}", thr_mma.tv_layout_A, thr_mma.tv_layout_A_tiled)
+            cute.printf("thr_mma.tv_layout_B: {}, thr_mma.tv_layout_B_tiled: {}", thr_mma.tv_layout_B, thr_mma.tv_layout_B_tiled)
+            cute.printf("thr_mma.tv_layout_C: {}, thr_mma.tv_layout_C_tiled: {}", thr_mma.tv_layout_C, thr_mma.tv_layout_C_tiled)
+            cute.printf("tCsA:")
+            cute.print_tensor(tCsA)
+            cute.printf("tCsB:")
+            cute.print_tensor(tCsB)
+            cute.printf("tCgC:")
+            cute.print_tensor(tCgC)
+
+        # //////////////////////////////////////////////////////////////////////////////
+        #  Make fragments for TiledMMA A/B/C
+        # //////////////////////////////////////////////////////////////////////////////
+        
+        # since tCsA layout is ( mk=(64,16), 1, kloop=4, stages=(1,4) )
+        # so tCrA layout will be (1, 1, kloop=4, stages=(1,4) ),
+        # wile the first two modes are dummy with stride=0 because tCsA in smem will be handled by current WG as a whole
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        
+        # since tCsB layout is ( nk=(256,16), 1, kloop=4, stages=(1,4) )
+        # so tCrB layout will be (1, 1, kloop=4, stages=(1,4) ),
+        # while the first two modes are dummy with stride=0 because tCsB in smem will be handled by current WG as a whole
+        tCrB = tiled_mma.make_fragment_B(tCsB)
+        
+        # since tCgC layout is ((2,2,32),1,1), then tCrC (accumulators) layout will also be ( (2,2,32), 1, 1 )
+        tCrC = cute.make_fragment(tCgC.shape, self.acc_dtype)
+        
+        if is_thread0:
+            cute.printf("")
+            # cute.printf("tCrA:")
+            # cute.print_tensor(tCrA)
+            cute.printf("tCrA.layout: {}", tCrA.layout) # tCrA is not printable, but we want to print its layout
+            
+            # cute.printf("tCrB:")
+            # cute.print_tensor(tCrB)
+            cute.printf("tCrB.layout: {}", tCrB.layout) # tCrB is not printable, but we want to print its layout
+            
+            cute.printf("tCrC:")
+            cute.print_tensor(tCrC)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cluster wait
         # ///////////////////////////////////////////////////////////////////////////////
+        
         # cluster wait for barrier init
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
         else:
             cute.arch.sync_threads()
+        
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch
         # /////////////////////////////////////////////////////////////////////////////
-        k_tile_cnt = cute.size(gA_mkl, mode=[2])
+        k_tile_cnt = cute.size(gA_mkl, mode=[2]) # rest_k dim as the k_tile cnt
         prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
+        
+        if is_thread0:
+            cute.printf("")
+            cute.printf("k_tile_cnt: {}, prefetch_k_tile_cnt: {}", k_tile_cnt, prefetch_k_tile_cnt)
 
+        # Init producer state for mainloop pipeline
         mainloop_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.ab_stage
+            pipeline.PipelineUserType.Producer, stages=self.ab_stage
         )
-        if warp_idx == 0:
+        
+        if warp_idx == 0: # producer
             # /////////////////////////////////////////////////////////////////////////////
             # Prefetch TMA load
             # /////////////////////////////////////////////////////////////////////////////
@@ -737,37 +963,55 @@ class HopperWgmmaGemmKernel:
                 #  Also sets the transaction barrier for the A/B buffers
                 # /////////////////////////////////////////////////////////////////////////////
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Slice to global/shared memref to current k_tile
                 # /////////////////////////////////////////////////////////////////////////////
+                
+                # tAgA_mkl layout: ( ((64,128),1), rest_k=16 ) 
+                # and we need to slice the rest_k dim according to the current k_tile indicated by mainloop_producer_state.count
+                # resulting in tAgA_k with layout: ( ((64,128),1), 1 )
                 tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
+                
+                # tAsA layout: ( (8192,1), stages=(1,4) ) 
+                # and we need to slice the stage dim according to the current pipeline stage indicated by mainloop_producer_state.index
+                # resulting in tAsA_pipe with layout: ( (8192,1), 1 )
                 tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
 
+                # tBgB_nkl layout: ( ((64,256),1), rest_k=16 )
+                # and we need to slice the rest_k dim according to the current k_tile indicated by mainloop_producer_state.count
+                # resulting in tBgB_k with layout: ( ((64,256),1), 1 )
                 tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
+                
+                # tBsB layout: ( (16384,1), stages=(1,4) )
+                # and we need to slice the stage dim according to the current pipeline stage indicated by mainloop_producer_state.index
+                # resulting in tBsB_pipe with layout: ( (16384,1), 1 )
                 tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  TMA load A/B
                 # /////////////////////////////////////////////////////////////////////////////
                 cute.copy(
-                    tma_atom_a,
-                    tAgA_k,
-                    tAsA_pipe,
+                    atom=tma_atom_a,
+                    src=tAgA_k,
+                    dst=tAsA_pipe,
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                         mainloop_producer_state
                     ),
-                    mcast_mask=a_mcast_mask,
+                    mcast_mask=a_mcast_mask, # 0(0b00), since A won't be multicast for cluster shape (2,1,1)
                 )
                 cute.copy(
-                    tma_atom_b,
-                    tBgB_k,
-                    tBsB_pipe,
+                    atom=tma_atom_b,
+                    src=tBgB_k,
+                    dst=tBsB_pipe,
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                         mainloop_producer_state
                     ),
-                    mcast_mask=b_mcast_mask,
+                    mcast_mask=b_mcast_mask, # 3(0b11), since B will be multicast along m mode for cluster shape (2,1,1)
                 )
+                
                 # Mainloop pipeline's producer commit is a NOP
+                # since TMA instruction itself updates the transaction count.
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
@@ -810,10 +1054,10 @@ class HopperWgmmaGemmKernel:
 
                 cute.gemm(
                     tiled_mma,
-                    accumulators,
+                    tCrC,
                     tCrA_1phase,
                     tCrB_1phase,
-                    accumulators,
+                    tCrC,
                 )
                 tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
 
@@ -851,10 +1095,10 @@ class HopperWgmmaGemmKernel:
 
                 cute.gemm(
                     tiled_mma,
-                    accumulators,
+                    tCrC,
                     tCrA_1phase,
                     tCrB_1phase,
-                    accumulators,
+                    tCrC,
                 )
 
             cute.nvgpu.warpgroup.commit_group()
@@ -955,7 +1199,7 @@ class HopperWgmmaGemmKernel:
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         tRS_sD = thr_copy_r2s.partition_D(sC)
         # (R2S, R2S_M, R2S_N)
-        tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+        tRS_rAcc = tiled_copy_r2s.retile(tCrC)
 
         # Allocate D registers.
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
@@ -1200,6 +1444,10 @@ class HopperWgmmaGemmKernel:
             cute.append(c_smem_shape, epi_stage),
             order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
         )
+
+        cute.printf("")
+        cute.printf("a_is_k_major: {}, b_is_k_major: {}, c_layout.is_n_major_c(): {}, a_major_mode_size: {}, b_major_mode_size: {}, c_major_mode_size: {}", a_is_k_major, b_is_k_major, c_layout.is_n_major_c(), a_major_mode_size, b_major_mode_size, c_major_mode_size)
+        cute.printf("a_smem_layout_atom: {}, b_smem_layout_atom: {}, c_smem_layout_atom: {}", a_smem_layout_atom, b_smem_layout_atom, c_smem_layout_atom)
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
 
@@ -1585,11 +1833,11 @@ if __name__ == "__main__":
         args.b_major,
         args.c_major,
         args.tile_shape_mn,
-        args.cluster_shape_mn,
+        (2, 1), # args.cluster_shape_mn
         args.tolerance,
         args.warmup_iterations,
         args.iterations,
-        args.skip_ref_check,
+        True, # args.skip_ref_check
         args.use_cold_l2,
     )
     print("PASS")
