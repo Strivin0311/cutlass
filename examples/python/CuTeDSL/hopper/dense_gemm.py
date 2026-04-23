@@ -979,8 +979,8 @@ class HopperWgmmaGemmKernel:
             pipeline.PipelineUserType.Producer, stages=self.ab_stage
         )
         
-        # Prefetch a full stage of A,B using TMA by producer warp (warp0)
-        if warp_idx == 0:
+        # Prefetch a full stage of A,B using TMA
+        if warp_idx == 0: # producer
             # /////////////////////////////////////////////////////////////////////////////
             # Prefetch TMA load
             # /////////////////////////////////////////////////////////////////////////////
@@ -1048,6 +1048,13 @@ class HopperWgmmaGemmKernel:
         #  Prologue MMAs
         # /////////////////////////////////////////////////////////////////////////////
 
+        # NOTE: we need to use two separate pipeline states:
+        #   1. consumer_read_state to issue consumer_wait 
+        #       to wait the current stage of full mbar before consuming the current data
+        #       as the tail ptr of the pipeline queue
+        #   2. consumer_release_state to issue consumer_release 
+        #       to arrive the empty mbar after consuming the previous data
+        #       as the head ptr of the pipeline queue
         mainloop_consumer_read_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.ab_stage
         )
@@ -1157,11 +1164,19 @@ class HopperWgmmaGemmKernel:
 
             cute.nvgpu.warpgroup.commit_group()
             
-            # Wait on the wgmma barrier for previous prologue_mmas wgmmas to complete
+            # Wait on the wgmma barrier 
+            # to allow at most `prologue_mmas` wgmmas unfinished
+            # i.e. the queue window size is `prologue_mmas` so the previous wgmmas out of the window must complete
+            # and we already issued `prologue_mmas + 1` wgmmas (including current one) at this point,
+            # so this wait equals to waiting for the very earliest issued wgmma (i.e. the current k_tile - prologue_mmas) to complete 
             cute.nvgpu.warpgroup.wait_group(prologue_mmas)
 
+            # When the current k_tile's WGMMA is done, then we can release the current stage of A/B buffer 
+            # by arriving the empty mbar for the current stage
             mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
 
+            # Advance read and release states to next stage 
+            # (i.e. moving both the head/tail ptrs of the pipeline queue)
             mainloop_consumer_read_state.advance()
             mainloop_consumer_release_state.advance()
 
@@ -1174,7 +1189,7 @@ class HopperWgmmaGemmKernel:
             # /////////////////////////////////////////////////////////////////////////////
             #  TMA load
             # /////////////////////////////////////////////////////////////////////////////
-            if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt:
+            if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt: # producer
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Wait for A/B buffers to be empty before loading into them
                 #  Also sets the transaction barrier for the A/B buffers
@@ -1211,6 +1226,7 @@ class HopperWgmmaGemmKernel:
                     ),
                     mcast_mask=b_mcast_mask,
                 )
+                
                 # Mainloop pipeline's producer commit is a NOP
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
