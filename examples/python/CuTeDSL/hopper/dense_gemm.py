@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
 import argparse
 from typing import Tuple, Type
 import math
@@ -39,6 +40,7 @@ import cutlass.cute.testing as testing
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
+from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -101,6 +103,9 @@ Constraints:
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
 """
+
+
+DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
 
 
 # /////////////////////////////////////////////////////////////////////////////
@@ -244,6 +249,7 @@ class HopperWgmmaGemmKernel:
         acc_dtype: type[cutlass.Numeric],
         tile_shape_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
+        debug_print: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -283,6 +289,8 @@ class HopperWgmmaGemmKernel:
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
+
+        self.debug_print = debug_print
 
         self.ab_stage = None
         self.epi_stage = None
@@ -402,15 +410,15 @@ class HopperWgmmaGemmKernel:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        if cutlass.const_expr(
+        if const_expr(
             self.a_dtype.width == 16 and self.a_dtype != self.b_dtype
         ):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-        if cutlass.const_expr(self.a_dtype.width != self.b_dtype.width):
+        if const_expr(self.a_dtype.width != self.b_dtype.width):
             raise TypeError(
                 f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
             )
-        if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
+        if const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError(f"a_dtype should be float16 or float8")
 
         self._setup_attributes()
@@ -457,41 +465,47 @@ class HopperWgmmaGemmKernel:
 
         self.shared_storage = SharedStorage
         
-        print()
-        print(f"{self.tile_shape_mnk=}, {self.atom_layout_mnk=}, {self.cluster_shape_mn=}, {self.num_mcast_ctas_a=}, {self.num_mcast_ctas_b=}, {self.is_a_mcast=}, {self.is_b_mcast=}")
-        print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
-        print("cta_layout_mnk: {}", self.cta_layout_mnk)
-        print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=}, {self.occupancy=}, {self.buffer_align_bytes=}")
-        print()
+        if const_expr(self.debug_print):
+            print()
+            print(f"{self.tile_shape_mnk=}, {self.atom_layout_mnk=}, {self.cluster_shape_mn=}, {self.num_mcast_ctas_a=}, {self.num_mcast_ctas_b=}, {self.is_a_mcast=}, {self.is_b_mcast=}")
+            print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
+            print("cta_layout_mnk: {}", self.cta_layout_mnk)
+            print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=}, {self.occupancy=}, {self.buffer_align_bytes=}")
+            print()
         
-        print()
-        print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
-        print(f"{self.a_layout=}, {self.b_layout=}, {self.c_layout=}")
-        print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.acc_dtype=}")
-        print()
+        if const_expr(self.debug_print):
+            print()
+            print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
+            print(f"{self.a_layout=}, {self.b_layout=}, {self.c_layout=}")
+            print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.acc_dtype=}")
+            print()
         
-        print()
-        print("self.a_smem_layout_staged: {}", self.a_smem_layout_staged)
-        print("self.b_smem_layout_staged: {}", self.b_smem_layout_staged)
-        print("self.epi_smem_layout_staged: {}", self.epi_smem_layout_staged)
-        print()
+        if const_expr(self.debug_print):
+            print()
+            print("self.a_smem_layout_staged: {}", self.a_smem_layout_staged)
+            print("self.b_smem_layout_staged: {}", self.b_smem_layout_staged)
+            print("self.epi_smem_layout_staged: {}", self.epi_smem_layout_staged)
+            print()
         
-        print()
-        print(f"tma_atom_a: {tma_atom_a}")
-        print(f"tma_tensor_a: {tma_tensor_a}")
-        print()
-        print(f"tma_atom_b: {tma_atom_b}")
-        print(f"tma_tensor_b: {tma_tensor_b}")
-        print()
-        print(f"tma_atom_c: {tma_atom_c}")
-        print(f"tma_tensor_c: {tma_tensor_c}")
-        print()
+        if const_expr(self.debug_print):
+            print()
+            print(f"tma_atom_a: {tma_atom_a}")
+            print(f"tma_tensor_a: {tma_tensor_a}")
+            print()
+            print(f"tma_atom_b: {tma_atom_b}")
+            print(f"tma_tensor_b: {tma_tensor_b}")
+            print()
+            print(f"tma_atom_c: {tma_atom_c}")
+            print(f"tma_tensor_c: {tma_tensor_c}")
+            print()
         
-        print()
-        print("tiled_mma: {}", self.tiled_mma)
-        print()
+        if const_expr(self.debug_print):
+            print()
+            print("tiled_mma: {}", self.tiled_mma)
+            print()
         
-        cute.printf("grid: {}", grid)
+        if const_expr(self.debug_print):
+            cute.printf("grid: {}", grid)
 
         # Launch the kernel synchronously
         self.kernel(
@@ -599,10 +613,11 @@ class HopperWgmmaGemmKernel:
         num_reg_cids = cute.size(s_shape)
         cid_m, cid_n = s_layout.get_flat_coord(cluster_id % num_reg_cids)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("s_layout: {}, num_reg_cids: {}", s_layout, num_reg_cids)
-            cute.printf("cid_m: {}, cid_n: {}, cluster_id: {}, bdim: ({}, {}, {}), cdim: ({}, {}, {}), bidx: ({}, {}, {}), cidx: ({}, {}, {})", cid_m, cid_n, cluster_id, *cute.arch.block_dim(), cdimx, cdimy, cdimz, bidx, bidy, bidz, cidx, cidy, cidxz)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("s_layout: {}, num_reg_cids: {}", s_layout, num_reg_cids)
+                cute.printf("cid_m: {}, cid_n: {}, cluster_id: {}, bdim: ({}, {}, {}), cdim: ({}, {}, {}), bidx: ({}, {}, {}), cidx: ({}, {}, {})", cid_m, cid_n, cluster_id, *cute.arch.block_dim(), cdimx, cdimy, cdimz, bidx, bidy, bidz, cidx, cidy, cidxz)
 
         # Deal with the tail part
         if cluster_id >= num_reg_cids:
@@ -626,11 +641,12 @@ class HopperWgmmaGemmKernel:
         )
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("block_in_cluster_idx: {}, block_idx_in_cluster: {}, ", bidx_in_cluster, cute.arch.block_idx_in_cluster())
-            cute.printf("pid_m: {}, pid_n: {}, tile_coord_mnkl: {}, cluster_coord_mnk: {}", pid_m, pid_n, tile_coord_mnkl, cluster_coord_mnk)
-            cute.printf("cta_layout_mnk: {}, cta_rank_in_cluster: {}, cluster_coord_mnk: {}", cta_layout_mnk, cta_rank_in_cluster, cluster_coord_mnk)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("block_in_cluster_idx: {}, block_idx_in_cluster: {}, ", bidx_in_cluster, cute.arch.block_idx_in_cluster())
+                cute.printf("pid_m: {}, pid_n: {}, tile_coord_mnkl: {}, cluster_coord_mnk: {}", pid_m, pid_n, tile_coord_mnkl, cluster_coord_mnk)
+                cute.printf("cta_layout_mnk: {}, cta_rank_in_cluster: {}, cluster_coord_mnk: {}", cta_layout_mnk, cta_rank_in_cluster, cluster_coord_mnk)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get mcast mask
@@ -660,10 +676,11 @@ class HopperWgmmaGemmKernel:
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("a_mcast_mask: {}, b_mcast_mask: {}", a_mcast_mask, b_mcast_mask)
-            cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("a_mcast_mask: {}, b_mcast_mask: {}", a_mcast_mask, b_mcast_mask)
+                cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
@@ -711,9 +728,10 @@ class HopperWgmmaGemmKernel:
             cta_layout_vmnk=cta_layout_vmnk,
         )
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", mcast_size, consumer_arrive_cnt, cta_layout_vmnk)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", mcast_size, consumer_arrive_cnt, cta_layout_vmnk)
 
         #  Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -733,14 +751,15 @@ class HopperWgmmaGemmKernel:
         )
         sC = cute.make_tensor(sC_ptr, epi_smem_layout_staged.outer)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("sA:")
-            cute.print_tensor(sA)
-            cute.printf("sB:")
-            cute.print_tensor(sB)
-            cute.printf("sC:")
-            cute.print_tensor(sC)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("sA:")
+                cute.print_tensor(sA)
+                cute.printf("sB:")
+                cute.print_tensor(sB)
+                cute.printf("sC:")
+                cute.print_tensor(sC)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
@@ -759,21 +778,22 @@ class HopperWgmmaGemmKernel:
             mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
         )
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("mA_mkl:")
-            cute.print_tensor(mA_mkl)
-            cute.printf("mB_nkl:")
-            cute.print_tensor(mB_nkl)
-            cute.printf("mC_mnl:")
-            cute.print_tensor(mC_mnl)
-            cute.printf("")
-            cute.printf("gA_mkl:")
-            cute.print_tensor(gA_mkl)
-            cute.printf("gB_nkl:")
-            cute.print_tensor(gB_nkl)
-            cute.printf("gC_mnl:")
-            cute.print_tensor(gC_mnl)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("mA_mkl:")
+                cute.print_tensor(mA_mkl)
+                cute.printf("mB_nkl:")
+                cute.print_tensor(mB_nkl)
+                cute.printf("mC_mnl:")
+                cute.print_tensor(mC_mnl)
+                cute.printf("")
+                cute.printf("gA_mkl:")
+                cute.print_tensor(gA_mkl)
+                cute.printf("gB_nkl:")
+                cute.print_tensor(gB_nkl)
+                cute.printf("gC_mnl:")
+                cute.print_tensor(gC_mnl)
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition shared tensor for TMA load A/B
@@ -836,29 +856,30 @@ class HopperWgmmaGemmKernel:
             gB_for_tma_partition,
         )
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("a_cta_layout: {}, a_cta_crd: {}", a_cta_layout, a_cta_crd)
-            cute.printf("b_cta_layout: {}, b_cta_crd: {}", b_cta_layout, b_cta_crd)
-            cute.printf("sA_for_tma_partition:")
-            cute.print_tensor(sA_for_tma_partition)
-            cute.printf("gA_for_tma_partition:")
-            cute.print_tensor(gA_for_tma_partition)
-            cute.printf("sB_for_tma_partition:")
-            cute.print_tensor(sB_for_tma_partition)
-            cute.printf("gB_for_tma_partition:")
-            cute.print_tensor(gB_for_tma_partition)
-            cute.printf("tAsA:")
-            cute.print_tensor(tAsA)
-            cute.printf("tAgA_mkl:")
-            cute.print_tensor(tAgA_mkl)
-            
-            # cute.printf("tBsB:")
-            # cute.print_tensor(tBsB) # FIXME: due to multicast, print_tensor will incur with illegal memory access
-            cute.printf("tBsB: {}", tBsB)
-            
-            cute.printf("tBgB_nkl:")
-            cute.print_tensor(tBgB_nkl)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("a_cta_layout: {}, a_cta_crd: {}", a_cta_layout, a_cta_crd)
+                cute.printf("b_cta_layout: {}, b_cta_crd: {}", b_cta_layout, b_cta_crd)
+                cute.printf("sA_for_tma_partition:")
+                cute.print_tensor(sA_for_tma_partition)
+                cute.printf("gA_for_tma_partition:")
+                cute.print_tensor(gA_for_tma_partition)
+                cute.printf("sB_for_tma_partition:")
+                cute.print_tensor(sB_for_tma_partition)
+                cute.printf("gB_for_tma_partition:")
+                cute.print_tensor(gB_for_tma_partition)
+                cute.printf("tAsA:")
+                cute.print_tensor(tAsA)
+                cute.printf("tAgA_mkl:")
+                cute.print_tensor(tAgA_mkl)
+                
+                # cute.printf("tBsB:")
+                # cute.print_tensor(tBsB) # FIXME: due to multicast, print_tensor will incur with illegal memory access
+                cute.printf("tBsB: {}", tBsB)
+                
+                cute.printf("tBgB_nkl:")
+                cute.print_tensor(tBgB_nkl)
             
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition shared/global tensor for TiledMMA A/B/C
@@ -884,19 +905,20 @@ class HopperWgmmaGemmKernel:
         # so tCgC with layout: ((2,2,32),1,1) is the sub-tile of gC_mnl that this thread will hold,
         tCgC = thr_mma.partition_C(gC_mnl)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("warp_group_idx: {}, warp_group_thread_layout: {}, slice: {}", warp_group_idx, warp_group_thread_layout, warp_group_thread_layout(warp_group_idx))
-            # thr_mma is not printable, but we want to print its attributes
-            cute.printf("thr_mma.tv_layout_A: {}, thr_mma.tv_layout_A_tiled: {}", thr_mma.tv_layout_A, thr_mma.tv_layout_A_tiled)
-            cute.printf("thr_mma.tv_layout_B: {}, thr_mma.tv_layout_B_tiled: {}", thr_mma.tv_layout_B, thr_mma.tv_layout_B_tiled)
-            cute.printf("thr_mma.tv_layout_C: {}, thr_mma.tv_layout_C_tiled: {}", thr_mma.tv_layout_C, thr_mma.tv_layout_C_tiled)
-            cute.printf("tCsA:")
-            cute.print_tensor(tCsA)
-            cute.printf("tCsB:")
-            cute.print_tensor(tCsB)
-            cute.printf("tCgC:")
-            cute.print_tensor(tCgC)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("warp_group_idx: {}, warp_group_thread_layout: {}, slice: {}", warp_group_idx, warp_group_thread_layout, warp_group_thread_layout(warp_group_idx))
+                # thr_mma is not printable, but we want to print its attributes
+                cute.printf("thr_mma.tv_layout_A: {}, thr_mma.tv_layout_A_tiled: {}", thr_mma.tv_layout_A, thr_mma.tv_layout_A_tiled)
+                cute.printf("thr_mma.tv_layout_B: {}, thr_mma.tv_layout_B_tiled: {}", thr_mma.tv_layout_B, thr_mma.tv_layout_B_tiled)
+                cute.printf("thr_mma.tv_layout_C: {}, thr_mma.tv_layout_C_tiled: {}", thr_mma.tv_layout_C, thr_mma.tv_layout_C_tiled)
+                cute.printf("tCsA:")
+                cute.print_tensor(tCsA)
+                cute.printf("tCsB:")
+                cute.print_tensor(tCsB)
+                cute.printf("tCgC:")
+                cute.print_tensor(tCgC)
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Make fragments for TiledMMA A/B/C
@@ -915,18 +937,19 @@ class HopperWgmmaGemmKernel:
         # since tCgC layout is ((2,2,32),1,1), then tCrC (accumulators) layout will also be ( (2,2,32), 1, 1 )
         tCrC = cute.make_fragment(tCgC.shape, self.acc_dtype)
         
-        if is_thread0:
-            cute.printf("")
-            # cute.printf("tCrA:")
-            # cute.print_tensor(tCrA)
-            cute.printf("tCrA.layout: {}", tCrA.layout) # tCrA is not printable, but we want to print its layout
-            
-            # cute.printf("tCrB:")
-            # cute.print_tensor(tCrB)
-            cute.printf("tCrB.layout: {}", tCrB.layout) # tCrB is not printable, but we want to print its layout
-            
-            cute.printf("tCrC:")
-            cute.print_tensor(tCrC)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                # cute.printf("tCrA:")
+                # cute.print_tensor(tCrA)
+                cute.printf("tCrA.layout: {}", tCrA.layout) # tCrA is not printable, but we want to print its layout
+                
+                # cute.printf("tCrB:")
+                # cute.print_tensor(tCrB)
+                cute.printf("tCrB.layout: {}", tCrB.layout) # tCrB is not printable, but we want to print its layout
+                
+                cute.printf("tCrC:")
+                cute.print_tensor(tCrC)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cluster wait
@@ -944,9 +967,10 @@ class HopperWgmmaGemmKernel:
         k_tile_cnt = cute.size(gA_mkl, mode=[2]) # rest_k dim as the k_tile cnt
         prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
         
-        if is_thread0:
-            cute.printf("")
-            cute.printf("k_tile_cnt: {}, prefetch_k_tile_cnt: {}", k_tile_cnt, prefetch_k_tile_cnt)
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("k_tile_cnt: {}, prefetch_k_tile_cnt: {}", k_tile_cnt, prefetch_k_tile_cnt)
 
         # Init producer state for mainloop pipeline
         mainloop_producer_state = pipeline.make_pipeline_state(
@@ -1350,8 +1374,8 @@ class HopperWgmmaGemmKernel:
             tile_n = min(n_perf, cute.size(tile_shape_mnk, mode=[1]))
             return (tile_m, tile_n)
 
-    @staticmethod
     def _make_smem_layouts(
+        self,
         tile_shape_mnk: tuple[int, int, int],
         epi_tile: tuple[int, int],
         a_dtype: type[cutlass.Numeric],
@@ -1445,9 +1469,10 @@ class HopperWgmmaGemmKernel:
             order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
         )
 
-        cute.printf("")
-        cute.printf("a_is_k_major: {}, b_is_k_major: {}, c_layout.is_n_major_c(): {}, a_major_mode_size: {}, b_major_mode_size: {}, c_major_mode_size: {}", a_is_k_major, b_is_k_major, c_layout.is_n_major_c(), a_major_mode_size, b_major_mode_size, c_major_mode_size)
-        cute.printf("a_smem_layout_atom: {}, b_smem_layout_atom: {}, c_smem_layout_atom: {}", a_smem_layout_atom, b_smem_layout_atom, c_smem_layout_atom)
+        if const_expr(self.debug_print):
+            cute.printf("")
+            cute.printf("a_is_k_major: {}, b_is_k_major: {}, c_layout.is_n_major_c(): {}, a_major_mode_size: {}, b_major_mode_size: {}, c_major_mode_size: {}", a_is_k_major, b_is_k_major, c_layout.is_n_major_c(), a_major_mode_size, b_major_mode_size, c_major_mode_size)
+            cute.printf("a_smem_layout_atom: {}, b_smem_layout_atom: {}, c_smem_layout_atom: {}", a_smem_layout_atom, b_smem_layout_atom, c_smem_layout_atom)
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
 
@@ -1748,7 +1773,7 @@ def run(
     b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
     c, mC, c_torch = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
 
-    gemm = HopperWgmmaGemmKernel(acc_dtype, tile_shape_mn, cluster_shape_mn)
+    gemm = HopperWgmmaGemmKernel(acc_dtype, tile_shape_mn, cluster_shape_mn, debug_print=DEBUG_MODE)
 
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -1833,11 +1858,11 @@ if __name__ == "__main__":
         args.b_major,
         args.c_major,
         args.tile_shape_mn,
-        (2, 1), # args.cluster_shape_mn
+        (2, 1) if DEBUG_MODE else args.cluster_shape_mn,
         args.tolerance,
         args.warmup_iterations,
         args.iterations,
-        True, # args.skip_ref_check
+        True if DEBUG_MODE else args.skip_ref_check,
         args.use_cold_l2,
     )
     print("PASS")
