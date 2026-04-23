@@ -324,13 +324,14 @@ class HopperWgmmaGemmKernel:
             raise ValueError("CTA tile shape N must be 64/128/256")
 
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_layout.sm90_mma_major_mode(),
-            self.b_layout.sm90_mma_major_mode(),
-            self.acc_dtype,
-            self.atom_layout_mnk,
+            a_dtype=self.a_dtype,
+            b_dtype=self.b_dtype,
+            a_leading_mode=self.a_layout.sm90_mma_major_mode(),
+            b_leading_mode=self.b_layout.sm90_mma_major_mode(),
+            acc_dtype=self.acc_dtype,
+            atom_layout_mnk=self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1]),
+            a_source=cute.nvgpu.warpgroup.OperandSource.SMEM,
         )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
@@ -473,21 +474,18 @@ class HopperWgmmaGemmKernel:
             print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=}, {self.occupancy=}, {self.buffer_align_bytes=}")
             print()
         
-        if const_expr(self.debug_print):
             print()
             print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
             print(f"{self.a_layout=}, {self.b_layout=}, {self.c_layout=}")
             print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.acc_dtype=}")
             print()
         
-        if const_expr(self.debug_print):
             print()
             print("self.a_smem_layout_staged: {}", self.a_smem_layout_staged)
             print("self.b_smem_layout_staged: {}", self.b_smem_layout_staged)
             print("self.epi_smem_layout_staged: {}", self.epi_smem_layout_staged)
             print()
         
-        if const_expr(self.debug_print):
             print()
             print(f"tma_atom_a: {tma_atom_a}")
             print(f"tma_tensor_a: {tma_tensor_a}")
@@ -499,12 +497,10 @@ class HopperWgmmaGemmKernel:
             print(f"tma_tensor_c: {tma_tensor_c}")
             print()
         
-        if const_expr(self.debug_print):
             print()
             print("tiled_mma: {}", self.tiled_mma)
             print()
         
-        if const_expr(self.debug_print):
             cute.printf("grid: {}", grid)
 
         # Launch the kernel synchronously
@@ -670,25 +666,28 @@ class HopperWgmmaGemmKernel:
 
         a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
-        tma_copy_bytes = cute.size_in_bytes(
-            self.a_dtype, a_smem_layout
-        ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
         
         if const_expr(self.debug_print):
             if is_thread0:
                 cute.printf("")
                 cute.printf("a_mcast_mask: {}, b_mcast_mask: {}", a_mcast_mask, b_mcast_mask)
-                cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
         # /////////////////////////////////////////////////////////////////////////////
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        
+        # Get the tma copy bytes for each stage,
+        # note that we need to wait both A/B and ready, thus the tma copy bytes is the sum of A and B copy size, 
+        # which is determined by the smem layout per stage and data type
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
+        tma_copy_bytes = cute.size_in_bytes(
+            self.a_dtype, a_smem_layout
+        ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
-        # get mbar arrays ptr
+        # Get mbar arrays ptr
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
         # Define producer group for mainloop pipeline
@@ -731,6 +730,7 @@ class HopperWgmmaGemmKernel:
         if const_expr(self.debug_print):
             if is_thread0:
                 cute.printf("")
+                cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
                 cute.printf("mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", mcast_size, consumer_arrive_cnt, cta_layout_vmnk)
 
         #  Cluster arrive after barrier init
@@ -964,20 +964,23 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch
         # /////////////////////////////////////////////////////////////////////////////
-        k_tile_cnt = cute.size(gA_mkl, mode=[2]) # rest_k dim as the k_tile cnt
-        prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
+        prologue_mmas = 1
+        k_tile_cnt = cute.size(gA_mkl, mode=[2]) # rest_k dim as the k_tile cnt (16)
+        num_k_blocks = cute.size(tCrA, mode=[2]) # kloop dim as the k_block cnt (4)
+        prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0) # min(rest_k, stages) = stages = 4
         
         if const_expr(self.debug_print):
             if is_thread0:
                 cute.printf("")
-                cute.printf("k_tile_cnt: {}, prefetch_k_tile_cnt: {}", k_tile_cnt, prefetch_k_tile_cnt)
+                cute.printf("prologue_mmas: {}, prefetch_k_tile_cnt: {}, num_k_blocks: {}", prologue_mmas, prefetch_k_tile_cnt, num_k_blocks)
 
         # Init producer state for mainloop pipeline
         mainloop_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, stages=self.ab_stage
         )
         
-        if warp_idx == 0: # producer
+        # Prefetch a full stage of A,B using TMA by producer warp (warp0)
+        if warp_idx == 0:
             # /////////////////////////////////////////////////////////////////////////////
             # Prefetch TMA load
             # /////////////////////////////////////////////////////////////////////////////
@@ -986,6 +989,8 @@ class HopperWgmmaGemmKernel:
                 #  Wait for A/B buffers to be empty before loading into them
                 #  Also sets the transaction barrier for the A/B buffers
                 # /////////////////////////////////////////////////////////////////////////////
+                
+                # producer acquire will wait the empty mbar and arrive the full mbar
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
                 
                 # /////////////////////////////////////////////////////////////////////////////
@@ -1042,7 +1047,6 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  Prologue MMAs
         # /////////////////////////////////////////////////////////////////////////////
-        k_pipe_mmas = 1
 
         mainloop_consumer_read_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.ab_stage
@@ -1053,18 +1057,32 @@ class HopperWgmmaGemmKernel:
 
         peek_ab_full_status = cutlass.Boolean(1)
         if mainloop_consumer_read_state.count < k_tile_cnt:
+            # consumer will peek if the full mbar is arrived without blocking, 
+            # and return the token in peek_ab_full_status (token == 1, then arrived and no need to wait; token == 0, then not arrived and need to wait)
             peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                 mainloop_consumer_read_state
             )
 
+        # NOTE: we only allocate tCrC for the accumulator of WGMMA, but we don't zeros it,
+        # so the first WGMMA needs to set ACCUMULATE to False to avoid using the uninitialized value in tCrC, 
+        # and then set it back to True for the rest WGMMA in the mainloop
         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-        num_k_blocks = cute.size(tCrA, mode=[2])
-        for k_tile in cutlass.range_constexpr(k_pipe_mmas):
-            # Wait for A/B buffer to be ready
+        for k_tile in cutlass.range_constexpr(prologue_mmas):
+            # Wait for the current stage of full mbar, i.e. A/B smem buffer to be ready,
+            # since we try wait earlier, so if peek_ab_full_status is true (token == 1),
+            # then consumer won't need to check the full mbar here and can directly go to consume the data;
             mainloop_pipeline.consumer_wait(
                 mainloop_consumer_read_state, peek_ab_full_status
             )
 
+            # NOTE: case1: Before the first WGMMA, we need call `wgmma.fence.sync.aligned` to 
+            #   1. ensure the memory operations by generic proxy to registers of the accumulator (like zeros), and the operand A if RS, are visible to wgmma proxy.
+            #   2. hand over the ownership of the accumulator registers and operand A if RS from generic proxy to wgmma proxy (so even no zeros, we still need ti call this fence).
+            # 
+            # case2: The same as to when we modify the registers between two WGMMA calls in the mainloop, 
+            # we also need to call `wgmma.fence.sync.aligned` to ensure the visibility of the modified registers to wgmma proxy for the next WGMMA call.
+            # 
+            # case3: Otherwise, we don't have to call fence between each iteration of WGMMA in the mainloop, since no memory operations by generic proxy in between.
             cute.nvgpu.warpgroup.fence()
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
@@ -1076,17 +1094,28 @@ class HopperWgmmaGemmKernel:
                 tCrA_1phase = tCrA[k_block_coord]
                 tCrB_1phase = tCrB[k_block_coord]
 
+                # D = A*B + C, where A and B are from smem and C is from register, 
+                # and the result is stored back to register D (which can be alias to C)
                 cute.gemm(
-                    tiled_mma,
-                    tCrC,
-                    tCrA_1phase,
-                    tCrB_1phase,
-                    tCrC,
+                    atom=tiled_mma,
+                    d=tCrC,
+                    a=tCrA_1phase,
+                    b=tCrB_1phase,
+                    c=tCrC,
                 )
+                
+                # After the first WGMMA, we set ACCUMULATE to True 
+                # for the rest WGMMA in the mainloop to accumulate on the result in tCrC
                 tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
 
+            # Commit the num_k_blocks WGMMA calls in the current k_tile
+            # to let wgmma engine runs them as a batch
             cute.nvgpu.warpgroup.commit_group()
+            
+            # Advance to next block of global A/B and next stage of smem A/B buffer
             mainloop_consumer_read_state.advance()
+            
+            # Peek next stage of A/B full mbar
             peek_ab_full_status = cutlass.Boolean(1)
             if mainloop_consumer_read_state.count < k_tile_cnt:
                 peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
@@ -1096,13 +1125,14 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  MAINLOOP
         # /////////////////////////////////////////////////////////////////////////////
-        for k_tile in cutlass.range(k_pipe_mmas, k_tile_cnt, 1, unroll=1):
+        for k_tile in cutlass.range(prologue_mmas, k_tile_cnt, 1, unroll=1):
             # /////////////////////////////////////////////////////////////////////////////
             #  Wait for TMA copies to complete
             # /////////////////////////////////////////////////////////////////////////////
             mainloop_pipeline.consumer_wait(
                 mainloop_consumer_read_state, peek_ab_full_status
             )
+            
             # /////////////////////////////////////////////////////////////////////////////
             #  WGMMA
             # /////////////////////////////////////////////////////////////////////////////
@@ -1118,16 +1148,17 @@ class HopperWgmmaGemmKernel:
                 tCrB_1phase = tCrB[k_block_coord]
 
                 cute.gemm(
-                    tiled_mma,
-                    tCrC,
-                    tCrA_1phase,
-                    tCrB_1phase,
-                    tCrC,
+                    atom=tiled_mma,
+                    d=tCrC,
+                    a=tCrA_1phase,
+                    b=tCrB_1phase,
+                    c=tCrC,
                 )
 
             cute.nvgpu.warpgroup.commit_group()
-            # Wait on the wgmma barrier for previous k_pipe_mmas wgmmas to complete
-            cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
+            
+            # Wait on the wgmma barrier for previous prologue_mmas wgmmas to complete
+            cute.nvgpu.warpgroup.wait_group(prologue_mmas)
 
             mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
 
@@ -1139,6 +1170,7 @@ class HopperWgmmaGemmKernel:
                 peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                     mainloop_consumer_read_state
                 )
+                
             # /////////////////////////////////////////////////////////////////////////////
             #  TMA load
             # /////////////////////////////////////////////////////////////////////////////
