@@ -3,11 +3,12 @@
 BUILD_ROOT=build
 
 # NOTE: don't forget 'a' at the end, according to https://github.com/NVIDIA/cutlass?tab=readme-ov-file#target-architecture
-ARCH=90a # H100 / H800
+# ARCH=90a # H100 / H800
 # ARCH=100a # B200
 # ARCH=103a # B300
+ARCH=${ARCH:-90a}
 
-OPTIONS=""
+OPTIONS=${OPTIONS:-""}
 # OPTIONS="-DCUTLASS_LIBRARY_KERNELS=all"
 # OPTIONS="-DGOOGLETEST_DIR=/path/to/googletest"
 
