@@ -376,6 +376,15 @@ class HopperWgmmaGemmKernel:
             self.c_dtype,
             self.c_layout,
             self.epi_stage,
+            debug_print=self.debug_print,
+        )
+        
+        self.epi_tiled_copy_r2s = self._make_epi_tiled_copy(
+            tiled_mma=self.tiled_mma,
+            c_layout=self.c_layout,
+            c_dtype=self.c_dtype,
+            acc_dtype=self.acc_dtype,
+            debug_print=self.debug_print,
         )
 
     @cute.jit
@@ -500,6 +509,10 @@ class HopperWgmmaGemmKernel:
             print()
             print("tiled_mma: {}", self.tiled_mma)
             print()
+            
+            print()
+            print("epi_tiled_copy_r2s: {}", self.epi_tiled_copy_r2s)
+            print()
         
             cute.printf("grid: {}", grid)
 
@@ -512,6 +525,7 @@ class HopperWgmmaGemmKernel:
             tma_atom_c,
             tma_tensor_c,
             self.tiled_mma,
+            self.epi_tiled_copy_r2s,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -535,6 +549,7 @@ class HopperWgmmaGemmKernel:
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
         tiled_mma: cute.TiledMma,
+        epi_tiled_copy_r2s: cute.TiledCopy,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -738,7 +753,7 @@ class HopperWgmmaGemmKernel:
             cute.arch.cluster_arrive_relaxed()
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Generate smem tensor A/B
+        #  Generate smem tensor A/B/C
         # ///////////////////////////////////////////////////////////////////////////////
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
@@ -746,6 +761,9 @@ class HopperWgmmaGemmKernel:
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
+        
+        # NOTE: smem of C reuses the one of A, since during the epilogue, A/B smem is no longer needed, 
+        # thus we can reuse A's smem for C to save smem usage
         sC_ptr = cute.recast_ptr(
             sA.iterator, swizzle_=epi_smem_layout_staged.inner, dtype=self.c_dtype
         )
@@ -955,7 +973,8 @@ class HopperWgmmaGemmKernel:
         #  Cluster wait
         # ///////////////////////////////////////////////////////////////////////////////
         
-        # cluster wait for barrier init
+        # TODO(REVIEW): do we need this cluster wait, since `pipeline.PipelineTmaAsync.create` 
+        # has already issued `cluster_arrive_relaxed` and `cluster_wait` inside ?
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
         else:
@@ -1234,6 +1253,8 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  EPILOG
         # /////////////////////////////////////////////////////////////////////////////
+        
+        # Wait all issued wgmmas to complete, to ensure the accumulated results in tCrC are ready to be stored
         cute.nvgpu.warpgroup.wait_group(0)
 
         if cute.size(self.cluster_shape_mn) > 1:
@@ -1246,32 +1267,23 @@ class HopperWgmmaGemmKernel:
             # the mainloop is reused in the epilogue.
             cute.arch.sync_threads()
 
-        copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-            self.c_layout,
-            elem_ty_d=self.c_dtype,
-            elem_ty_acc=self.acc_dtype,
-        )
-
-        copy_atom_C = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                self.c_layout.is_m_major_c(),
-                4,
-            ),
-            self.c_dtype,
-        )
-
-        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
-
-        tiled_copy_r2s = cute.make_tiled_copy_S(
-            copy_atom_r2s,
-            tiled_copy_C_Atom,
-        )
-
         # (R2S, R2S_M, R2S_N, PIPE_D)
-        thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        thr_copy_r2s = epi_tiled_copy_r2s.get_slice(tidx)
         tRS_sD = thr_copy_r2s.partition_D(sC)
         # (R2S, R2S_M, R2S_N)
-        tRS_rAcc = tiled_copy_r2s.retile(tCrC)
+        tRS_rAcc = epi_tiled_copy_r2s.retile(tCrC)
+        
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("thr_copy_r2s.layout_src_tv: {}", thr_copy_r2s.layout_src_tv)
+                cute.printf("thr_copy_r2s.layout_src_tv_tiled: {}", thr_copy_r2s.layout_src_tv_tiled)
+                cute.printf("thr_copy_r2s.layout_dst_tv: {}", thr_copy_r2s.layout_dst_tv)
+                cute.printf("thr_copy_r2s.layout_dst_tv_tiled: {}", thr_copy_r2s.layout_dst_tv_tiled)
+                cute.printf("tRS_sD:")
+                cute.print_tensor(tRS_sD)
+                cute.printf("tRS_rAcc:")
+                cute.print_tensor(tRS_rAcc)
 
         # Allocate D registers.
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
@@ -1318,7 +1330,7 @@ class HopperWgmmaGemmKernel:
             # Copy from D registers to shared memory
             epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
             cute.copy(
-                tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
+                epi_tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
             )
 
             cute.arch.fence_proxy(
@@ -1422,8 +1434,8 @@ class HopperWgmmaGemmKernel:
             tile_n = min(n_perf, cute.size(tile_shape_mnk, mode=[1]))
             return (tile_m, tile_n)
 
+    @staticmethod
     def _make_smem_layouts(
-        self,
         tile_shape_mnk: tuple[int, int, int],
         epi_tile: tuple[int, int],
         a_dtype: type[cutlass.Numeric],
@@ -1434,6 +1446,7 @@ class HopperWgmmaGemmKernel:
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
         epi_stage: int,
+        debug_print: bool = False,
     ) -> tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]:
         """Create shared memory layouts for A, B, and C tensors.
 
@@ -1517,12 +1530,50 @@ class HopperWgmmaGemmKernel:
             order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
         )
 
-        if const_expr(self.debug_print):
+        if const_expr(debug_print):
             cute.printf("")
             cute.printf("a_is_k_major: {}, b_is_k_major: {}, c_layout.is_n_major_c(): {}, a_major_mode_size: {}, b_major_mode_size: {}, c_major_mode_size: {}", a_is_k_major, b_is_k_major, c_layout.is_n_major_c(), a_major_mode_size, b_major_mode_size, c_major_mode_size)
             cute.printf("a_smem_layout_atom: {}, b_smem_layout_atom: {}, c_smem_layout_atom: {}", a_smem_layout_atom, b_smem_layout_atom, c_smem_layout_atom)
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
+
+    @staticmethod
+    def _make_epi_tiled_copy(
+        tiled_mma: cute.TiledMma,
+        c_layout: utils.LayoutEnum,
+        c_dtype: type[cutlass.Numeric],
+        acc_dtype: type[cutlass.Numeric],
+        debug_print: bool = False,
+    ) -> cute.TiledCopy:
+        copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+            c_layout,
+            elem_ty_d=c_dtype,
+            elem_ty_acc=acc_dtype,
+        )
+
+        copy_atom_C = cute.make_copy_atom(
+            cute.nvgpu.warp.StMatrix8x8x16bOp(
+                c_layout.is_m_major_c(),
+                4,
+            ),
+            c_dtype,
+        )
+
+        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+
+        tiled_copy_r2s = cute.make_tiled_copy_S(
+            copy_atom_r2s,
+            tiled_copy_C_Atom,
+        )
+        
+        if const_expr(debug_print):
+            print()
+            print(f"{c_layout.is_m_major_c()=}")
+            print("copy_atom_r2s: {}", copy_atom_r2s)
+            print("copy_atom_C: {}", copy_atom_C)
+            print("tiled_copy_C_Atom: {}", tiled_copy_C_Atom)
+        
+        return tiled_copy_r2s
 
     @staticmethod
     def _compute_grid(
