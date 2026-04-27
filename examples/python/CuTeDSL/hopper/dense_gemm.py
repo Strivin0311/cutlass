@@ -1728,9 +1728,30 @@ class HopperWgmmaGemmKernel:
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
         """
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
+        
+        # NOTE: this step is also the first step inside of `make_tiled_tma_atom`
+        # and it can be executed in advance here since ID∘X = X
+        # so we can directly pass in epi_tile as the cta tiler just like tma atom of A/B
+        # 
+        # and the reason why cute needs to use this ID composition, is to make the cta tiler a TMA layout with the basis stride:
+        # e.g. epi_tiler=(128,32) => c_cta_v_layout: (128,32):(1@0,1@1)
+        # it is different from the layout with normal stride, mapping a coord (m,n) to a flatten offset integer
+        # which will map a coord to the multi-dim TMA coord tuple (d0, d1) to TMA
+        # since TMA will store the strides of each dim itself and figure its own offset
+        # 
+        # e.g. for smem tma tensor mA_mkl: (m=2048,n=1024,l=1):(1@1,1@0,1@2), where `1@k` means the k-th basis vector,
+        # so the n is the innermost dim0, m is second dim1, and l is the outermost dim2, 
+        # indicating it is a col-major layout of (m,k) and the l is the "batch" dim
+        # 
+        # and for gmem tma tensor gA_mkl: (128,64,16):(1@1,1@0,64@0), where `N@k` means the vector 
+        # with the same direction as the k-th basis vector but with length/mode of N, 
+        # so the k is the innermost dim0 with step size 1, m is the second dim1 with step size 1, 
+        # and l is also the dim0, but with step size 64 == k,
+        # indication it is a col-major layout of (m,k), and l is actually the "rest_k" dim
         c_cta_v_layout = cute.composition(
             cute.make_identity_layout(tensor_c.shape), epi_tile
         )
+        
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op=cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             gmem_tensor=tensor_c,
