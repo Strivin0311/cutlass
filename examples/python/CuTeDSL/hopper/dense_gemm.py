@@ -451,6 +451,7 @@ class HopperWgmmaGemmKernel:
             c,
             self.epi_smem_layout_staged,
             self.epi_tile,
+            debug_print=self.debug_print,
         )
 
         grid = self._compute_grid(c, self.tile_shape_mnk, self.cluster_shape_mn)
@@ -711,6 +712,7 @@ class HopperWgmmaGemmKernel:
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size=1
         )
+        
         # Define consumer group for mainloop pipeline
         # all warps in the CTA will consume the data produced by the producer group, 
         # thus size=num_warps (the lane0 in each warp will participate the pipeline and wait/release the tma data)
@@ -724,15 +726,16 @@ class HopperWgmmaGemmKernel:
             pipeline.Agent.Thread, size=consumer_arrive_cnt
         )
 
-        # since cta_layout_mnk = (2,1,1), thus cta_layout_vmnk is (1, 2, 1, 1)
+        # since cta_layout_mnk = (2,1,1), thus cta_layout_vmnk is (1,2,1,1)
         cta_layout_vmnk = cute.make_layout((1, *cta_layout_mnk.shape))
         
-        # Make the mainloop pipeline for producer and consumer synchronization of TMA smem buffer using mbarriers
-        # in the `creat` function, it will creat a pair of mbarriers for empty and full state for each stage, 
-        # thus the total number of mbarriers needed is `ab_stage * 2`, and then call `mbarrier_init_fence`
-        # and during each stage, producer will wait the empty mbar, then issue the TMA load and arrive the full mbar; 
-        # while consumer will wait the full mbar, then consume the data and arrive the empty mbar
-        # where the mbar's `mbarrier_arrive_and_expect_tx` count is set by `tx_count=tma_copy_bytes`
+        # Make the mainloop pipeline for producer and consumer synchronization of TMA smem buffer using mbarriers in the `create` function
+        #   1. it will creat a pair of mbarriers for empty and full state for each stage,
+        #       thus the total number of mbarriers needed is `ab_stage * 2`, and then call `mbarrier_init_fence`
+        #   2. and during each stage, producer will wait the empty mbar, arrive the full mbar and expect `tma_copy_bytes` of `tx_count`, 
+        #       and then issue the TMA load to update the `tx_count` on full mbar;
+        #   3. while the consumer will wait the full mbar, i.e. the TMA load completion, then consume the data,
+        #       and arrive the empty mbar and expect 0 `tx_count`, just to notify the producer that the stage is consumed and empty again for the next iteration
         mainloop_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=mainloop_pipeline_array_ptr,
             num_stages=self.ab_stage,
@@ -819,13 +822,13 @@ class HopperWgmmaGemmKernel:
         
         #  TMA load A partition_S/D
         
-        # cta layout is the tma multicast layout
+        # The cta layout is the tma multicast layout
         # since cluster_shape_mn is (2,1,1), then two CTAs in the same cluster will have different A slices w/o multicast,
         # so the cta layout for A is dummy `(1):(0)` and cta coordinate is dummy `0`
         a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
         a_cta_crd = cluster_coord_mnk[1]
         
-        # sA layout: ( (8,16), (64,1), stages=(1,4) ) while tma_atom_a is 8192
+        # Since sA layout: ( (8,16), (64,1), stages=(1,4) ) while tma_atom_a is 8192
         # so we need to group the first two modes of sA together (8x16x64=8192) for one tma atom,
         # so sA_for_tma_partition layout: ( ((8,16),(64,1)), stages=(1,4) )
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
@@ -833,7 +836,7 @@ class HopperWgmmaGemmKernel:
         # so gA_for_tma_partition layout: ( (128,64), rest_k=16 )
         gA_for_tma_partition = cute.group_modes(gA_mkl, 0, 2)
         
-        # tma partition will further partition the given shared/global tensors into tiles 
+        # Then, tma partition will further partition the given shared/global tensors into tiles 
         # according to the given tma atom, the cta layout with cta coordinate
         # and return the corr. tiled shared/global tensors,
         # i.e. tAsA with layout: ( (8192,1), stages=(1,4) ) 
@@ -848,13 +851,13 @@ class HopperWgmmaGemmKernel:
 
         # TMA load B partition_S/D
         
-        # while the cta layout for B is `(2):(0)` since two CTAs in the same cluster will have the same B slice with multicast,
+        # While the cta layout for B is `(2):(0)` since two CTAs in the same cluster will have the same B slice with multicast,
         # and the cta coordinate is either `0` or `1` indicating the multicast idx of the current CTA,
         # which equals to the cluster coordinate along the multicast mode
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
         
-        # similar to A, since tma_atom_b is 16384, we need to group the first two modes of sB together (8x32x64=16384) for one tma atom,
+        # Similar to A, since tma_atom_b is 16384, we need to group the first two modes of sB together (8x32x64=16384) for one tma atom,
         # so 
         #   sB layout: ( (8,32), (64,1), stages=(1,4) ) while 
         #   sB_for_tma_partition layout: ( ((8,32),(64,1)), stages=(1,4) )
@@ -863,7 +866,7 @@ class HopperWgmmaGemmKernel:
         sB_for_tma_partition = cute.group_modes(sB, 0, 2)
         gB_for_tma_partition = cute.group_modes(gB_nkl, 0, 2)
         
-        # and tma partition will return 
+        # And tma partition will return 
         # tBsB with layout: ( (16384,1), stages=(1,4) ) 
         # and tBgB_nkl with layout: ( ((64,256),1), rest_k=16 )
         tBsB, tBgB_nkl = cute.nvgpu.cpasync.tma_partition(
@@ -1009,7 +1012,8 @@ class HopperWgmmaGemmKernel:
                 #  Also sets the transaction barrier for the A/B buffers
                 # /////////////////////////////////////////////////////////////////////////////
                 
-                # producer acquire will wait the empty mbar and arrive the full mbar
+                # producer acquire will wait the empty mbar using `mbarrier.try_wait.parity.shared`
+                # and arrive the full mbar using `mbarrier_arrive_and_expect_tx`, where the tx_count = tma_copy_bytes
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
                 
                 # /////////////////////////////////////////////////////////////////////////////
@@ -1058,8 +1062,8 @@ class HopperWgmmaGemmKernel:
                     mcast_mask=b_mcast_mask, # 3(0b11), since B will be multicast along m mode for cluster shape (2,1,1)
                 )
                 
-                # Mainloop pipeline's producer commit is a NOP
-                # since TMA instruction itself updates the transaction count.
+                # NOTE: Mainloop pipeline's producer commit is a NOP
+                # since TMA instruction itself updates the transaction count in full mbar
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
@@ -1083,8 +1087,10 @@ class HopperWgmmaGemmKernel:
 
         peek_ab_full_status = cutlass.Boolean(1)
         if mainloop_consumer_read_state.count < k_tile_cnt:
-            # consumer will peek if the full mbar is arrived without blocking, 
-            # and return the token in peek_ab_full_status (token == 1, then arrived and no need to wait; token == 0, then not arrived and need to wait)
+            # consumer will peek if the full mbar is arrived without blocking, using `mbarrier_try_wait`
+            # and return the token in peek_ab_full_status, where:
+            #   1. token == 1, then arrived and no need to wait
+            #   2. token == 0, then not arrived and need to wait
             peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                 mainloop_consumer_read_state
             )
@@ -1094,7 +1100,7 @@ class HopperWgmmaGemmKernel:
         # and then set it back to True for the rest WGMMA in the mainloop
         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
         for k_tile in cutlass.range_constexpr(prologue_mmas):
-            # Wait for the current stage of full mbar, i.e. A/B smem buffer to be ready,
+            # Wait for the current stage of full mbar, i.e. A/B smem buffer to be ready,  using `mbarrier_wait`
             # since we try wait earlier, so if peek_ab_full_status is true (token == 1),
             # then consumer won't need to check the full mbar here and can directly go to consume the data;
             mainloop_pipeline.consumer_wait(
@@ -1191,7 +1197,14 @@ class HopperWgmmaGemmKernel:
             cute.nvgpu.warpgroup.wait_group(prologue_mmas)
 
             # When the current k_tile's WGMMA is done, then we can release the current stage of A/B buffer 
-            # by arriving the empty mbar for the current stage
+            # by arriving the empty mbar for the current stage, using `mbarrier_arrive_and_expect_tx` where tx_count = 0
+            # NOTE: this is a huge difference with the `mbarrier_arrive_and_expect_tx` used in producer's `acquire`, since:
+            #   1. producer's `acquire` will arrive the full mbar with tx_count = tma_copy_bytes after issuing the TMA load, 
+            #       to not only notify the consumer that "I am arrived", but also let TMA engine update the mbar's tx count later,
+            #       so that consumer's `wait` will actually wait for the TMA load to complete by checking the tx count in the mbar;
+            #   2. while consumer's `release` here will arrive the empty mbar with tx_count = 0 after consuming the data,
+            #       just to notify the producer that "I am arrived and have consumed the data", 
+            #       so that producer's `acquire` only needs to wait for the consumer to arrive before issuing the next TMA load
             mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
 
             # Advance read and release states to next stage 
@@ -1267,10 +1280,23 @@ class HopperWgmmaGemmKernel:
             # the mainloop is reused in the epilogue.
             cute.arch.sync_threads()
 
-        # (R2S, R2S_M, R2S_N, PIPE_D)
+        # Get the thread slice of the epilogue R2S tiled copy 
         thr_copy_r2s = epi_tiled_copy_r2s.get_slice(tidx)
+        
+        # Partition the dst shared memory of sC with layout (epi_tile=((8,16), 32), epi_stage=(1,4))
+        # with this tiled copy with tiler-mn (m128, n16) and copy atom TV layout of (32, (2,4)),
+        # to get the tiled dst shared memory tRS_sD for this thread
+        # with layout: (R2S=(2,4), R2S_M=1, R2S_N=2, PIPE_D=(1,4))
+        # i.e. this thread copies (2,4) elems in one tiled copy atom, and will repeat 2 times along N 
+        # (since each tiled copy a (m128, n16) tiler in C, so repeating 2 times along N will cover the (m128, n32) epi_tile of C),
+        # and 4 times along the pipeline stage to finish copying a subtile (m128, n128) of C
+        # then repeating the whole thing for the next subtile (m128, n128) of C to cover the whole tile (m128, n256) of C
         tRS_sD = thr_copy_r2s.partition_D(sC)
-        # (R2S, R2S_M, R2S_N)
+        
+        # Since tCrC has a mma layout of ( (2,2,32), 1, 1 ) to hold 128 fp32 elems of C in this thread
+        # while the tiled copy atom (stmatrix inst) needs 8=(2,4) contiguous fp32 elems in one go,
+        # so we need to retile tCrC to have a layout of (8,16):(1,8) to match the tiled copy atom layout,
+        # where 8 elems in one tiled copy, and repeat 16 = R2S_N=2 x PIPE_D=4 x LOOP=(256/128)=2 times to cover the whole tile (m128, n256) of C
         tRS_rAcc = epi_tiled_copy_r2s.retile(tCrC)
         
         if const_expr(self.debug_print):
@@ -1285,75 +1311,134 @@ class HopperWgmmaGemmKernel:
                 cute.printf("tRS_rAcc:")
                 cute.print_tensor(tRS_rAcc)
 
-        # Allocate D registers.
-        rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-        tRS_rD_layout = cute.make_layout(rD_shape[:3])
-        tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.acc_dtype)
-        size_tRS_rD = cute.size(tRS_rD)
+        # Allocate D registers as a register buffer for a single tiled copy in each stage
+        # tRS_rD_layout is (R2S=((2,2,2),1), R2S_M=1, R2S_N=2)
+        # which means in each stage, this thread will copy 8=(2,2,2) fp32 elems from src registers and repeat 2 times along N
+        # NOTE: the input tensors of partition_D / partition_S are both sC, 
+        # instead of more natually passing tCrC for partition_S and passing sC for partition_D,
+        # because the tiled_copy_r2s determines the mapping based on the smem layout,
+        # so we only need the dst sC to figure out how the dst tRS_sD, as well as src tRS_rD look like
+        rD_staged_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+        tRS_rD_layout = cute.make_layout(rD_staged_shape[:3]) # removing pipeline stage mode
+        tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.acc_dtype) # fp32 buffer to slice from tCrC
+        tRS_rD_out = cute.make_fragment_like(tRS_rD_layout, self.c_dtype) # c_dtype buffer for type conversion output before copying to shared memory
+        size_tRS_rD = cute.size(tRS_rD) # 16 fp32 elems in one tiled copy of tRS_rD
+        
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("rD_staged_shape: {}, tRS_rD_layout: {}, size_tRS_rD: {}", rD_staged_shape, tRS_rD_layout, size_tRS_rD)
+                cute.printf("tRS_rD:")
+                cute.print_tensor(tRS_rD)
 
+        # Make tma copy partitions for the epilogue store of C from shared memory to global memory
+        # where:
+        #   1. sepi_for_tma_partition is just group the non-pipeline modes together with layout: (epi_tile=((8,16),(32,1)), epi_stages=(1,4))
+        #   2. tCgC_for_tma_partition is just divide the global memory tensor gC_mnl by the epi_tile with layout (m128, n32),
+        #       resulting in (epi_tile=(128,32), rest_n=(1,8)) tiled layout, which indicates how many epi_tiles (rest_n) we need 
+        #       to finish copying the whole gC_mnl
         sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
         tCgC_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)
 
+        # And tma partition will return 
+        #  1. bSG_sD with layout: (TMA_TILE=(4096,1), epi_stages=(1,4)) as the src shared memory
+        #  2. bSG_gD with layout: (TMA_TILE=((32,128),1), rest_n=(1,8)) as the dst global memory
         bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            sepi_for_tma_partition,
-            tCgC_for_tma_partition,
+            atom=tma_atom_c,
+            cta_coord=0,
+            cta_layout=cute.make_layout(1),
+            smem_tensor=sepi_for_tma_partition,
+            gmem_tensor=tCgC_for_tma_partition,
         )
 
-        epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
-        epi_tile_shape = tCgC_for_tma_partition.shape[1]
-        epi_tile_layout = cute.make_layout(
+        epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1]) # rest_n=8, number of epi_tiles
+        epi_tile_shape = tCgC_for_tma_partition.shape[1] # rest_n_shape=(1,8)
+        epi_tile_layout = cute.make_layout( # rest_n_layout=(1,8):(8,1)
             epi_tile_shape, stride=(epi_tile_shape[1], 1)
         )
+        
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("epi_tile_num: {}, epi_tile_shape: {}, epi_tile_layout: {}", epi_tile_num, epi_tile_shape, epi_tile_layout)
+                cute.printf("sepi_for_tma_partition:")
+                cute.print_tensor(sepi_for_tma_partition)
+                cute.printf("tCgC_for_tma_partition:")
+                cute.print_tensor(tCgC_for_tma_partition)
+                cute.printf("bSG_sD:")
+                cute.print_tensor(bSG_sD)
+                cute.printf("bSG_gD:")
+                cute.print_tensor(bSG_gD)
 
-        # Initialize tma store c_pipeline
-        c_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.threads_per_cta, self.threads_per_cta
+        # Initialize tma store c_pipeline using `TmaStoreFence` instead of `MbarrierArray`
+        # which servers as an alias API for `cp.async.bulk.commit_group` and `cp.async.bulk.wait_group`
+        # since we don't need to know if the 
+        c_producer_group = pipeline.CooperativeGroup( # NOTE: this is only a dummy placeholder, no matter waht the arguments are
+            pipeline.Agent.Thread, self.threads_per_cta
         )
         c_pipeline = pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage,
             producer_group=c_producer_group,
         )
 
-        for epi_idx in cutlass.range_constexpr(epi_tile_num):
-            # Copy from accumulators to D registers
-            for epi_v in cutlass.range_constexpr(size_tRS_rD):
-                tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+        for epi_idx in cutlass.range_constexpr(epi_tile_num): # 8
+            # Copy from accumulators to D registers (fp32 -> fp32)
+            for epi_v in cutlass.range_constexpr(size_tRS_rD): # 16 = (2,2,2) x 2
+                # NOTE: it's ok to directly use tCrC for the src tensor, 
+                # since it is element-wise copied to tRS_rD without any reduction, 
+                # so no need to worry about the layout difference between tCrC and tRS_rAcc
+                # but it's still a good habit to use the retiled tiled_copy layout tRS_rAcc, instead of original tiled_mma layout tCrC
+                tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v] 
 
-            # Type conversion
-            tRS_rD_out = cute.make_fragment_like(tRS_rD_layout, self.c_dtype)
-            acc_vec = tRS_rD.load()
-            tRS_rD_out.store(acc_vec.to(self.c_dtype))
+            # Type conversion (fp32 -> c_dtype) in registers
+            tRS_rD_out.store(tRS_rD.load().to(self.c_dtype))
 
-            # Copy from D registers to shared memory
-            epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
+            # R2S-Copy from D registers to shared memory
+            epi_stage_idx = epi_idx % self.epi_stage
             cute.copy(
-                epi_tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
+                atom=epi_tiled_copy_r2s,
+                src=tRS_rD_out,
+                dst=tRS_sD[(None, None, None, epi_stage_idx)] # slice the stage mode with epi_buffer index
             )
 
+            # Fence-proxy between the R2S copy using generic proxy above
+            # with the S2G copy using TMA proxy below, to ensure the visibility of the copied data in shared memory 
+            # to the TMA proxy for the following S2G copy
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared,
                 space=cute.arch.SharedSpace.shared_cta,
             )
-            # barrier for sync
+            
+            # And we also need to sync (bar.sync) all the threads in the CTA
+            # to ensure all threads have finished the R2S copy 
+            # and the data in shared memory is all ready to allow the warp0 below to issue the S2G copy using TMA
             cute.arch.barrier()
 
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            # Copy from shared memory to global memory
+            # S2G-Copy from shared memory to global memory using TMA
             if warp_idx == 0:
+                gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                 cute.copy(
-                    tma_atom_c,
-                    bSG_sD[(None, epi_buffer)],
-                    bSG_gD[(None, gmem_coord)],
+                    atom=tma_atom_c,
+                    src=bSG_sD[(None, epi_stage_idx)],
+                    dst=bSG_gD[(None, gmem_coord)],
                 )
+                
+                # `producer_commit` for TMAStoreFence will issue `cp.async.bulk.commit_group` 
+                # to commit the current group of TMA store insts
                 c_pipeline.producer_commit()
+                
+                # `producer_acquire` for TMAStoreFence will issue `cp.async.bulk.wait_group(num_stages-1)` 
+                # to wait for the earliest committed TMA store group to complete, 
+                # to allow only `num_stages-1` committed but unfinished TMA store groups in the pipeline,
+                # to avoid the next stage buffer's data being overwritten before it is consumed by the TMA store in the next iteration
                 c_pipeline.producer_acquire()
 
+            # Wait for warp0 to issue the S2G copy before entering the next epi_tile iteration
             cute.arch.barrier()
 
         if warp_idx == 0:
+            # `producer_tail` for TMAStoreFence will issue `cp.async.bulk.wait_group(0)`
+            # to wait for all committed TMA store groups to complete before the producer (warp0) can exit
             c_pipeline.producer_tail()
 
         return
@@ -1545,12 +1630,25 @@ class HopperWgmmaGemmKernel:
         acc_dtype: type[cutlass.Numeric],
         debug_print: bool = False,
     ) -> cute.TiledCopy:
+        # Select the appropriate smem store operation based on C's layout and data type
+        # and when the c_dtype (smem store dtype) is 2B-wide (like bf16/fp16), 
+        # it will select `stmatrix.m8n8.x4.b16` intruction 
+        # to warp-level vectorized store a (m=8x4, n=8) 2B smem tile in one go within a warp, where:
+        #   1. one `m8n8` tile will be copied by 32 threads in this warp and 1 thread will copy 2 contiguous elems
+        #       so this 8x8 matrix will result in (8,(4,2)) thread layout for 32 threads in this warp
+        #       where one group of 4 contiguous threads will together copy 8 elements in one row ( inner layout: (4,2) )
+        #       and 8 groups forming a warp will together copy all of the 8 rows ( outer layout: 8 )
+        #   2. and since it has `x4`, so this copy atom will repeat 4 times, thus finall resulting in
+        #       `(32,(2,4)):(2,(1,64))` src TV layout, where each thread in 32 will copy 2 contiguous elements
+        #       and it will repeat 4 times in last mode with stride of 32x2=64 elems
+        #       so each thread will copy 8 elements in total, so the dst TV layout is simply `(32,8):(8,1)`
         copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
             c_layout,
             elem_ty_d=c_dtype,
             elem_ty_acc=acc_dtype,
         )
 
+        # the same copy atom as `copy_atom_r2s`, but to make tiled copy atom of C
         copy_atom_C = cute.make_copy_atom(
             cute.nvgpu.warp.StMatrix8x8x16bOp(
                 c_layout.is_m_major_c(),
@@ -1559,8 +1657,17 @@ class HopperWgmmaGemmKernel:
             c_dtype,
         )
 
+        # Since the `copy_atom_C` is only the smallest copy atom to copy 32x8 elems in one warp, 
+        # and using the info from tiled_mma, we also need to know how to use all the 4x2=8 warps in the 2 mma warp groups
+        # to copy a larger tile of C, as a larger tiled copy atom, to copy (32x8) x (4x2) = m128 x n16 elems in one go:
+        #   1. the Tiler-M layout of m128 is (8,8,2):(1,16,8), while the Tiler-N layout of n16 is (4,2,2):(2,1,8)
+        #   2. and the TV layout for all 8 mma warps is: (4,8,8),(2,2,2), where each thread in 256 will copy 8 elems
         tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
 
+        # Using the two copy atoms above to make the final R2S tiled copy for the accumulator C of the tiled mma
+        # sharing the same Tiler-MN as `tiled_copy_C_Atom` and simliar TV layout of ((4,64),((2,2,2),1))
+        # NOTE: the src (R) and dst (S) memory are all assumed in the same dtype with 2B, 
+        # so the type conversion (fp32->c_dtype) is done in the src registers by the user
         tiled_copy_r2s = cute.make_tiled_copy_S(
             copy_atom_r2s,
             tiled_copy_C_Atom,
@@ -1606,6 +1713,7 @@ class HopperWgmmaGemmKernel:
         tensor_c: cute.Tensor,
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_tile: tuple[int, int],
+        debug_print: bool = False,
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for C tensor storage.
 
@@ -1624,11 +1732,16 @@ class HopperWgmmaGemmKernel:
             cute.make_identity_layout(tensor_c.shape), epi_tile
         )
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
-            tensor_c,
-            epi_smem_layout,
-            c_cta_v_layout,
+            op=cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            gmem_tensor=tensor_c,
+            smem_layout=epi_smem_layout,
+            cta_tiler=c_cta_v_layout,
+            num_multicast=1,
         )
+        
+        if const_expr(debug_print):
+            cute.printf("")
+            cute.printf("epi_smem_layout: {}, c_cta_v_layout: {}", epi_smem_layout, c_cta_v_layout)
 
         return tma_atom_c, tma_tensor_c
 
@@ -1662,9 +1775,9 @@ class HopperWgmmaGemmKernel:
         smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
         tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op,
-            tensor,
-            smem_layout,
-            smem_tile,
+            gmem_tensor=tensor,
+            smem_layout=smem_layout,
+            cta_tiler=smem_tile,
             num_multicast=mcast_dim,
         )
         return tma_atom, tma_tensor
