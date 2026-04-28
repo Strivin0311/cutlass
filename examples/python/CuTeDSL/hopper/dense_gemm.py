@@ -1013,6 +1013,8 @@ class HopperWgmmaGemmKernel:
                 cute.printf("prologue_mmas: {}, prefetch_k_tile_cnt: {}, num_k_blocks: {}", prologue_mmas, prefetch_k_tile_cnt, num_k_blocks)
 
         # Init producer state for mainloop pipeline
+        #   1. mainloop_producer_state.count: [0, rest_k=16]
+        #   2. mainloop_producer_state.index: [0, ab_stage=4]
         mainloop_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, stages=self.ab_stage
         )
@@ -1059,27 +1061,27 @@ class HopperWgmmaGemmKernel:
                 # /////////////////////////////////////////////////////////////////////////////
                 #  TMA load A/B
                 # /////////////////////////////////////////////////////////////////////////////
+                # NOTE: TMA load for A/B shares the same tma mbar, 
+                # as the tx_count is set to the sum of A and B copy size earlier
+                tma_bar_ptr = mainloop_pipeline.producer_get_barrier(mainloop_producer_state)
+                
                 cute.copy(
                     atom=tma_atom_a,
                     src=tAgA_k,
                     dst=tAsA_pipe,
-                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                        mainloop_producer_state
-                    ),
+                    tma_bar_ptr=tma_bar_ptr,
                     mcast_mask=a_mcast_mask, # 0(0b00), since A won't be multicast for cluster shape (2,1,1)
                 )
                 cute.copy(
                     atom=tma_atom_b,
                     src=tBgB_k,
                     dst=tBsB_pipe,
-                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                        mainloop_producer_state
-                    ),
+                    tma_bar_ptr=tma_bar_ptr,
                     mcast_mask=b_mcast_mask, # 3(0b11), since B will be multicast along m mode for cluster shape (2,1,1)
                 )
                 
                 # NOTE: Mainloop pipeline's producer commit is a NOP
-                # since TMA instruction itself updates the transaction count in full mbar
+                # since TMA itself updates the transaction count in full mbar automatically
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
@@ -1120,17 +1122,21 @@ class HopperWgmmaGemmKernel:
             # since we try wait earlier, so if peek_ab_full_status is true (token == 1),
             # then consumer won't need to check the full mbar here and can directly go to consume the data;
             mainloop_pipeline.consumer_wait(
-                mainloop_consumer_read_state, peek_ab_full_status
+                mainloop_consumer_read_state,
+                try_wait_token=peek_ab_full_status
             )
 
-            # NOTE: case1: Before the first WGMMA, we need call `wgmma.fence.sync.aligned` to 
+            # NOTE: For `wgmma.fence.sync.aligned`:
+            # case1: Before the first WGMMA (in a commited group) we must call it to:
             #   1. ensure the memory operations by generic proxy to registers of the accumulator (like zeros), and the operand A if RS, are visible to wgmma proxy.
             #   2. hand over the ownership of the accumulator registers and operand A if RS from generic proxy to wgmma proxy (so even no zeros, we still need ti call this fence).
             # 
-            # case2: The same as to when we modify the registers between two WGMMA calls in the mainloop, 
-            # we also need to call `wgmma.fence.sync.aligned` to ensure the visibility of the modified registers to wgmma proxy for the next WGMMA call.
+            # case2: when we modify the registers between two WGMMA calls in the mainloop,
+            #   we also need to call it to ensure the visibility of the modified registers to wgmma proxy 
+            #   for the next WGMMA call.
             # 
-            # case3: Otherwise, we don't have to call fence between each iteration of WGMMA in the mainloop, since no memory operations by generic proxy in between.
+            # case3: Otherwise, we don't have to call it between each iteration of WGMMA in the mainloop, 
+            #   since no memory operations by generic proxy in between.
             cute.nvgpu.warpgroup.fence()
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
@@ -1158,6 +1164,7 @@ class HopperWgmmaGemmKernel:
 
             # Commit the num_k_blocks WGMMA calls in the current k_tile
             # to let wgmma engine runs them as a batch
+            # NOTE: we don't wait it finished until the first iteration in mainloop
             cute.nvgpu.warpgroup.commit_group()
             
             # Advance to next block of global A/B and next stage of smem A/B buffer
@@ -1173,12 +1180,13 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  MAINLOOP
         # /////////////////////////////////////////////////////////////////////////////
-        for k_tile in cutlass.range(prologue_mmas, k_tile_cnt, 1, unroll=1):
+        for k_tile in cutlass.range(prologue_mmas, k_tile_cnt, unroll=1):
             # /////////////////////////////////////////////////////////////////////////////
             #  Wait for TMA copies to complete
             # /////////////////////////////////////////////////////////////////////////////
             mainloop_pipeline.consumer_wait(
-                mainloop_consumer_read_state, peek_ab_full_status
+                mainloop_consumer_read_state, 
+                try_wait_token=peek_ab_full_status
             )
             
             # /////////////////////////////////////////////////////////////////////////////
@@ -1257,18 +1265,18 @@ class HopperWgmmaGemmKernel:
                 #  TMA load A/B
                 # /////////////////////////////////////////////////////////////////////////////
                 cute.copy(
-                    tma_atom_a,
-                    tAgA_k,
-                    tAsA_pipe,
+                    atom=tma_atom_a,
+                    src=tAgA_k,
+                    dst=tAsA_pipe,
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                         mainloop_producer_state
                     ),
                     mcast_mask=a_mcast_mask,
                 )
                 cute.copy(
-                    tma_atom_b,
-                    tBgB_k,
-                    tBsB_pipe,
+                    atom=tma_atom_b,
+                    src=tBgB_k,
+                    dst=tBsB_pipe,
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                         mainloop_producer_state
                     ),
@@ -1279,15 +1287,12 @@ class HopperWgmmaGemmKernel:
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  EPILOG
-        # /////////////////////////////////////////////////////////////////////////////
-        
-        # Wait all issued wgmmas to complete, to ensure the accumulated results in tCrC are ready to be stored
+        # Wait all issued wgmmas to complete, 
+        # to ensure the accumulated results in tCrC are ready to be stored
         cute.nvgpu.warpgroup.wait_group(0)
-
+        
         if cute.size(self.cluster_shape_mn) > 1:
-            # Wait for all threads in the cluster to finish, avoid early release of smem
+            # Wait for all threads in the cluster to finish, avoiding early release of smem
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         else:
@@ -1295,6 +1300,48 @@ class HopperWgmmaGemmKernel:
             # Wait for all warp groups in the thread block to finish, because smem for tensor A in
             # the mainloop is reused in the epilogue.
             cute.arch.sync_threads()
+        
+        
+        # NOTE: Do NOT call mainloop_pipeline.producer_tail(mainloop_producer_state) here.
+        #
+        # producer_tail() is designed for persistent kernels where a single CTA reuses smem
+        # across multiple tiles in a loop.  In that scenario the producer must drain all
+        # "dangling" empty-mbar arrive signals before moving on to the next tile, because the
+        # same mbarrier objects will be reused and a late arrive from the previous tile would
+        # corrupt the next tile's synchronization.  producer_tail() achieves this by calling
+        # producer_acquire() on the last (num_stages - 1) pipeline stages that the consumer
+        # has not yet released, effectively waiting for every consumer_release() to land.
+        #
+        # Here, however, this is a NON-persistent kernel: each launch processes exactly one
+        # output tile and the kernel exits immediately after the epilogue.  This means:
+        #
+        #   1. The smem is never reused across tiles, so there is no risk of a late arrive
+        #      corrupting a future tile's mbarrier state.
+        #
+        #   2. More critically, calling producer_tail() would cause a DEADLOCK.
+        #      At the end of the mainloop the pipeline states are in the following condition:
+        #        - mainloop_producer_state  : count = k_tile_cnt (=16), index = 0
+        #        - mainloop_consumer_release_state : points to one stage behind the last
+        #          consumed stage (the last consumer_release() in the loop body released
+        #          the stage that finished WGMMA prologue_mmas iterations ago, not the very
+        #          last consumed stage).
+        #      producer_tail() internally calls producer_acquire() after advancing
+        #      (num_stages - 1) = 3 times from the current producer state.  That acquire
+        #      waits on the empty mbar of a stage that no thread will ever arrive on again,
+        #      because the mainloop has already exited without issuing the corresponding
+        #      consumer_release().  The kernel therefore hangs indefinitely.
+        #
+        #   3. The cluster_wait() / sync_threads() barrier immediately above this point
+        #      already ensures that all threads have completed the mainloop and that all
+        #      wgmma.wait_group(0) results are visible before entering the epilogue,
+        #      which is the only synchronization guarantee we actually need here.
+        #
+        # if warp_idx == 0:
+        #     mainloop_pipeline.producer_tail(mainloop_producer_state)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  EPILOG
+        # /////////////////////////////////////////////////////////////////////////////
 
         # Get the thread slice of the epilogue R2S tiled copy 
         thr_copy_r2s = epi_tiled_copy_r2s.get_slice(tidx)
