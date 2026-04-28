@@ -436,21 +436,21 @@ class HopperWgmmaGemmKernel:
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
             a,
             self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), # (tileM, tileK)
             self.cluster_shape_mn[1],
         )
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             b,
             self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), # (tileN, tileK)
             self.cluster_shape_mn[0],
         )
 
         tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
             c,
             self.epi_smem_layout_staged,
-            self.epi_tile,
+            self.epi_tile, # (epiM, epiN)
             debug_print=self.debug_print,
         )
 
@@ -502,7 +502,7 @@ class HopperWgmmaGemmKernel:
             print()
         
             print()
-            print(f"{self.tiled_mma=}, shape_mnk: {self.tiled_mma.shape_mnk}")
+            print("self.tiled_mma: ", self.tiled_mma, f"shape_mnk: {self.tiled_mma.shape_mnk}")
             print()
         
             cute.printf("grid: {}", grid)
@@ -1651,41 +1651,32 @@ class HopperWgmmaGemmKernel:
         #       and it will repeat 4 times in last mode with stride of 32x2=64 elems
         #       so each thread will copy 8 elements in total, so the dst TV layout is simply `(32,8):(8,1)`
         copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-            c_layout,
-            elem_ty_d=c_dtype,
-            elem_ty_acc=acc_dtype,
+            layout_d=c_layout, # if c_layout.is_m_major_c, then stmatrix will transpose
+            elem_ty_d=c_dtype, # if bf16, use stmatrix.b16
+            elem_ty_acc=acc_dtype, # no use
         )
 
-        # the same copy atom as `copy_atom_r2s`, but to make tiled copy atom of C
-        copy_atom_C = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                c_layout.is_m_major_c(),
-                4,
-            ),
-            c_dtype,
-        )
-
-        # Since the `copy_atom_C` is only the smallest copy atom to copy 32x8 elems in one warp, 
+        # Since the `copy_atom_r2s` is only the smallest copy atom to copy 32x8 elems in one warp, 
         # and using the info from tiled_mma, we also need to know how to use all the 4x2=8 warps in the 2 mma warp groups
         # to copy a larger tile of C, as a larger tiled copy atom, to copy (32x8) x (4x2) = m128 x n16 elems in one go:
         #   1. the Tiler-M layout of m128 is (8,8,2):(1,16,8), while the Tiler-N layout of n16 is (4,2,2):(2,1,8)
         #   2. and the TV layout for all 8 mma warps is: (4,8,8),(2,2,2), where each thread in 256 will copy 8 elems
-        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
+        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(atom=copy_atom_r2s, mma=tiled_mma)
 
         # Using the two copy atoms above to make the final R2S tiled copy for the accumulator C of the tiled mma
-        # sharing the same Tiler-MN as `tiled_copy_C_Atom` and simliar TV layout of ((4,64),((2,2,2),1))
+        # sharing the same Tiler-MN as `tiled_copy_C_Atom` but different TV layout of ((4,64),((2,2,2),1))
+        # which is more suitable for R2S copy with a pipeling-stage mode placeholder 1, instead of (4,8,8),(2,2,2) for tiled_mma
         # NOTE: the src (R) and dst (S) memory are all assumed in the same dtype with 2B, 
         # so the type conversion (fp32->c_dtype) is done in the src registers by the user
         tiled_copy_r2s = cute.make_tiled_copy_S(
-            copy_atom_r2s,
-            tiled_copy_C_Atom,
+            atom=copy_atom_r2s,
+            tiled_copy=tiled_copy_C_Atom,
         )
         
         if const_expr(debug_print):
             print()
             print("c_layout.is_m_major_c(): ", c_layout.is_m_major_c())
             print("copy_atom_r2s: ", copy_atom_r2s)
-            print("copy_atom_C: ", copy_atom_C)
             print("tiled_copy_C_Atom: ", tiled_copy_C_Atom)
             print("tiled_copy_r2s: ", tiled_copy_r2s)
             
