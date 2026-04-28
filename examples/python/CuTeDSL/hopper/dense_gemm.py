@@ -597,12 +597,23 @@ class HopperWgmmaGemmKernel:
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+            # NOTE: we don't and had better not to prefetch tma desc for tma_atom_c
+            # since it is not used until the epilogue, thus no need to prefetch 
+            # not to mention waste the limited prefetch slots and L2 cache
             
         # /////////////////////////////////////////////////////////////////////////////
         #  Make CTA layout
         # /////////////////////////////////////////////////////////////////////////////
 
         # CTA Swizzle to promote L2 data reuse
+        # if the original cluster layout is (cx, cy) : (1, cx), 
+        # then we swizzle it to ((gm, cx//cm), cy) : ((1, gm*cy), gm)
+        # 
+        # So that, we don't have to iterate all the A along m dimension before moving to the next n, 
+        # which cannot be fully fed into L2 cache and the older A will be evicted when we move to the next n, resulting in more L2 traffic of A.
+        # 
+        # Instead, we can iterate through a smaller group of A (group_size_m) and then move to the next n, 
+        # so that the group of A can be reused in L2 cache when we iterate through the next n, resulting in less L2 traffic of A.
         group_size_m = 8
         s_shape = (
             (group_size_m, cdimx // group_size_m),
@@ -619,7 +630,8 @@ class HopperWgmmaGemmKernel:
                 cute.printf("s_layout: {}, num_reg_cids: {}", s_layout, num_reg_cids)
                 cute.printf("cid_m: {}, cid_n: {}, cluster_id: {}, bdim: ({}, {}, {}), cdim: ({}, {}, {}), bidx: ({}, {}, {}), cidx: ({}, {}, {})", cid_m, cid_n, cluster_id, *cute.arch.block_dim(), cdimx, cdimy, cdimz, bidx, bidy, bidz, cidx, cidy, cidxz)
 
-        # Deal with the tail part
+        # Deal with the tail part if the cluster cannot be partitioned evenly by the group size, 
+        # e.g. cdimx=18 and group_size_m=8, then the last 2 cids will have a smaller group size of 2 instead of 8.
         if cluster_id >= num_reg_cids:
             tail_size_m = cdimx % group_size_m
             tail_layout = cute.make_layout(
@@ -654,21 +666,23 @@ class HopperWgmmaGemmKernel:
         a_mcast_mask = cute.make_layout_image_mask(
             # multicast the same A along the given mode1 (i.e. N dimension) of the cluster
             # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have different A slices
-            # so the mcast mask is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
+            # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
+            # is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
             # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have the same A slice,
             # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp
-            cta_layout_mnk, cluster_coord_mnk, mode=1
+            lay=cta_layout_mnk, coord=cluster_coord_mnk, mode=1 # multicast mode
         )
+        a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
+        
         b_mcast_mask = cute.make_layout_image_mask(
             # multicast the same B along the given mode0 (i.e. M dimension) of the cluster
             # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have the same B slice,
-            # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp,
+            # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
+            # is 11 in binary with CopyBulkTensorTileG2SMulticastOp,
             # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have different B slices,
             # so the mcast mask is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
-            cta_layout_mnk, cluster_coord_mnk, mode=0
+            lay=cta_layout_mnk, coord=cluster_coord_mnk, mode=0 # multicast mode
         )
-
-        a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
         
         if const_expr(self.debug_print):
@@ -1727,6 +1741,10 @@ class HopperWgmmaGemmKernel:
         :return: TMA atom and tensor for C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
         """
+        
+        # cp.async SMEM -> GMEM bulk tensor copy Operation
+        op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
+        
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         
         # NOTE: this step is also the first step inside of `make_tiled_tma_atom`
@@ -1753,7 +1771,7 @@ class HopperWgmmaGemmKernel:
         )
         
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            op=cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            op=op,
             gmem_tensor=tensor_c,
             smem_layout=epi_smem_layout,
             cta_tiler=c_cta_v_layout, # or directly pass in `epi_tile`
@@ -1762,7 +1780,7 @@ class HopperWgmmaGemmKernel:
         
         if const_expr(debug_print):
             print("")
-            print(f"{title}: epi_smem_layout: {epi_smem_layout}, c_cta_v_layout: {c_cta_v_layout}")
+            print(f"{title}: op: {op}, epi_smem_layout: {epi_smem_layout}, c_cta_v_layout: {c_cta_v_layout}")
             print()
             print(f"tma_atom_c: {tma_atom_c}")
             print()

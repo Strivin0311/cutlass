@@ -4,10 +4,16 @@
 # with classic configuration with verbose logging, good for learning and debugging
 export DEBUG_MODE=1
 
+export PROFILE_MODE=0
+
 if [[ $DEBUG_MODE -eq 1 ]]; then
     M=2048
     K=4096
     N=1024
+elif [[ $PROFILE_MODE -eq 1 ]]; then
+    M=6144
+    K=2048
+    N=8192
 else
     M=8192
     K=8192
