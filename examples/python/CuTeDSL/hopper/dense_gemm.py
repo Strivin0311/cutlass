@@ -598,6 +598,8 @@ class HopperWgmmaGemmKernel:
         #  Prefetch Tma desc
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == 0:
+            # Issues a hardware prefetch instruction to bring the TMA descriptor created by host
+            # into the device constant cache, which can improve performance when the descriptor will be used soon.
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
             # NOTE: we don't and had better not to prefetch tma desc for tma_atom_c
