@@ -2172,13 +2172,32 @@ def run(
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
+    
+    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
+    if profile_mode:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+        
+        flops = 2 * m * n * k
+        event_str = f"{mnkl=} ({flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            
+            with add_nvtx_event(event_str):
+                compiled_gemm(mA, mB, mC, stream)
 
     return exec_time  # Return execution time in microseconds
 
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(
+    exec_time = run(
         args.mnkl,
         args.a_dtype,
         args.b_dtype,
@@ -2195,4 +2214,4 @@ if __name__ == "__main__":
         True if DEBUG_MODE else args.skip_ref_check,
         args.use_cold_l2,
     )
-    print("PASS")
+    print(f"PASS with execution time: {exec_time} ms")
