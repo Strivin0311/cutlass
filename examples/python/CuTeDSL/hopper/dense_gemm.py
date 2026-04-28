@@ -270,7 +270,7 @@ class HopperWgmmaGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_inst_shape_mn = None
         # K dimension is deferred in _setup_attributes
-        self.tile_shape_mnk = (*tile_shape_mn, 1)
+        self.tile_shape_mnk = (*tile_shape_mn, 1) # determine tileK automatically later
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
         self.atom_layout_mnk = (
@@ -288,7 +288,7 @@ class HopperWgmmaGemmKernel:
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90") # get the dynamic shared memory capacity for sm_90, which is (228-1) KB
 
         self.debug_print = debug_print
 
@@ -301,7 +301,7 @@ class HopperWgmmaGemmKernel:
         self.epi_tile = None
 
         self.shared_storage = None
-        self.buffer_align_bytes = 1024
+        self.buffer_align_bytes = 1024 # TMA smem alignment
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -326,8 +326,8 @@ class HopperWgmmaGemmKernel:
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             a_dtype=self.a_dtype,
             b_dtype=self.b_dtype,
-            a_leading_mode=self.a_layout.sm90_mma_major_mode(),
-            b_leading_mode=self.b_layout.sm90_mma_major_mode(),
+            a_leading_mode=self.a_layout.sm90_mma_major_mode(), # K if row-major, MN if col-major
+            b_leading_mode=self.b_layout.sm90_mma_major_mode(), # K if row-major, MN if col-major
             acc_dtype=self.acc_dtype,
             atom_layout_mnk=self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1]),
@@ -338,7 +338,7 @@ class HopperWgmmaGemmKernel:
         self.tile_shape_mnk = (
             self.tile_shape_mnk[0],
             self.tile_shape_mnk[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            mma_inst_shape_k * mma_inst_tile_k, # 16 x 4 = 64
         )
 
         self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
@@ -478,22 +478,22 @@ class HopperWgmmaGemmKernel:
         
         if const_expr(self.debug_print):
             print()
-            print(f"{self.tile_shape_mnk=}, {self.atom_layout_mnk=}, {self.cluster_shape_mn=}, {self.num_mcast_ctas_a=}, {self.num_mcast_ctas_b=}, {self.is_a_mcast=}, {self.is_b_mcast=}")
+            print(f"{self.tile_shape_mnk=}, {self.atom_layout_mnk=}, {self.cluster_shape_mn=}, {self.cta_layout_mnk=}")
+            print(f"{self.num_mcast_ctas_a=}, {self.num_mcast_ctas_b=}, {self.is_a_mcast=}, {self.is_b_mcast=}")
             print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
-            print("cta_layout_mnk: {}", self.cta_layout_mnk)
-            print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=}, {self.occupancy=}, {self.buffer_align_bytes=}")
+            print(f"{self.ab_stage=}, {self.epi_stage=}, {self.epi_tile=}, {self.smem_capacity=} ({self.smem_capacity / 1024:.1f} KB), {self.occupancy=}, {self.buffer_align_bytes=}")
             print()
         
             print()
             print(f"{self.mma_warp_groups=}, {self.num_threads_per_warp_group=}, {self.threads_per_cta=}")
-            print(f"{self.a_layout=}, {self.b_layout=}, {self.c_layout=}")
+            print(f"{self.a_layout=}, {self.a_layout.sm90_mma_major_mode()=} | {self.b_layout=}, {self.b_layout.sm90_mma_major_mode()=} | {self.c_layout=}")
             print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.acc_dtype=}")
             print()
         
             print()
-            print("self.a_smem_layout_staged: {}", self.a_smem_layout_staged)
-            print("self.b_smem_layout_staged: {}", self.b_smem_layout_staged)
-            print("self.epi_smem_layout_staged: {}", self.epi_smem_layout_staged)
+            print(f"{self.a_smem_layout_staged=}",)
+            print(f"{self.b_smem_layout_staged=}",)
+            print(f"{self.epi_smem_layout_staged=}",)
             print()
         
             print()
@@ -508,11 +508,11 @@ class HopperWgmmaGemmKernel:
             print()
         
             print()
-            print("tiled_mma: {}", self.tiled_mma)
+            print(f"{self.tiled_mma=}, shape_mnk: {self.tiled_mma.shape_mnk}")
             print()
             
             print()
-            print("epi_tiled_copy_r2s: {}", self.epi_tiled_copy_r2s)
+            print(f"{self.epi_tiled_copy_r2s=}")
             print()
         
             cute.printf("grid: {}", grid)
@@ -1473,8 +1473,8 @@ class HopperWgmmaGemmKernel:
         # epi_smem will reuse smem ab.
         epi_bytes = 0
 
-        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
-        b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
+        a_shape = cute.slice_(tile_shape_mnk, (None, 0, None)) # (tileM, tileK)
+        b_shape = cute.slice_(tile_shape_mnk, (0, None, None)) # (tileN, tileK)
         ab_bytes_per_stage = (
             cute.size(a_shape) * a_dtype.width // 8
             + cute.size(b_shape) * b_dtype.width // 8
@@ -1484,6 +1484,7 @@ class HopperWgmmaGemmKernel:
         ab_stage = (
             smem_capacity // occupancy - mbar_helpers_bytes - epi_bytes
         ) // ab_bytes_per_stage
+        
         return ab_stage, epi_stage
 
     @staticmethod
@@ -1559,66 +1560,72 @@ class HopperWgmmaGemmKernel:
         :return: Tuple of shared memory layouts for A, B, and C
         :rtype: Tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]
         """
-        a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
+        a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None)) # (tileM, tileK)
 
         a_is_k_major = (
             a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
         )
-        b_is_k_major = (
-            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        )
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
+        a_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+            layout=a_layout,
+            element_type=a_dtype,
+            major_mode_size=a_major_mode_size,
+        )
         a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                a_layout,
-                a_dtype,
-                a_major_mode_size,
-            ),
-            a_dtype,
+            kind=a_smem_layout_atom_kind,
+            element_type=a_dtype,
         )
         a_smem_layout_staged = cute.tile_to_shape(
-            a_smem_layout_atom,
-            cute.append(a_smem_shape, ab_stage),
+            atom=a_smem_layout_atom,
+            trg_shape=cute.append(a_smem_shape, ab_stage),
             order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
         )
 
         b_smem_shape = cute.slice_(tile_shape_mnk, (0, None, None))
-
+        b_is_k_major = (
+            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+        )
         b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
+        b_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+            layout=b_layout,
+            element_type=b_dtype,
+            major_mode_size=b_major_mode_size,
+        )
         b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                b_layout,
-                b_dtype,
-                b_major_mode_size,
-            ),
-            b_dtype,
+            kind=b_smem_layout_atom_kind,
+            element_type=b_dtype,
         )
         b_smem_layout_staged = cute.tile_to_shape(
-            b_smem_layout_atom,
-            cute.append(b_smem_shape, ab_stage),
+            atom=b_smem_layout_atom,
+            trg_shape=cute.append(b_smem_shape, ab_stage),
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 
         c_smem_shape = epi_tile
-        c_major_mode_size = epi_tile[1] if c_layout.is_n_major_c() else epi_tile[0]
+        c_major_mode_size = epi_tile[1 if c_layout.is_n_major_c() else 0]
+        c_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+            layout=c_layout,
+            element_type=c_dtype,
+            major_mode_size=c_major_mode_size,
+        )
         c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-            sm90_utils.get_smem_layout_atom(
-                c_layout,
-                c_dtype,
-                c_major_mode_size,
-            ),
-            c_dtype,
+            kind=c_smem_layout_atom_kind,
+            element_type=c_dtype,
         )
         epi_smem_layout_staged = cute.tile_to_shape(
-            c_smem_layout_atom,
-            cute.append(c_smem_shape, epi_stage),
-            order=(1, 0, 2) if c_layout.is_m_major_c() else (0, 1, 2),
+            atom=c_smem_layout_atom,
+            trg_shape=cute.append(c_smem_shape, epi_stage),
+            order=(0, 1, 2) if c_layout.is_n_major_c() else (1, 0, 2),
         )
 
         if const_expr(debug_print):
-            cute.printf("")
-            cute.printf("a_is_k_major: {}, b_is_k_major: {}, c_layout.is_n_major_c(): {}, a_major_mode_size: {}, b_major_mode_size: {}, c_major_mode_size: {}", a_is_k_major, b_is_k_major, c_layout.is_n_major_c(), a_major_mode_size, b_major_mode_size, c_major_mode_size)
-            cute.printf("a_smem_layout_atom: {}, b_smem_layout_atom: {}, c_smem_layout_atom: {}", a_smem_layout_atom, b_smem_layout_atom, c_smem_layout_atom)
+            print()
+            print(f"{a_is_k_major=}, {a_major_mode_size=}, {a_smem_layout_atom_kind=}")
+            print(f"{b_is_k_major=}, {b_major_mode_size=}, {b_smem_layout_atom_kind=}")
+            print(f"{c_layout.is_n_major_c()=}, {c_major_mode_size=}, {c_smem_layout_atom_kind=}")
+            print(f"{a_smem_layout_staged=}")
+            print(f"{b_smem_layout_staged=}")
+            print(f"{epi_smem_layout_staged=}")
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
 
@@ -1676,9 +1683,9 @@ class HopperWgmmaGemmKernel:
         if const_expr(debug_print):
             print()
             print(f"{c_layout.is_m_major_c()=}")
-            print("copy_atom_r2s: {}", copy_atom_r2s)
-            print("copy_atom_C: {}", copy_atom_C)
-            print("tiled_copy_C_Atom: {}", tiled_copy_C_Atom)
+            print(f"copy_atom_r2s: {copy_atom_r2s}")
+            print(f"copy_atom_C: {copy_atom_C}")
+            print(f"tiled_copy_C_Atom: {tiled_copy_C_Atom}")
         
         return tiled_copy_r2s
 
@@ -1741,13 +1748,13 @@ class HopperWgmmaGemmKernel:
         # 
         # e.g. for smem tma tensor mA_mkl: (m=2048,n=1024,l=1):(1@1,1@0,1@2), where `1@k` means the k-th basis vector,
         # so the n is the innermost dim0, m is second dim1, and l is the outermost dim2, 
-        # indicating it is a col-major layout of (m,k) and the l is the "batch" dim
+        # indicating it is a row-major layout of (m,k) and the l is the "batch" dim
         # 
         # and for gmem tma tensor gA_mkl: (128,64,16):(1@1,1@0,64@0), where `N@k` means the vector 
         # with the same direction as the k-th basis vector but with length/mode of N, 
         # so the k is the innermost dim0 with step size 1, m is the second dim1 with step size 1, 
         # and l is also the dim0, but with step size 64 == k,
-        # indication it is a col-major layout of (m,k), and l is actually the "rest_k" dim
+        # indication it is a row-major layout of (m,k), and l is actually the "rest_k" dim
         c_cta_v_layout = cute.composition(
             cute.make_identity_layout(tensor_c.shape), epi_tile
         )

@@ -2,7 +2,7 @@
 
 # Uncomment the following line to enable debug mode 
 # with classic configuration with verbose logging, good for learning and debugging
-# export DEBUG_MODE=1
+export DEBUG_MODE=1
 
 if [[ $DEBUG_MODE -eq 1 ]]; then
     M=2048
