@@ -438,6 +438,8 @@ class HopperWgmmaGemmKernel:
             self.a_smem_layout_staged,
             (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), # (tileM, tileK)
             self.cluster_shape_mn[1],
+            debug_print=self.debug_print,
+            title="Make TMA atom/tensor for A",
         )
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
@@ -445,6 +447,8 @@ class HopperWgmmaGemmKernel:
             self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), # (tileN, tileK)
             self.cluster_shape_mn[0],
+            debug_print=self.debug_print,
+            title="Make TMA atom/tensor for B",
         )
 
         tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
@@ -452,6 +456,7 @@ class HopperWgmmaGemmKernel:
             self.epi_smem_layout_staged,
             self.epi_tile, # (epiM, epiN)
             debug_print=self.debug_print,
+            title="Make TMA atom/tensor for C",
         )
 
         grid = self._compute_grid(c, self.tile_shape_mnk, self.cluster_shape_mn)
@@ -491,19 +496,12 @@ class HopperWgmmaGemmKernel:
             print()
         
             print()
-            print(f"tma_atom_a: {tma_atom_a}")
-            print(f"tma_tensor_a: {tma_tensor_a}")
-            print()
-            print(f"tma_atom_b: {tma_atom_b}")
-            print(f"tma_tensor_b: {tma_tensor_b}")
-            print()
-            print(f"tma_atom_c: {tma_atom_c}")
-            print(f"tma_tensor_c: {tma_tensor_c}")
-            print()
-        
-            print()
             print("self.tiled_mma: ", self.tiled_mma, f"shape_mnk: {self.tiled_mma.shape_mnk}")
             print()
+            
+            cute.printf("tma_tensor_a: {}", tma_tensor_a)
+            cute.printf("tma_tensor_b: {}", tma_tensor_b)
+            cute.printf("tma_tensor_c: {}", tma_tensor_c)
         
             cute.printf("grid: {}", grid)
 
@@ -1715,6 +1713,7 @@ class HopperWgmmaGemmKernel:
         epi_smem_layout_staged: cute.ComposedLayout,
         epi_tile: tuple[int, int],
         debug_print: bool = False,
+        title: str = "",
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for C tensor storage.
 
@@ -1757,13 +1756,17 @@ class HopperWgmmaGemmKernel:
             op=cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             gmem_tensor=tensor_c,
             smem_layout=epi_smem_layout,
-            cta_tiler=c_cta_v_layout,
+            cta_tiler=c_cta_v_layout, # or directly pass in `epi_tile`
             num_multicast=1,
         )
         
         if const_expr(debug_print):
-            cute.printf("")
-            cute.printf("epi_smem_layout: {}, c_cta_v_layout: {}", epi_smem_layout, c_cta_v_layout)
+            print("")
+            print(f"{title}: epi_smem_layout: {epi_smem_layout}, c_cta_v_layout: {c_cta_v_layout}")
+            print()
+            print(f"tma_atom_c: {tma_atom_c}")
+            print()
+            
 
         return tma_atom_c, tma_tensor_c
 
@@ -1773,6 +1776,8 @@ class HopperWgmmaGemmKernel:
         smem_layout_staged: cute.ComposedLayout,
         smem_tile: tuple[int, int],
         mcast_dim: int,
+        debug_print: bool = False,
+        title: str = "",
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for input tensors.
 
@@ -1789,19 +1794,27 @@ class HopperWgmmaGemmKernel:
         :rtype: Tuple[cute.CopyAtom, cute.Tensor]
         """
         op = (
+            # cp.async GMEM -> SMEM bulk tensor copy Operation
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
             if mcast_dim == 1
+            # cp.async GMEM -> SMEM bulk tensor multicast copy Operation
             else cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
         )
 
-        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0)) # removing the pipeline stage mode
         tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            op,
+            op=op,
             gmem_tensor=tensor,
             smem_layout=smem_layout,
             cta_tiler=smem_tile,
             num_multicast=mcast_dim,
         )
+        
+        if const_expr(debug_print):
+            print(f"{title}: op: {op}, smem_layout: {smem_layout}, cta_tiler: {smem_tile}, mcast_dim: {mcast_dim}")
+            print()
+            print(f"tma_atom: {tma_atom}")
+        
         return tma_atom, tma_tensor
 
     @staticmethod
