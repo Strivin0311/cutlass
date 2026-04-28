@@ -491,12 +491,6 @@ class HopperWgmmaGemmKernel:
             print()
         
             print()
-            print(f"{self.a_smem_layout_staged=}",)
-            print(f"{self.b_smem_layout_staged=}",)
-            print(f"{self.epi_smem_layout_staged=}",)
-            print()
-        
-            print()
             print(f"tma_atom_a: {tma_atom_a}")
             print(f"tma_tensor_a: {tma_tensor_a}")
             print()
@@ -509,10 +503,6 @@ class HopperWgmmaGemmKernel:
         
             print()
             print(f"{self.tiled_mma=}, shape_mnk: {self.tiled_mma.shape_mnk}")
-            print()
-            
-            print()
-            print(f"{self.epi_tiled_copy_r2s=}")
             print()
         
             cute.printf("grid: {}", grid)
@@ -1566,18 +1556,22 @@ class HopperWgmmaGemmKernel:
             a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
         )
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
-        a_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+        a_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW128 if k-major
             layout=a_layout,
             element_type=a_dtype,
+            # how many elems in one row, if it's 64 with 2B per elem, 
+            # then one row has 128B and can use SW128, i.e. SW(B3, M4, S3),
+            # where 2^(B3 + M4) = 2^7 = 128B
             major_mode_size=a_major_mode_size,
         )
-        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,64) if k-major
             kind=a_smem_layout_atom_kind,
             element_type=a_dtype,
         )
         a_smem_layout_staged = cute.tile_to_shape(
             atom=a_smem_layout_atom,
             trg_shape=cute.append(a_smem_shape, ab_stage),
+            # if in k-major, then the first extending order is m mode (along rows)
             order=(0, 1, 2) if a_is_k_major else (1, 0, 2),
         )
 
@@ -1586,35 +1580,39 @@ class HopperWgmmaGemmKernel:
             b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
         )
         b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
-        b_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+        b_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW128 if k-major
             layout=b_layout,
             element_type=b_dtype,
             major_mode_size=b_major_mode_size,
         )
-        b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+        b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,64) if k-major
             kind=b_smem_layout_atom_kind,
             element_type=b_dtype,
         )
         b_smem_layout_staged = cute.tile_to_shape(
             atom=b_smem_layout_atom,
             trg_shape=cute.append(b_smem_shape, ab_stage),
+            # if in k-major, then the first extending order is n mode (along rows)
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 
         c_smem_shape = epi_tile
         c_major_mode_size = epi_tile[1 if c_layout.is_n_major_c() else 0]
-        c_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom(
+        c_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW64 if n-major
             layout=c_layout,
             element_type=c_dtype,
+            # Since c_major_size is 32, then one row has 64B if c_dtype is 2B-wide, 
+            # so can use SW64, i.e. SW(B2, M4, S3), where 2^(B2 + M4) = 2^6 = 64B
             major_mode_size=c_major_mode_size,
         )
-        c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+        c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,32) if n-major
             kind=c_smem_layout_atom_kind,
             element_type=c_dtype,
         )
         epi_smem_layout_staged = cute.tile_to_shape(
             atom=c_smem_layout_atom,
             trg_shape=cute.append(c_smem_shape, epi_stage),
+            # if in n-major, then the first extending order is m mode (along rows)
             order=(0, 1, 2) if c_layout.is_n_major_c() else (1, 0, 2),
         )
 
@@ -1623,9 +1621,12 @@ class HopperWgmmaGemmKernel:
             print(f"{a_is_k_major=}, {a_major_mode_size=}, {a_smem_layout_atom_kind=}")
             print(f"{b_is_k_major=}, {b_major_mode_size=}, {b_smem_layout_atom_kind=}")
             print(f"{c_layout.is_n_major_c()=}, {c_major_mode_size=}, {c_smem_layout_atom_kind=}")
-            print(f"{a_smem_layout_staged=}")
-            print(f"{b_smem_layout_staged=}")
-            print(f"{epi_smem_layout_staged=}")
+            print("a_smem_layout_atom: ", a_smem_layout_atom)
+            print("b_smem_layout_atom: ", b_smem_layout_atom)
+            print("c_smem_layout_atom: ", c_smem_layout_atom)
+            print("a_smem_layout_staged: ", a_smem_layout_staged)
+            print("b_smem_layout_staged: ", b_smem_layout_staged)
+            print("epi_smem_layout_staged: ", epi_smem_layout_staged)
 
         return a_smem_layout_staged, b_smem_layout_staged, epi_smem_layout_staged
 
@@ -1682,10 +1683,12 @@ class HopperWgmmaGemmKernel:
         
         if const_expr(debug_print):
             print()
-            print(f"{c_layout.is_m_major_c()=}")
-            print(f"{copy_atom_r2s=}")
-            print(f"{copy_atom_C=}")
-            print(f"{tiled_copy_C_Atom=}")
+            print("c_layout.is_m_major_c(): ", c_layout.is_m_major_c())
+            print("copy_atom_r2s: ", copy_atom_r2s)
+            print("copy_atom_C: ", copy_atom_C)
+            print("tiled_copy_C_Atom: ", tiled_copy_C_Atom)
+            print("tiled_copy_r2s: ", tiled_copy_r2s)
+            
         
         return tiled_copy_r2s
 
