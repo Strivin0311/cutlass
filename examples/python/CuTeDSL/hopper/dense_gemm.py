@@ -301,7 +301,10 @@ class HopperWgmmaGemmKernel:
         self.epi_tile = None
 
         self.shared_storage = None
-        self.buffer_align_bytes = 1024 # TMA smem alignment
+        # NOTE: TMA smem alignment due to swizzle
+        # since the maximum swizzle pattern SW(B3, M4, S3) has a period of 2^(3+4+3) = 2^10 = 1024B
+        # so we have to align to 1024B
+        self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
