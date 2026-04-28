@@ -1683,9 +1683,9 @@ class HopperWgmmaGemmKernel:
         if const_expr(debug_print):
             print()
             print(f"{c_layout.is_m_major_c()=}")
-            print(f"copy_atom_r2s: {copy_atom_r2s}")
-            print(f"copy_atom_C: {copy_atom_C}")
-            print(f"tiled_copy_C_Atom: {tiled_copy_C_Atom}")
+            print(f"{copy_atom_r2s=}")
+            print(f"{copy_atom_C=}")
+            print(f"{tiled_copy_C_Atom=}")
         
         return tiled_copy_r2s
 
