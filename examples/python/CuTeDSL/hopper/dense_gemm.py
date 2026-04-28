@@ -599,7 +599,7 @@ class HopperWgmmaGemmKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
             # NOTE: we don't and had better not to prefetch tma desc for tma_atom_c
             # since it is not used until the epilogue, thus no need to prefetch 
-            # not to mention waste the limited prefetch slots and L2 cache
+            # not to mention waste the limited prefetch slots and L2 cache lines
             
         # /////////////////////////////////////////////////////////////////////////////
         #  Make CTA layout
@@ -647,7 +647,7 @@ class HopperWgmmaGemmKernel:
         pid_m = cid_m * self.cluster_shape_mn[0] + bidx_in_cluster[0]
         pid_n = cid_n * self.cluster_shape_mn[1] + bidx_in_cluster[1]
 
-        tile_coord_mnkl = (pid_m, pid_n, None, bidz)
+        tile_coord_mnkl = (pid_m, pid_n, None, bidz) # k dim will be preseved, so if there's will be a rest_K dim for tileK
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -697,10 +697,10 @@ class HopperWgmmaGemmKernel:
         storage = smem.allocate(self.shared_storage)
         
         # Get the tma copy bytes for each stage,
-        # note that we need to wait both A/B and ready, thus the tma copy bytes is the sum of A and B copy size, 
+        # note that the producer neesd to wait both A/B ready, thus the tma copy bytes is the sum of A and B copy size, 
         # which is determined by the smem layout per stage and data type
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
+        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0)) # removing the stage dim
+        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0)) # removing the stage dim
         tma_copy_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -711,8 +711,9 @@ class HopperWgmmaGemmKernel:
         # Define producer group for mainloop pipeline
         # only warp0 will be the producer to load the data, 
         # thus size=1 (the lane0 in warp0 will participate the pipeline and accquire/issue the tma load)
+        num_producer_warps = 1
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, size=1
+            pipeline.Agent.Thread, size=num_producer_warps
         )
         
         # Define consumer group for mainloop pipeline
@@ -723,9 +724,9 @@ class HopperWgmmaGemmKernel:
         # since the current CTA itself counts twice in A(row) and B(col)
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         num_warps = self.threads_per_cta // 32
-        consumer_arrive_cnt = mcast_size * num_warps
+        num_consumer_warps = mcast_size * num_warps
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, size=consumer_arrive_cnt
+            pipeline.Agent.Thread, size=num_consumer_warps
         )
 
         # since cta_layout_mnk = (2,1,1), thus cta_layout_vmnk is (1,2,1,1)
@@ -750,21 +751,22 @@ class HopperWgmmaGemmKernel:
         if const_expr(self.debug_print):
             if is_thread0:
                 cute.printf("")
-                cute.printf("a_smem_layout: {}, b_smem_layout: {}, tma_copy_bytes: {}", a_smem_layout, b_smem_layout, tma_copy_bytes)
-                cute.printf("mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", mcast_size, consumer_arrive_cnt, cta_layout_vmnk)
+                cute.printf("tma_copy_bytes: {}, mcast_size: {}, consumer_arrive_cnt: {}, cta_layout_vmnk: {}", tma_copy_bytes, mcast_size, num_consumer_warps, cta_layout_vmnk)
 
         #  Cluster arrive after barrier init
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed()
+        # NOTE: this step is redundant since the `cluster_arrive` is already done 
+        # in the `pipeline.PipelineTmaAsync.create`  function
+        # if cute.size(self.cluster_shape_mn) > 1:
+        #     cute.arch.cluster_arrive_relaxed()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor A/B/C
         # ///////////////////////////////////////////////////////////////////////////////
         sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+            layout=a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
         )
         sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+            layout=b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
         
         # NOTE: smem of C reuses the one of A, since during the epilogue, A/B smem is no longer needed, 
@@ -772,7 +774,7 @@ class HopperWgmmaGemmKernel:
         sC_ptr = cute.recast_ptr(
             sA.iterator, swizzle_=epi_smem_layout_staged.inner, dtype=self.c_dtype
         )
-        sC = cute.make_tensor(sC_ptr, epi_smem_layout_staged.outer)
+        sC = cute.make_tensor(iterator=sC_ptr, layout=epi_smem_layout_staged.outer)
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -787,18 +789,28 @@ class HopperWgmmaGemmKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
         # ///////////////////////////////////////////////////////////////////////////////
-        
-        # (bM, bK, RestK)
-        gA_mkl = cute.local_tile(
-            mA_mkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, None, 1)
+        # Use the `tiler` to zipped divide the `input` global tensor 
+        # and pick the corr. sub-tile according to the tile `coord` (None means keeping the whole dimension, like K, then there'll be an another rest_K dim),
+        # and also `proj` the tiled tensor to take only the needed dimensions (None means tossing the dimension away).
+        gA_mkl = cute.local_tile( # (tileM, tileK, rest_K)
+            input=mA_mkl, # (pM, pK, l)
+            tiler=self.tile_shape_mnk,
+            coord=tile_coord_mnkl,
+            proj=(1, None, 1) # only take M,K dims
         )
-        # (bN, bK, RestK)
-        gB_nkl = cute.local_tile(
-            mB_nkl, self.tile_shape_mnk, tile_coord_mnkl, proj=(None, 1, 1)
+        gB_nkl = cute.local_tile( # (tileN, tileK, rest_K)
+            input=mB_nkl,
+            tiler=self.tile_shape_mnk,
+            coord=tile_coord_mnkl,
+            proj=(None, 1, 1) # only take N,K dims
         )
-        # (bM, bN)
-        gC_mnl = cute.local_tile(
-            mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
+        gC_mnl = cute.local_tile( # (tileM, tileN)
+            input=mC_mnl,
+            # NOTE: we make tma_tensor_c with epi_tile, but here we still use tile_shape_mnk for mma tiling
+            # and gC_mnl is going to be partitioned to tCrC
+            tiler=self.tile_shape_mnk,
+            coord=tile_coord_mnkl,
+            proj=(1, 1, None) # only take M,N dims
         )
         
         if const_expr(self.debug_print):
@@ -844,11 +856,11 @@ class HopperWgmmaGemmKernel:
         # i.e. tAsA with layout: ( (8192,1), stages=(1,4) ) 
         # and tAgA_mkl with layout: ( ((64,128),1), rest_k=16 )
         tAsA, tAgA_mkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_a,
-            a_cta_crd,
-            a_cta_layout,
-            sA_for_tma_partition,
-            gA_for_tma_partition,
+            atom=tma_atom_a,
+            cta_coord=a_cta_crd,
+            cta_layout=a_cta_layout,
+            smem_tensor=sA_for_tma_partition, # (TMA, PIPE_STAGES)
+            gmem_tensor=gA_for_tma_partition, # (TMA, REST_K)
         )
 
         # TMA load B partition_S/D
@@ -872,11 +884,11 @@ class HopperWgmmaGemmKernel:
         # tBsB with layout: ( (16384,1), stages=(1,4) ) 
         # and tBgB_nkl with layout: ( ((64,256),1), rest_k=16 )
         tBsB, tBgB_nkl = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_b,
-            b_cta_crd,
-            b_cta_layout,
-            sB_for_tma_partition,
-            gB_for_tma_partition,
+            atom=tma_atom_b,
+            cta_coord=b_cta_crd,
+            cta_layout=b_cta_layout,
+            smem_tensor=sB_for_tma_partition, # (TMA, PIPE_STAGES)
+            gmem_tensor=gB_for_tma_partition, # (TMA, REST_K)
         )
         
         if const_expr(self.debug_print):
@@ -950,15 +962,17 @@ class HopperWgmmaGemmKernel:
         # since tCsA layout is ( mk=(64,16), 1, kloop=4, stages=(1,4) )
         # so tCrA layout will be (1, 1, kloop=4, stages=(1,4) ),
         # wile the first two modes are dummy with stride=0 because tCsA in smem will be handled by current WG as a whole
-        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrA = thr_mma.make_fragment_A(tCsA)
         
         # since tCsB layout is ( nk=(256,16), 1, kloop=4, stages=(1,4) )
         # so tCrB layout will be (1, 1, kloop=4, stages=(1,4) ),
         # while the first two modes are dummy with stride=0 because tCsB in smem will be handled by current WG as a whole
-        tCrB = tiled_mma.make_fragment_B(tCsB)
+        tCrB = thr_mma.make_fragment_B(tCsB)
         
-        # since tCgC layout is ((2,2,32),1,1), then tCrC (accumulators) layout will also be ( (2,2,32), 1, 1 )
-        tCrC = cute.make_fragment(tCgC.shape, self.acc_dtype)
+        # since tCgC layout is ((2,2,32),1,1), 
+        # then tCrC (accumulators) layout will also be ( (2,2,32), 1, 1 )
+        # tCrC = cute.make_fragment(tCgC.shape, self.acc_dtype) # deprecated API
+        tCrC = cute.make_rmem_tensor(tCgC.shape, self.acc_dtype) # newer API
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -978,8 +992,8 @@ class HopperWgmmaGemmKernel:
         #  Cluster wait
         # ///////////////////////////////////////////////////////////////////////////////
         
-        # TODO(REVIEW): do we need this cluster wait, since `pipeline.PipelineTmaAsync.create` 
-        # has already issued `cluster_arrive_relaxed` and `cluster_wait` inside ?
+        # TODO(review): is this step redundant since the `cluster_wait` is already done 
+        # in the `pipeline.PipelineTmaAsync.create`  function
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
         else:
