@@ -1287,21 +1287,6 @@ class HopperWgmmaGemmKernel:
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
 
-        # Wait all issued wgmmas to complete, 
-        # to ensure the accumulated results in tCrC are ready to be stored
-        cute.nvgpu.warpgroup.wait_group(0)
-        
-        if cute.size(self.cluster_shape_mn) > 1:
-            # Wait for all threads in the cluster to finish, avoiding early release of smem
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
-        else:
-            # For cluster that has a single thread block, it might have more than one warp groups.
-            # Wait for all warp groups in the thread block to finish, because smem for tensor A in
-            # the mainloop is reused in the epilogue.
-            cute.arch.sync_threads()
-        
-        
         # NOTE: Do NOT call mainloop_pipeline.producer_tail(mainloop_producer_state) here.
         #
         # producer_tail() is designed for persistent kernels where a single CTA reuses smem
@@ -1342,6 +1327,20 @@ class HopperWgmmaGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  EPILOG
         # /////////////////////////////////////////////////////////////////////////////
+        
+        # Wait all issued wgmmas to complete, 
+        # to ensure the accumulated results in tCrC are ready to be stored
+        cute.nvgpu.warpgroup.wait_group(0)
+        
+        if cute.size(self.cluster_shape_mn) > 1:
+            # Wait for all threads in the cluster to finish, avoiding early release of smem
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        else:
+            # For cluster that has a single thread block, it might have more than one warp groups.
+            # Wait for all warp groups in the thread block to finish, because smem for tensor A in
+            # the mainloop is reused in the epilogue.
+            cute.arch.sync_threads()
 
         # Get the thread slice of the epilogue R2S tiled copy 
         thr_copy_r2s = epi_tiled_copy_r2s.get_slice(tidx)
@@ -1360,7 +1359,7 @@ class HopperWgmmaGemmKernel:
         # while the tiled copy atom (stmatrix inst) needs 8=(2,4) contiguous fp32 elems in one go,
         # so we need to retile tCrC to have a layout of (8,16):(1,8) to match the tiled copy atom layout,
         # where 8 elems in one tiled copy, and repeat 16 = R2S_N=2 x PIPE_D=4 x LOOP=(256/128)=2 times to cover the whole tile (m128, n256) of C
-        tRS_rAcc = epi_tiled_copy_r2s.retile(tCrC)
+        tRS_rC = epi_tiled_copy_r2s.retile(tCrC)
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -1371,8 +1370,8 @@ class HopperWgmmaGemmKernel:
                 cute.printf("thr_copy_r2s.layout_dst_tv_tiled: {}", thr_copy_r2s.layout_dst_tv_tiled)
                 cute.printf("tRS_sD:")
                 cute.print_tensor(tRS_sD)
-                cute.printf("tRS_rAcc:")
-                cute.print_tensor(tRS_rAcc)
+                cute.printf("tRS_rC:")
+                cute.print_tensor(tRS_rC)
 
         # Allocate D registers as a register buffer for a single tiled copy in each stage
         # tRS_rD_layout is (R2S=((2,2,2),1), R2S_M=1, R2S_N=2)
@@ -1396,26 +1395,26 @@ class HopperWgmmaGemmKernel:
 
         # Make tma copy partitions for the epilogue store of C from shared memory to global memory
         # where:
-        #   1. sepi_for_tma_partition is just group the non-pipeline modes together with layout: (epi_tile=((8,16),(32,1)), epi_stages=(1,4))
-        #   2. tCgC_for_tma_partition is just divide the global memory tensor gC_mnl by the epi_tile with layout (m128, n32),
-        #       resulting in (epi_tile=(128,32), rest_n=(1,8)) tiled layout, which indicates how many epi_tiles (rest_n) we need 
-        #       to finish copying the whole gC_mnl
-        sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
-        tCgC_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)
+        #   1. sC_for_tma_partition: group the non-pipeline modes together with layout: (epi_tile=((8,16),(32,1)), epi_stages=(1,4))
+        #   2. tCgC_for_tma_partition: divide the global memory tensor gC_mnl by the epi_tile with layout (m128, n32),
+        #       resulting in (epi_tile=(128,32), rest_n=(1,8)) tiled layout, 
+        #       which indicates how many epi_tiles (rest_n) we need to finish copying the whole gC_mnl
+        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
+        gC_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)
 
         # And tma partition will return 
-        #  1. bSG_sD with layout: (TMA_TILE=(4096,1), epi_stages=(1,4)) as the src shared memory
-        #  2. bSG_gD with layout: (TMA_TILE=((32,128),1), rest_n=(1,8)) as the dst global memory
-        bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+        #  1. tSG_sD with layout: (TMA_TILE=(4096,1), epi_stages=(1,4)) as the src shared memory
+        #  2. tSG_gD with layout: (TMA_TILE=((32,128),1), rest_n=(1,8)) as the dst global memory
+        tSG_sD, tSG_gD = cute.nvgpu.cpasync.tma_partition(
             atom=tma_atom_c,
             cta_coord=0,
             cta_layout=cute.make_layout(1),
-            smem_tensor=sepi_for_tma_partition,
-            gmem_tensor=tCgC_for_tma_partition,
+            smem_tensor=sC_for_tma_partition,
+            gmem_tensor=gC_for_tma_partition,
         )
 
-        epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1]) # rest_n=8, number of epi_tiles
-        epi_tile_shape = tCgC_for_tma_partition.shape[1] # rest_n_shape=(1,8)
+        epi_tile_num = cute.size(gC_for_tma_partition, mode=[1]) # rest_n=8, number of epi_tiles
+        epi_tile_shape = gC_for_tma_partition.shape[1] # rest_n_shape=(1,8)
         epi_tile_layout = cute.make_layout( # rest_n_layout=(1,8):(8,1)
             epi_tile_shape, stride=(epi_tile_shape[1], 1)
         )
@@ -1424,14 +1423,14 @@ class HopperWgmmaGemmKernel:
             if is_thread0:
                 cute.printf("")
                 cute.printf("epi_tile_num: {}, epi_tile_shape: {}, epi_tile_layout: {}", epi_tile_num, epi_tile_shape, epi_tile_layout)
-                cute.printf("sepi_for_tma_partition:")
-                cute.print_tensor(sepi_for_tma_partition)
-                cute.printf("tCgC_for_tma_partition:")
-                cute.print_tensor(tCgC_for_tma_partition)
-                cute.printf("bSG_sD:")
-                cute.print_tensor(bSG_sD)
-                cute.printf("bSG_gD:")
-                cute.print_tensor(bSG_gD)
+                cute.printf("sC_for_tma_partition:")
+                cute.print_tensor(sC_for_tma_partition)
+                cute.printf("gC_for_tma_partition:")
+                cute.print_tensor(gC_for_tma_partition)
+                cute.printf("tSG_sD:")
+                cute.print_tensor(tSG_sD)
+                cute.printf("tSG_gD:")
+                cute.print_tensor(tSG_gD)
 
         # Initialize tma store c_pipeline using `TmaStoreFence` instead of `MbarrierArray`
         # which servers as an alias API for `cp.async.bulk.commit_group` and `cp.async.bulk.wait_group`
@@ -1451,7 +1450,7 @@ class HopperWgmmaGemmKernel:
                 # since it is element-wise copied to tRS_rD without any reduction, 
                 # so no need to worry about the layout difference between tCrC and tRS_rAcc
                 # but it's still a good habit to use the retiled tiled_copy layout tRS_rAcc, instead of original tiled_mma layout tCrC
-                tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v] 
+                tRS_rD[epi_v] = tRS_rC[epi_idx * size_tRS_rD + epi_v] 
 
             # Type conversion (fp32 -> c_dtype) in registers
             tRS_rD_out.store(tRS_rD.load().to(self.c_dtype))
@@ -1482,8 +1481,8 @@ class HopperWgmmaGemmKernel:
                 gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
                 cute.copy(
                     atom=tma_atom_c,
-                    src=bSG_sD[(None, epi_stage_idx)],
-                    dst=bSG_gD[(None, gmem_coord)],
+                    src=tSG_sD[(None, epi_stage_idx)],
+                    dst=tSG_gD[(None, gmem_coord)],
                 )
                 
                 # `producer_commit` for TMAStoreFence will issue `cp.async.bulk.commit_group` 
