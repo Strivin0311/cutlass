@@ -2,7 +2,7 @@
 
 # Uncomment the following line to enable debug mode 
 # with classic configuration with verbose logging, good for learning and debugging
-# export DEBUG_MODE=1
+export DEBUG_MODE=1
 
 export PROFILE_MODE=0 # set to 1 to enable profiling with either Nsight Systems (nsys) or Nsight Compute (ncu)
 export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_MODE

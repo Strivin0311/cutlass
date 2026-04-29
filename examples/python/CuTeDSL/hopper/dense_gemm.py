@@ -41,6 +41,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 from cutlass import const_expr
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -269,8 +270,7 @@ class HopperWgmmaGemmKernel:
 
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_inst_shape_mn = None
-        # K dimension is deferred in _setup_attributes
-        self.tile_shape_mnk = (*tile_shape_mn, 1) # determine tileK automatically later
+        self.tile_shape_mnk = (*tile_shape_mn, 1) # K dimension is deferred in _setup_attributes
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
         self.atom_layout_mnk = (
@@ -499,7 +499,7 @@ class HopperWgmmaGemmKernel:
             print()
         
             print()
-            print("self.tiled_mma: ", self.tiled_mma, f"shape_mnk: {self.tiled_mma.shape_mnk}")
+            print("self.tiled_mma: ", self.tiled_mma, f"\n\nshape_mnk: {self.tiled_mma.shape_mnk}")
             print()
             
             cute.printf("tma_tensor_a: {}", tma_tensor_a)
@@ -528,7 +528,6 @@ class HopperWgmmaGemmKernel:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
         )
-        return
 
     #  GPU device kernel
     @cute.kernel
@@ -600,8 +599,8 @@ class HopperWgmmaGemmKernel:
         if warp_idx == 0:
             # Issues a hardware prefetch instruction to bring the TMA descriptor created by host
             # into the device constant cache, which can improve performance when the descriptor will be used soon.
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
             # NOTE: we don't and had better not to prefetch tma desc for tma_atom_c
             # since it is not used until the epilogue, thus no need to prefetch 
             # not to mention waste the limited prefetch slots and L2 cache lines
@@ -860,7 +859,7 @@ class HopperWgmmaGemmKernel:
         # and return the corr. tiled shared/global tensors,
         # i.e. tAsA with layout: ( (8192,1), stages=(1,4) ) 
         # and tAgA_mkl with layout: ( ((64,128),1), rest_k=16 )
-        tAsA, tAgA_mkl = cute.nvgpu.cpasync.tma_partition(
+        tAsA, tAgA_mkl = cpasync.tma_partition(
             atom=tma_atom_a,
             cta_coord=a_cta_crd,
             cta_layout=a_cta_layout,
@@ -888,7 +887,7 @@ class HopperWgmmaGemmKernel:
         # And tma partition will return 
         # tBsB with layout: ( (16384,1), stages=(1,4) ) 
         # and tBgB_nkl with layout: ( ((64,256),1), rest_k=16 )
-        tBsB, tBgB_nkl = cute.nvgpu.cpasync.tma_partition(
+        tBsB, tBgB_nkl = cpasync.tma_partition(
             atom=tma_atom_b,
             cta_coord=b_cta_crd,
             cta_layout=b_cta_layout,
@@ -1410,7 +1409,7 @@ class HopperWgmmaGemmKernel:
         # And tma partition will return 
         #  1. tSG_sD with layout: (TMA_TILE=(4096,1), epi_stages=(1,4)) as the src shared memory
         #  2. tSG_gD with layout: (TMA_TILE=((32,128),1), rest_n=(1,8)) as the dst global memory
-        tSG_sD, tSG_gD = cute.nvgpu.cpasync.tma_partition(
+        tSG_sD, tSG_gD = cpasync.tma_partition(
             atom=tma_atom_c,
             cta_coord=0,
             cta_layout=cute.make_layout(1),
@@ -1808,7 +1807,7 @@ class HopperWgmmaGemmKernel:
         """
         
         # cp.async SMEM -> GMEM bulk tensor copy Operation
-        op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
+        op = cpasync.CopyBulkTensorTileS2GOp()
         
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
         
@@ -1835,7 +1834,7 @@ class HopperWgmmaGemmKernel:
             cute.make_identity_layout(tensor_c.shape), epi_tile
         )
         
-        tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             op=op,
             gmem_tensor=tensor_c,
             smem_layout=epi_smem_layout,
@@ -1878,14 +1877,14 @@ class HopperWgmmaGemmKernel:
         """
         op = (
             # cp.async GMEM -> SMEM bulk tensor copy Operation
-            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+            cpasync.CopyBulkTensorTileG2SOp()
             if mcast_dim == 1
             # cp.async GMEM -> SMEM bulk tensor multicast copy Operation
-            else cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
+            else cpasync.CopyBulkTensorTileG2SMulticastOp()
         )
 
         smem_layout = cute.slice_(smem_layout_staged, (None, None, 0)) # removing the pipeline stage mode
-        tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
             op=op,
             gmem_tensor=tensor,
             smem_layout=smem_layout,
