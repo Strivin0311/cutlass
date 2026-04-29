@@ -585,12 +585,13 @@ class DenseGemmKernel:
         """
         GPU device kernel performing the batched GEMM computation.
         """
+        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-        #
-        # Prefetch tma descriptor
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Prefetch Tma desc
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -599,9 +600,10 @@ class DenseGemmKernel:
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
-        # Setup cta/thread coordinates
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup cta/thread coordinates
+        # /////////////////////////////////////////////////////////////////////////////
+        
         # Coords inside cluster
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -612,6 +614,7 @@ class DenseGemmKernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
+        
         # Coords outside cluster
         cta_coord = (bidx, bidy, bidz)
         mma_tile_coord_mnl = (
@@ -619,12 +622,10 @@ class DenseGemmKernel:
             cta_coord[1],
             cta_coord[2],
         )
-        # Coords inside cta
-        tidx, _, _ = cute.arch.thread_idx()
-
-        #
-        # Alloc and init: a+b full/empty, accumulator full, tensor memory dealloc barrier
-        #
+        
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Alloc and init: a+b full/empty, accumulator full, tensor memory dealloc barrier
+        # /////////////////////////////////////////////////////////////////////////////
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
@@ -685,9 +686,10 @@ class DenseGemmKernel:
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
-        #
-        # Setup smem tensor A/B/C
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup smem tensor A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
+        
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = (
             storage.sC.get_tensor(
@@ -705,9 +707,9 @@ class DenseGemmKernel:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
-        #
-        # Compute multicast mask for A/B buffer full
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Compute multicast mask for A/B buffer full
+        # /////////////////////////////////////////////////////////////////////////////
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
@@ -718,9 +720,9 @@ class DenseGemmKernel:
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
             )
 
-        #
-        # Local_tile partition global tensors
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Local_tile partition global tensors
+        # /////////////////////////////////////////////////////////////////////////////
         # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
@@ -735,9 +737,9 @@ class DenseGemmKernel:
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
-        #
-        # Partition global tensor for TiledMMA_A/B/C
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition global tensor for TiledMMA_A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
@@ -746,9 +748,10 @@ class DenseGemmKernel:
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
-        #
-        # Partition global/shared tensor for TMA load A/B
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition global/shared tensor for TMA load A/B
+        # /////////////////////////////////////////////////////////////////////////////
+        
         # TMA load A partition_S/D
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -776,9 +779,10 @@ class DenseGemmKernel:
             cute.group_modes(tCgB, 0, 3),
         )
 
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/C
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition shared/tensor memory tensor for TiledMMA_A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
+        
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -788,37 +792,37 @@ class DenseGemmKernel:
         # (MMA, MMA_M, MMA_N)
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
 
-        #
-        # Cluster wait before tensor memory alloc
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Cluster wait before tensor memory alloc
+        # /////////////////////////////////////////////////////////////////////////////
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
 
-        #
-        # Alloc tensor memory buffer
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Alloc tensor memory buffer
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == 0:
             cute.arch.alloc_tmem(
                 self.num_tmem_alloc_cols, tmem_holding_buf, is_two_cta=use_2cta_instrs
             )
 
-        #
-        # Bar sync for retrieve tensor memory ptr from shared memory
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Bar sync for retrieve tensor memory ptr from shared memory
+        # /////////////////////////////////////////////////////////////////////////////
         cute.arch.barrier()
 
-        #
-        # Retrieving tensor memory ptr and make accumulator tensor
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Retrieving tensor memory ptr and make accumulator tensor
+        # /////////////////////////////////////////////////////////////////////////////
         tmem_ptr = cute.arch.retrieve_tmem_ptr(
             self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
         )
         # (MMA, MMA_M, MMA_N)
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-        #
-        # Partition for epilogue
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition for epilogue
+        # /////////////////////////////////////////////////////////////////////////////
         tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
             tidx, tCtAcc, tCgC, epi_tile, use_2cta_instrs
         )
@@ -844,9 +848,10 @@ class DenseGemmKernel:
                 tidx, tiled_copy_t2r, tCgC, epi_tile, sC
             )
 
-        #
-        # Slice to per mma tile index
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Slice to per mma tile index
+        # /////////////////////////////////////////////////////////////////////////////
+        
         # ((atom_v, rest_v), RestK)
         tAgA = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
         # ((atom_v, rest_v), RestK)
@@ -858,9 +863,9 @@ class DenseGemmKernel:
             # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
             tTR_gC = tTR_gC[(None, None, None, None, None, *mma_tile_coord_mnl)]
 
-        #
-        # Pipelining TMA load A/B and MMA mainloop
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Pipelining TMA load A/B and MMA mainloop
+        # ///////////////////////////////////////////////////////////////////////////
         prefetch_k_tile_cnt = cutlass.min(self.num_ab_stage - 2, k_tile_cnt)
 
         if warp_idx == 0:
@@ -973,9 +978,9 @@ class DenseGemmKernel:
             if is_leader_cta:
                 acc_pipeline.producer_commit(acc_producer_state)
 
-        #
-        # Epilogue
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Epilogue
+        # /////////////////////////////////////////////////////////////////////////////
 
         # Release tensor memory allocation lock
         if warp_idx == 0:
@@ -1001,9 +1006,9 @@ class DenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-        #
-        # Store accumulator to global memory in subtiles
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Store accumulator to global memory in subtiles
+        # /////////////////////////////////////////////////////////////////////////////
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         for subtile_idx in range(subtile_cnt):
             #
@@ -1058,9 +1063,9 @@ class DenseGemmKernel:
                 #
                 cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
 
-        #
-        # Dealloc the tensor memory buffer
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Dealloc the tensor memory buffer
+        # /////////////////////////////////////////////////////////////////////////////
         cute.arch.barrier()
         if warp_idx == 0:
             if use_2cta_instrs:
@@ -1072,21 +1077,21 @@ class DenseGemmKernel:
                 tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
             )
 
-        #
-        # Wait for C store complete
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Wait for C store complete
+        # /////////////////////////////////////////////////////////////////////////////
         if const_expr(self.use_tma_store):
             c_pipeline.producer_tail()
 
-        #
-        # Wait A/B buffer empty
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Wait A/B buffer empty
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == 0:
             # Reverse prefetch_k_tile_cnt times to next available buffer
             for i in range(prefetch_k_tile_cnt):
                 ab_producer_state.reverse()
             ab_pipeline.producer_tail(ab_producer_state)
-        return
+
 
     def epilog_tmem_copy_and_partition(
         self,

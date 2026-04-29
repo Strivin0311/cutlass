@@ -1507,7 +1507,6 @@ class HopperWgmmaGemmKernel:
             # to wait for all committed TMA store groups to complete before the producer (warp0) can exit
             c_pipeline.producer_tail()
 
-        return
 
     @staticmethod
     def _compute_stages(
