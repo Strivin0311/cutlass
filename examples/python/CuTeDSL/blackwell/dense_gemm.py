@@ -229,9 +229,11 @@ class DenseGemmKernel:
                   f"use_2cta_instrs={self.use_2cta_instrs}, "
                   f"mma_tiler_mn={mma_tiler_mn}, "
                   f"cluster_shape_mn={cluster_shape_mn}, "
+                  f"cta_group={self.cta_group}, "
                   f"use_tma_store={use_tma_store}, "
                   f"occupancy={self.occupancy}, "
                   f"threads_per_cta={self.threads_per_cta}, "
+                  f"buffer_align_bytes={self.buffer_align_bytes}, "
                   f"smem_capacity={self.smem_capacity} bytes"
             )
             print()
@@ -422,6 +424,8 @@ class DenseGemmKernel:
             atom_thr_id=tiled_mma.thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0)) # removing the pipeline stage dim
+        a_smem_size = cute.cosize(self.a_smem_layout_staged.outer)
+        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             op=a_op,
             gmem_tensor=a,
@@ -440,6 +444,8 @@ class DenseGemmKernel:
             atom_thr_id=tiled_mma.thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0)) # removing the pipeline stage dim
+        b_smem_size = cute.cosize(self.b_smem_layout_staged.outer)
+        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             op=b_op,
             gmem_tensor=b,
@@ -452,19 +458,19 @@ class DenseGemmKernel:
             ),
         )
 
-        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
-        b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
-
         # Setup store for C
         tma_atom_c = None
         tma_tensor_c = None
+        c_smem_size = 0
+        c_cta_v_layout = None
         if const_expr(self.use_tma_store):
             c_op = cpasync.CopyBulkTensorTileS2GOp()
             c_cta_v_layout = cute.composition(
                 cute.make_identity_layout(c.shape), self.epi_tile
             )
             epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0)) # removing the pipeline stage dim
+            c_smem_size = cute.cosize(self.c_smem_layout_staged.outer)
+            
             tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
                 op=c_op,
                 gmem_tensor=c,
@@ -473,11 +479,8 @@ class DenseGemmKernel:
             )
 
         # Compute grid size
+        self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
         grid = self._compute_grid(c, self.cta_tile_shape_mnk, self.cluster_shape_mn)
-
-        c_smem_size = (
-            cute.cosize(self.c_smem_layout_staged.outer) if self.use_tma_store else 0
-        )
 
         # Define shared storage for kernel
         @cute.struct
@@ -485,13 +488,14 @@ class DenseGemmKernel:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+            
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.a_dtype, a_smem_size
                 ],
                 self.buffer_align_bytes,
             ]
@@ -499,7 +503,7 @@ class DenseGemmKernel:
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.b_dtype, b_smem_size
                 ],
                 self.buffer_align_bytes,
             ]
@@ -507,8 +511,7 @@ class DenseGemmKernel:
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.c_dtype,
-                    c_smem_size,
+                    self.c_dtype, c_smem_size
                 ],
                 self.buffer_align_bytes,
             ]
@@ -517,14 +520,25 @@ class DenseGemmKernel:
         
         if const_expr(self.debug_print):
             print()
-            print(f"{self.num_tma_load_bytes=}")
-            print("TMA A: op: ", a_op, ", atom: ", tma_atom_a)
-            print("TMA B: op: ", b_op, ", atom: ", tma_atom_b)
-            print("TMA C: op: ", c_op, ", atom: ", tma_atom_c, ", c_cta_v_layout: ", c_cta_v_layout, ", c_smem_size: ", c_smem_size)
+            print(f"{a_smem_size=}, {b_smem_size=}, {c_smem_size=}, {c_cta_v_layout=}")
+            print(f"{a_copy_size=}, {b_copy_size=}, {atom_thr_size=}, {self.num_tma_load_bytes=}")
+            print()
             
+            print()
+            print("TMA A: op: ", a_op, "\natom: ", tma_atom_a)
+            print()
+            print("TMA B: op: ", b_op, "\natom: ", tma_atom_b)
+            print()
+            print("TMA C: op: ", c_op, "\natom: ", tma_atom_c)
+            print()
+            
+            cute.printf("")
             cute.printf("tma_tensor_a: {}", tma_tensor_a)
+            cute.printf("")
             cute.printf("tma_tensor_b: {}", tma_tensor_b)
+            cute.printf("")
             cute.printf("tma_tensor_c: {}", tma_tensor_c)
+            cute.printf("")
         
             cute.printf("grid: {}", grid)
         
