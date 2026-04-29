@@ -105,7 +105,7 @@ To collect performance with NCU profiler:
 
 Constraints:
 * Supported input data types: mxf8, mxf4, nvf4
-  see detailed valid dtype combinations in below Sm100BlockScaledPersistentDenseGemmKernel class documentation
+  see detailed valid dtype combinations in below BlockScaledDenseGemmPersistentKernelSm100 class documentation
 * A/B tensor must have the same data type, mixed data type is not supported (e.g., mxf8 x mxf4)
 * Mma tiler M must be 128 or 256(use_2cta_instrs)
 * Mma tiler N must be 128 or 256
@@ -116,7 +116,7 @@ Constraints:
 """
 
 
-class Sm100BlockScaledPersistentDenseGemmKernel:
+class BlockScaledDenseGemmPersistentKernelSm100:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -150,7 +150,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
 
     Example:
-        >>> gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+        >>> gemm = BlockScaledDenseGemmPersistentKernelSm100(
         ...     sf_vec_size=16,
         ...     mma_tiler_mn=(256, 128),
         ...     cluster_shape_mn=(2, 1)
@@ -1997,22 +1997,22 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
+        if not BlockScaledDenseGemmPersistentKernelSm100.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, c_dtype
         ):
             can_implement = False
         # Skip unsupported layouts
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_layouts(
+        if not BlockScaledDenseGemmPersistentKernelSm100.is_valid_layouts(
             ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+        if not BlockScaledDenseGemmPersistentKernelSm100.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(
+        if not BlockScaledDenseGemmPersistentKernelSm100.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
@@ -2104,7 +2104,7 @@ def run(
     m, n, k, l = mnkl
 
     # Skip unsupported testcase
-    if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+    if not BlockScaledDenseGemmPersistentKernelSm100.can_implement(
         ab_dtype,
         sf_dtype,
         sf_vec_size,
@@ -2249,7 +2249,7 @@ def run(
     )
 
     # Configure gemm kernel
-    gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+    gemm = BlockScaledDenseGemmPersistentKernelSm100(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,

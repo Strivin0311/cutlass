@@ -99,7 +99,7 @@ To collect performance with NCU profiler:
 
 Constraints:
 * Supported input data types: fp16, bf16, tf32, int8, uint8, fp8 (e4m3fn, e5m2),
-  see detailed valid dtype combinations in below DenseGemmKernel class documentation
+  see detailed valid dtype combinations in below DenseGemmKernelSm100 class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
 * Mma tiler N must be 32-256, step 32
@@ -115,7 +115,7 @@ Constraints:
 DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
 
 
-class DenseGemmKernel:
+class DenseGemmKernelSm100:
     """
     This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs.
@@ -159,7 +159,7 @@ class DenseGemmKernel:
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 
     Example:
-        >>> gemm = DenseGemmKernel(
+        >>> gemm = DenseGemmKernelSm100(
         ...     acc_dtype=cutlass.Float32,
         ...     use_2cta_instrs=True,
         ...     mma_tiler_mn=(128, 128),
@@ -225,7 +225,7 @@ class DenseGemmKernel:
         
         if const_expr(self.debug_print):
             print()
-            print(f"Initialized DenseGemmKernel with acc_dtype={self.acc_dtype}, "
+            print(f"Initialized DenseGemmKernelSm100 with acc_dtype={self.acc_dtype}, "
                   f"use_2cta_instrs={self.use_2cta_instrs}, "
                   f"mma_tiler_mn={mma_tiler_mn}, "
                   f"cluster_shape_mn={cluster_shape_mn}, "
@@ -695,7 +695,7 @@ class DenseGemmKernel:
 
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
-            if warp_idx == 0:
+            if warp_idx == 0: # only warp0 handles tmem
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(
@@ -907,9 +907,11 @@ class DenseGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc tensor memory buffer
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == 0:
+        if warp_idx == 0: # only warp0 handles tmem
             cute.arch.alloc_tmem(
-                self.num_tmem_alloc_cols, tmem_holding_buf, is_two_cta=use_2cta_instrs
+                num_columns=self.num_tmem_alloc_cols, 
+                smem_ptr_to_write_address=tmem_holding_buf, 
+                is_two_cta=use_2cta_instrs
             )
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -1789,20 +1791,20 @@ class DenseGemmKernel:
         """
         can_implement = True
         # Skip unsupported types
-        if not DenseGemmKernel.is_valid_dtypes(ab_dtype, acc_dtype, c_dtype):
+        if not DenseGemmKernelSm100.is_valid_dtypes(ab_dtype, acc_dtype, c_dtype):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
-        if not DenseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
+        if not DenseGemmKernelSm100.is_valid_mma_tiler_and_cluster_shape(
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn
         ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
-        if not DenseGemmKernel.is_valid_tensor_alignment(
+        if not DenseGemmKernelSm100.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
         # Skip invalid epilogue store option
-        if not DenseGemmKernel.is_valid_epilog_store_option(
+        if not DenseGemmKernelSm100.is_valid_epilog_store_option(
             use_2cta_instrs, use_tma_store, m, n, mma_tiler_mn
         ):
             can_implement = False
@@ -1846,7 +1848,7 @@ def run_dense_gemm(
     m, n, k, l = mnkl
 
     # Skip unsupported testcase
-    if not DenseGemmKernel.can_implement(
+    if not DenseGemmKernelSm100.can_implement(
         ab_dtype,
         acc_dtype,
         c_dtype,
@@ -1930,7 +1932,7 @@ def run_dense_gemm(
     )
 
     # Configure gemm kernel
-    gemm = DenseGemmKernel(
+    gemm = DenseGemmKernelSm100(
         acc_dtype,
         use_2cta_instrs,
         mma_tiler_mn,

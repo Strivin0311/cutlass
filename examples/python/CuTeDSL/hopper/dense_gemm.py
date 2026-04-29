@@ -206,10 +206,12 @@ def parse_arguments() -> argparse.Namespace:
 # /////////////////////////////////////////////////////////////////////////////
 
 
-class HopperWgmmaGemmKernel:
+class WgmmaDenseGemmKernelSm90:
     """
     This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Hopper GPUs.
+    
+    NOTE: this is a non-persistent kernel with optional cluster features
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
@@ -237,7 +239,7 @@ class HopperWgmmaGemmKernel:
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 4
 
     Example:
-        >>> gemm = HopperWgmmaGemmKernel(
+        >>> gemm = WgmmaDenseGemmKernelSm90(
         ...     acc_dtype=cutlass.Float32,
         ...     tile_shape_mn=(128, 256),
         ...     cluster_shape_mn=(1, 1)
@@ -2033,7 +2035,7 @@ def run(
     m, n, k, l = mnkl
 
     # Skip unsupported types
-    if not HopperWgmmaGemmKernel.is_valid_dtypes(
+    if not WgmmaDenseGemmKernelSm90.is_valid_dtypes(
         a_dtype, b_dtype, acc_dtype, c_dtype, a_major, b_major
     ):
         raise TypeError(
@@ -2098,7 +2100,7 @@ def run(
     b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
     c, mC, c_torch = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
 
-    gemm = HopperWgmmaGemmKernel(acc_dtype, tile_shape_mn, cluster_shape_mn, debug_print=DEBUG_MODE)
+    gemm = WgmmaDenseGemmKernelSm90(acc_dtype, tile_shape_mn, cluster_shape_mn, debug_print=DEBUG_MODE)
 
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
