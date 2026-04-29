@@ -2068,12 +2068,12 @@ def run(
         )
 
         # Create dtype torch tensor (cpu)
-        torch_tensor_cpu = cutlass.torch.create_and_permute_torch_tensor(
+        torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
             shape,
             torch_dtype,
             permute_order=permute_order,
-            init_type=cutlass.torch.TensorInitType.RANDOM,
-            init_config=cutlass.torch.RandomInitConfig(
+            init_type=cutlass_torch.TensorInitType.RANDOM,
+            init_config=cutlass_torch.RandomInitConfig(
                 min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
             ),
         )
@@ -2090,7 +2090,7 @@ def run(
             cute_tensor = cute_tensor.mark_layout_dynamic(
                 leading_dim=(0 if is_mode0_major else 1)
             )
-        cute_tensor = cutlass.torch.convert_cute_tensor(
+        cute_tensor = cutlass_torch.convert_cute_tensor(
             f32_torch_tensor,
             cute_tensor,
             dtype,
