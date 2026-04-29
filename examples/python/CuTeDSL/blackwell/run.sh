@@ -14,13 +14,28 @@ TEST_SCRIPT="dense_gemm"
 # TEST_SCRIPT="grouped_gemm"
 # TEST_SCRIPT="fmha"
 
+if [[ $DEBUG_MODE -eq 1 ]]; then
+    M=2048
+    K=4096
+    N=1024
+    PROFILE_MODE=0 # disable profiling when in debug mode to avoid conflicts with verbose logging
+elif [[ $PROFILE_MODE -eq 1 ]]; then
+    M=6144
+    K=2048
+    N=8192
+else
+    M=8192
+    K=8192
+    N=8192
+fi
+
 
 if [[ $TEST_SCRIPT == "dense_gemm" ]]; then
     SCRIPT_CMD="
     python dense_gemm.py                                     \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
     --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-    --mnkl 8192,8192,8192,1                                                   \
+    --mnkl $M,$K,$N,1                                                   \
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_gemm_software_pipeline" ]]; then
@@ -28,7 +43,7 @@ elif [[ $TEST_SCRIPT == "dense_gemm_software_pipeline" ]]; then
     python dense_gemm_software_pipeline.py                   \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
     --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-    --mnkl 8192,8192,8192,1                                                   \
+    --mnkl $M,$K,$N,1                                                   \
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_gemm_persistent" ]]; then
@@ -36,7 +51,7 @@ elif [[ $TEST_SCRIPT == "dense_gemm_persistent" ]]; then
     python dense_gemm_persistent.py                          \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
     --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                             \
-    --mnkl 8192,8192,8192,1                                                   \
+    --mnkl $M,$K,$N,1                                                   \
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_blockscaled_gemm_persistent" ]]; then

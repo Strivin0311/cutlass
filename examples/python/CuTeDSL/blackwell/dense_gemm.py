@@ -588,7 +588,7 @@ class DenseGemmKernel:
         bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-        is_thread0 = tidx == 127 and bidx == 63 and bidy == 63 and bidz == 0 # used only for debug print
+        is_thread0 = tidx == 127 and bidx == 15 and bidy == 31 and bidz == 0 # used only for debug print
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
@@ -706,19 +706,18 @@ class DenseGemmKernel:
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
-
+            
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                # FIXME: why print the stuff below causing hang ?
+                # cute.printf("[ab_pipeline] num_stages: {}, producer_mask: {}, consumer_mask: {}, is_leader_cta: {}", ab_pipeline.num_stages, ab_pipeline.producer_mask, ab_pipeline.consumer_mask, ab_pipeline.is_leader_cta)
+                # cute.printf("[acc_pipeline] num_stages: {}, producer_mask: {}, consumer_mask: {}", acc_pipeline.num_stages, acc_pipeline.producer_mask, acc_pipeline.consumer_mask)
+            
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup smem tensor A/B/C
         # /////////////////////////////////////////////////////////////////////////////
         
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sC = (
-            storage.sC.get_tensor(
-                c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
-            )
-            if self.use_tma_store
-            else None
-        )
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
@@ -728,77 +727,163 @@ class DenseGemmKernel:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
+        # (EPI_TILE_M, EPI_TILE_N, STAGE)
+        sC = (
+            storage.sC.get_tensor(
+                c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
+            )
+            if self.use_tma_store
+            else None
+        )
+
         # /////////////////////////////////////////////////////////////////////////////
         #  Compute multicast mask for A/B buffer full
         # /////////////////////////////////////////////////////////////////////////////
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(10), only for itself
+                cta_layout_vmnk=cluster_layout_vmnk, 
+                cta_coord_vmnk=block_in_cluster_coord_vmnk, 
+                mcast_mode=2 # multicast along N dim
             )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(10), only for itself 
+                cta_layout_vmnk=cluster_layout_vmnk, 
+                cta_coord_vmnk=block_in_cluster_coord_vmnk, 
+                mcast_mode=1 # multicast along M dim
             )
+            
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("a_full_mcast_mask: {}, b_full_mcast_mask: {}", a_full_mcast_mask, b_full_mcast_mask)
+                    cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
         # /////////////////////////////////////////////////////////////////////////////
-        # (bM, bK, RestM, RestK, RestL)
+        
+        # NOTE: we don't manually compute tile coordinates for global local tiles below
+        # so they all start with (0, 0, 0) offset in the tiles
+        
+        # (tileM, tileK, restM, restK, restL)
         gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            input=mA_mkl,
+            tiler=cute.slice_(self.mma_tiler, (None, 0, None)), # (M, K)
+            coord=(None, None, None)
         )
-        # (bN, bK, RestN, RestK, RestL)
+        # (tileN, tileK, restN, restK, restL)
         gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            input=mB_nkl, 
+            tiler=cute.slice_(self.mma_tiler, (0, None, None)), # (N, K)
+            coord=(None, None, None)
         )
-        # (bM, bN, RestM, RestN, RestL)
+        # (tileM, tileN, restM, restN, restL)
         gC_mnl = cute.local_tile(
-            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            input=mC_mnl, 
+            tiler=cute.slice_(self.mma_tiler, (None, None, 0)), # (M, N)
+            coord=(None, None, None)
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        
+        if const_expr(self.debug_print):
+            if is_thread0:
+                # FIXME: printing the tensors below causing incorrectness, need to investigate
+                cute.printf("")
+                cute.printf("k_tile_cnt: {}", k_tile_cnt)
+                # cute.printf("mA_mkl:")
+                # cute.print_tensor(mA_mkl)
+                cute.printf("mA_mkl: {}", mA_mkl)
+                # cute.printf("mB_nkl:")
+                # cute.print_tensor(mB_nkl)
+                cute.printf("mB_nkl: {}", mB_nkl)
+                # cute.printf("mC_mnl:")
+                # cute.print_tensor(mC_mnl)
+                cute.printf("mC_mnl: {}", mC_mnl)
+                
+                cute.printf("")
+                # cute.printf("gA_mkl:")
+                # cute.print_tensor(gA_mkl)
+                cute.printf("gA_mkl: {}", gA_mkl)
+                # cute.printf("gB_nkl:")
+                # cute.print_tensor(gB_nkl)
+                cute.printf("gB_nkl: {}", gB_nkl)
+                # cute.printf("gC_mnl:")
+                # cute.print_tensor(gC_mnl)
+                cute.printf("gC_mnl: {}", gC_mnl)
+                cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v) # use the block idx in cluster to slice tiled mma
+        
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tCgA: {}", tCgA)
+                cute.printf("tCgB: {}", tCgB)
+                cute.printf("tCgC: {}", tCgC)
+                cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global/shared tensor for TMA load A/B
         # /////////////////////////////////////////////////////////////////////////////
         
         # TMA load A partition_S/D
-        a_cta_layout = cute.make_layout(
+        sA_for_tma_partition = cute.group_modes(sA, 0, 3) # ((MMA, MMA_M, MMA_K), PIPE)
+        tCgA_for_tma_partition = cute.group_modes(tCgA, 0, 3) # ((MMA, MMA_M, MMA_K), RestM, RestK, RestL)
+        a_cta_layout = cute.make_layout( # only need the 3rd N dim
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestM, RestK, RestL)
+        # tAsA: ((TMA_atom_v, rest_v), STAGE)
+        # tAgA: ((TMA_atom_v, rest_v), RestM, RestK, RestL)
         tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
+            atom=tma_atom_a,
+            cta_coord=block_in_cluster_coord_vmnk[2], # along N
+            cta_layout=a_cta_layout,
+            smem_tensor=sA_for_tma_partition,
+            gmem_tensor=tCgA_for_tma_partition,
         )
+        
         # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(
+        sB_for_tma_partition = cute.group_modes(sB, 0, 3) # ((MMA, MMA_N, MMA_K), PIPE)
+        tCgB_for_tma_partition = cute.group_modes(tCgB, 0, 3) # ((MMA, MMA_N, MMA_K), RestN, RestK, RestL)
+        b_cta_layout = cute.make_layout( # only need the 2nd M dim
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestN, RestK, RestL)
+        # tBsB: ((TMA_atom_v, rest_v), STAGE)
+        # tBgB: ((TMA_atom_v, rest_v), RestN, RestK, RestL)
         tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(sB, 0, 3),
-            cute.group_modes(tCgB, 0, 3),
+            atom=tma_atom_b,
+            cta_coord=block_in_cluster_coord_vmnk[1], # along M
+            cta_layout=b_cta_layout,
+            smem_tensor=sB_for_tma_partition,
+            gmem_tensor=tCgB_for_tma_partition,
         )
+
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("a_cta_layout: {}", a_cta_layout)
+                cute.printf("sA_for_tma_partition: {}", sA_for_tma_partition)
+                cute.printf("tCgA_for_tma_partition: {}", tCgA_for_tma_partition)
+                cute.printf("tAsA: {}", tAsA)
+                cute.printf("tAgA: {}", tAgA)
+                cute.printf("")
+                cute.printf("b_cta_layout: {}", b_cta_layout)
+                cute.printf("sB_for_tma_partition: {}", sB_for_tma_partition)
+                cute.printf("tCgB_for_tma_partition: {}", tCgB_for_tma_partition)
+                cute.printf("tBsB: {}", tBsB)
+                cute.printf("tBgB: {}", tBgB)
+                cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition shared/tensor memory tensor for TiledMMA_A/B/C
