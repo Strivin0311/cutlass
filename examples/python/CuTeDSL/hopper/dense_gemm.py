@@ -578,7 +578,7 @@ class HopperWgmmaGemmKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        is_thread0 = tidx == 129 and bidx == 15 and bidy == 15
+        is_thread0 = tidx == 129 and bidx == 15 and bidy == 15 # used only for debug print
 
         cidx, cidy, cidxz = cute.arch.cluster_idx()
         cdimx, cdimy, cdimz = cute.arch.cluster_dim()
@@ -619,10 +619,7 @@ class HopperWgmmaGemmKernel:
         # Instead, we can iterate through a smaller group of A (group_size_m) and then move to the next n, 
         # so that the group of A can be reused in L2 cache when we iterate through the next n, resulting in less L2 traffic of A.
         group_size_m = 8
-        s_shape = (
-            (group_size_m, cdimx // group_size_m),
-            cdimy,
-        )
+        s_shape = ((group_size_m, cdimx // group_size_m), cdimy)
         s_stride = ((1, cdimy * group_size_m), group_size_m)
         s_layout = cute.make_layout(s_shape, stride=s_stride)
         num_reg_cids = cute.size(s_shape)

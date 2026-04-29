@@ -485,8 +485,7 @@ class DenseGemmKernel:
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
-            ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+            ab_full_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             
             tmem_dealloc_mbar_ptr: cutlass.Int64
@@ -586,8 +585,10 @@ class DenseGemmKernel:
         GPU device kernel performing the batched GEMM computation.
         """
         tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        is_thread0 = tidx == 127 and bidx == 63 and bidy == 63 and bidz == 0 # used only for debug print
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch Tma desc
@@ -605,7 +606,6 @@ class DenseGemmKernel:
         # /////////////////////////////////////////////////////////////////////////////
         
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
@@ -623,53 +623,74 @@ class DenseGemmKernel:
             cta_coord[2],
         )
         
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tidx: {}, warp_idx: {}, block_idx: ({}, {}, {})", tidx, warp_idx, bidx, bidy, bidz)
+                cute.printf("mma_tile_coord_v: {}, is_leader_cta: {}, cta_rank_in_cluster: {}, block_in_cluster_coord_vmnk: ({}, {}, {})", mma_tile_coord_v, is_leader_cta, cta_rank_in_cluster, block_in_cluster_coord_vmnk[0], block_in_cluster_coord_vmnk[1], block_in_cluster_coord_vmnk[2])
+                cute.printf("MMA tile coord (M,N,L): ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+        
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init: a+b full/empty, accumulator full, tensor memory dealloc barrier
         # /////////////////////////////////////////////////////////////////////////////
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        # Fetch (mbar) data ptrs
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
         tmem_holding_buf = storage.tmem_holding_buf
+        ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
+        acc_full_mbar_ptr = storage.acc_full_mbar_ptr.data_ptr()
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_tma_producer
+        num_tma_producer = 1
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_tma_producer
         )
+        ab_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_ab_stage
+        )
+        
+        num_tma_consumer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1 # counting itself twice
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_tma_consumer
+        )
+        ab_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_ab_stage
+        )
+        
         ab_pipeline = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
+            barrier_storage=ab_full_empty_mbar_ptr,
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        ab_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.num_ab_stage
-        )
-        ab_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.num_ab_stage
-        )
 
         # Initialize acc_pipeline (barrier) and states
-        acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        acc_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.threads_per_cta
-        )
-        acc_pipeline = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
-            num_stages=self.num_acc_stage,
-            producer_group=acc_pipeline_producer_group,
-            consumer_group=acc_pipeline_consumer_group,
-            cta_layout_vmnk=cluster_layout_vmnk,
+        num_acc_producer = 1
+        acc_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_acc_producer
         )
         acc_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_acc_stage
         )
+        
+        num_acc_consumer = self.threads_per_cta
+        acc_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_acc_consumer,
+        )
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_acc_stage
+        )
+        
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=acc_full_mbar_ptr,
+            num_stages=self.num_acc_stage,
+            producer_group=acc_pipeline_producer_group,
+            consumer_group=acc_pipeline_consumer_group,
+            cta_layout_vmnk=cluster_layout_vmnk,
         )
 
         # Tensor memory dealloc barrier init
