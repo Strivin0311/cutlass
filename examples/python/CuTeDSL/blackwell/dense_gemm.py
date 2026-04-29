@@ -695,7 +695,7 @@ class DenseGemmKernelSm100:
 
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
-            if warp_idx == 0: # only warp0 handles tmem
+            if warp_idx == 0: # only warp0 handles tmem lifecycle
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(
@@ -907,7 +907,7 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc tensor memory buffer
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == 0: # only warp0 handles tmem
+        if warp_idx == 0: # only warp0 handles tmem lifecycle
             cute.arch.alloc_tmem(
                 num_columns=self.num_tmem_alloc_cols, 
                 smem_ptr_to_write_address=tmem_holding_buf, 
@@ -935,16 +935,11 @@ class DenseGemmKernelSm100:
             tidx, tCtAcc, tCgC, epi_tile, use_2cta_instrs
         )
 
-        tTR_rC = None
-        tiled_copy_r2s = None
-        simt_atom = None
-        tRS_rC = None
-        tRS_sC = None
-        bSG_sC = None
-        bSG_gC = None
-        tTR_gC = None
+        tTR_rC, tiled_copy_r2s, simt_atom = None, None, None
+        tRS_rC, tRS_sC, bSG_sC, bSG_gC, tTR_gC = None, None, None, None, None
         if const_expr(self.use_tma_store):
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            # tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype) # deprecated API
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype) # new API
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, tidx, sC
             )
@@ -976,33 +971,38 @@ class DenseGemmKernelSm100:
         # ///////////////////////////////////////////////////////////////////////////
         prefetch_k_tile_cnt = cutlass.min(self.num_ab_stage - 2, k_tile_cnt)
 
-        if warp_idx == 0:
+        if warp_idx == 0: # producer
             # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
             peek_ab_empty_status = cutlass.Boolean(1)
             if ab_producer_state.count < k_tile_cnt:
                 peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                     ab_producer_state
                 )
-            #
-            # Prefetch TMA load A/B
-            #
+            
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Prefetch TMA load A/B
+            # /////////////////////////////////////////////////////////////////////////////
             for prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
                 # Conditionally wait for AB buffer empty
-                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                ab_pipeline.producer_acquire(
+                    ab_producer_state, 
+                    try_acquire_token=peek_ab_empty_status
+                )
 
                 # TMA load A/B
+                tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
                 cute.copy(
-                    tma_atom_a,
-                    tAgA[(None, ab_producer_state.count)],
-                    tAsA[(None, ab_producer_state.index)],
-                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                    atom=tma_atom_a,
+                    src=tAgA[(None, ab_producer_state.count)],
+                    dst=tAsA[(None, ab_producer_state.index)],
+                    tma_bar_ptr=tma_bar_ptr,
                     mcast_mask=a_full_mcast_mask,
                 )
                 cute.copy(
-                    tma_atom_b,
-                    tBgB[(None, ab_producer_state.count)],
-                    tBsB[(None, ab_producer_state.index)],
-                    tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                    atom=tma_atom_b,
+                    src=tBgB[(None, ab_producer_state.count)],
+                    dst=tBsB[(None, ab_producer_state.index)],
+                    tma_bar_ptr=tma_bar_ptr,
                     mcast_mask=b_full_mcast_mask,
                 )
 
@@ -1019,33 +1019,40 @@ class DenseGemmKernelSm100:
             if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
                 peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
-            #
+            # /////////////////////////////////////////////////////////////////////////////
             # MMA mainloop
-            #
-            for k_tile in range(k_tile_cnt):
+            # /////////////////////////////////////////////////////////////////////////////
+            for k_tile in cutlass.range(k_tile_cnt):
                 # Conditionally wait for AB buffer empty
-                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                ab_pipeline.producer_acquire(
+                    ab_producer_state, 
+                    try_acquire_token=peek_ab_empty_status
+                )
 
                 if ab_producer_state.count < k_tile_cnt:
                     # TMA load A/B
+                    tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
                     cute.copy(
-                        tma_atom_a,
-                        tAgA[(None, ab_producer_state.count)],
-                        tAsA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        atom=tma_atom_a,
+                        src=tAgA[(None, ab_producer_state.count)],
+                        dst=tAsA[(None, ab_producer_state.index)],
+                        tma_bar_ptr=tma_bar_ptr,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
-                        tma_atom_b,
-                        tBgB[(None, ab_producer_state.count)],
-                        tBsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                        atom=tma_atom_b,
+                        src=tBgB[(None, ab_producer_state.count)],
+                        dst=tBsB[(None, ab_producer_state.index)],
+                        tma_bar_ptr=tma_bar_ptr,
                         mcast_mask=b_full_mcast_mask,
                     )
 
                 if is_leader_cta:
                     # Conditionally wait for AB buffer full
-                    ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                    ab_pipeline.consumer_wait(
+                        ab_consumer_state, 
+                        try_wait_token=peek_ab_full_status
+                    )
 
                     # tCtAcc += tCrA * tCrB
                     num_kblocks = cute.size(tCrA, mode=[2])
@@ -1053,12 +1060,13 @@ class DenseGemmKernelSm100:
                         kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
 
                         cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            tCrA[kblock_coord],
-                            tCrB[kblock_coord],
-                            tCtAcc,
+                            atom=tiled_mma,
+                            d=tCtAcc,
+                            a=tCrA[kblock_coord],
+                            b=tCrB[kblock_coord],
+                            c=tCtAcc,
                         )
+                        
                         # Enable accumulate on tCtAcc after first kblock
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -1106,7 +1114,7 @@ class DenseGemmKernelSm100:
         c_pipeline = None
         if const_expr(self.use_tma_store):
             # Initialize tma store c_pipeline
-            c_producer_group = pipeline.CooperativeGroup(
+            c_producer_group = pipeline.CooperativeGroup( # NOTE: this is only a dummy placeholder, no matter waht the arguments are
                 pipeline.Agent.Thread, self.threads_per_cta
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
@@ -1119,25 +1127,34 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
         for subtile_idx in range(subtile_cnt):
-            #
-            # Load accumulator from tensor memory buffer to register
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Load accumulator from tensor memory buffer to register
+            # /////////////////////////////////////////////////////////////////////////////
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+            cute.copy(
+                atom=tiled_copy_t2r, 
+                src=tTR_tAcc_mn, 
+                dst=tTR_rAcc
+            )
 
             if const_expr(self.use_tma_store):
-                #
-                # Perform epilogue op on accumulator and convert to C type
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Perform epilogue op on accumulator and convert to C type
+                # /////////////////////////////////////////////////////////////////////////////
                 acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                 acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                 tRS_rC.store(acc_vec)
 
-                #
-                # Store C to shared memory
-                #
-                c_buffer = subtile_idx % self.num_c_stage
-                cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Store C from register to shared memory
+                # /////////////////////////////////////////////////////////////////////////////
+                c_stage_idx = subtile_idx % self.num_c_stage
+                cute.copy(
+                    atom=tiled_copy_r2s, 
+                    src=tRS_rC, 
+                    dst=tRS_sC[(None, None, None, c_stage_idx)]
+                )
+                
                 # Fence and barrier to make sure shared memory store is visible to TMA store
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared,
@@ -1145,51 +1162,55 @@ class DenseGemmKernelSm100:
                 )
                 cute.arch.barrier()
 
-                #
-                # TMA store C to global memory
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  TMA store C from shared memory to global memory
+                # /////////////////////////////////////////////////////////////////////////////
                 if warp_idx == 0:
                     cute.copy(
-                        tma_atom_c,
-                        bSG_sC[(None, c_buffer)],
-                        bSG_gC[(None, subtile_idx)],
+                        atom=tma_atom_c,
+                        src=bSG_sC[(None, c_stage_idx)],
+                        dst=bSG_gC[(None, subtile_idx)],
                     )
+                    
                     # Fence and barrier to make sure TMA store is completed to recollect C buffer
-                    c_pipeline.producer_commit()
-                    c_pipeline.producer_acquire()
+                    c_pipeline.producer_commit() # `cp.async.bulk.commit_group`
+                    c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1)` 
+                
                 cute.arch.barrier()
             else:
-                #
-                # Perform epilogue op on accumulator and convert to C type
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Perform epilogue op on accumulator and convert to C type
+                # /////////////////////////////////////////////////////////////////////////////
                 acc_vec = tTR_rAcc.load()
                 acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                 tTR_rC.store(acc_vec)
 
-                #
-                # Store C to global memory
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Store C to global memory
+                # /////////////////////////////////////////////////////////////////////////////
                 cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Dealloc the tensor memory buffer
         # /////////////////////////////////////////////////////////////////////////////
         cute.arch.barrier()
-        if warp_idx == 0:
+        if warp_idx == 0: # only warp0 handles tmem lifecycle
             if use_2cta_instrs:
                 cute.arch.mbarrier_arrive(
                     tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1
                 )
                 cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
             cute.arch.dealloc_tmem(
-                tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
+                tmem_ptr=tmem_ptr, 
+                num_columns=self.num_tmem_alloc_cols, 
+                is_two_cta=use_2cta_instrs
             )
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Wait for C store complete
         # /////////////////////////////////////////////////////////////////////////////
         if const_expr(self.use_tma_store):
-            c_pipeline.producer_tail()
+            c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0)`
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Wait A/B buffer empty
@@ -1238,6 +1259,7 @@ class DenseGemmKernelSm100:
             epi_tile,
             use_2cta_instrs,
         )
+        
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
         tAcc_epi = cute.flat_divide(
             tAcc[((None, None), 0, 0)],
@@ -1245,10 +1267,12 @@ class DenseGemmKernelSm100:
         )
         # (EPI_TILE_M, EPI_TILE_N)
         tiled_copy_t2r = tcgen05.make_tmem_copy(
-            copy_atom_t2r, tAcc_epi[(None, None, 0, 0)]
+            atom=copy_atom_t2r, 
+            tmem_tensor=tAcc_epi[(None, None, 0, 0)]
         )
 
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+        
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
 
@@ -1256,12 +1280,16 @@ class DenseGemmKernelSm100:
         gC_mnl_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
+        
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
+        
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        # tTR_rAcc = cute.make_fragment( # deprecated API
+        tTR_rAcc = cute.make_rmem_tensor( # new API
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
+        
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_copy_and_partition(
@@ -1293,11 +1321,15 @@ class DenseGemmKernelSm100:
             self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
         )
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
-        # (R2S, R2S_M, R2S_N, PIPE_D)
+        
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+        
+        # (R2S, R2S_M, R2S_N, PIPE_D)
         tRS_sC = thr_copy_r2s.partition_D(sC)
+        
         # (R2S, R2S_M, R2S_N)
         tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+        
         return tiled_copy_r2s, tRS_rC, tRS_sC
 
     def epilog_gmem_copy_and_partition(
