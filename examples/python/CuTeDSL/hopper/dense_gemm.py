@@ -947,7 +947,7 @@ class WgmmaDenseGemmKernelSm90:
             if is_thread0:
                 cute.printf("")
                 cute.printf("warp_group_idx: {}, warp_group_thread_layout: {}, slice: {}", warp_group_idx, warp_group_thread_layout, warp_group_thread_layout(warp_group_idx))
-                # thr_mma is not printable, but we want to print its attributes
+                # thr_mma is not printable, so only print its attributes
                 cute.printf("thr_mma.tv_layout_A: {}, thr_mma.tv_layout_A_tiled: {}", thr_mma.tv_layout_A, thr_mma.tv_layout_A_tiled)
                 cute.printf("thr_mma.tv_layout_B: {}, thr_mma.tv_layout_B_tiled: {}", thr_mma.tv_layout_B, thr_mma.tv_layout_B_tiled)
                 cute.printf("thr_mma.tv_layout_C: {}, thr_mma.tv_layout_C_tiled: {}", thr_mma.tv_layout_C, thr_mma.tv_layout_C_tiled)
@@ -982,11 +982,11 @@ class WgmmaDenseGemmKernelSm90:
                 cute.printf("")
                 # cute.printf("tCrA:")
                 # cute.print_tensor(tCrA)
-                cute.printf("tCrA.layout: {}", tCrA.layout) # tCrA is not printable, but we want to print its layout
+                cute.printf("tCrA.layout: {}", tCrA.layout) # tCrA is not printable, so only print its layout
                 
                 # cute.printf("tCrB:")
                 # cute.print_tensor(tCrB)
-                cute.printf("tCrB.layout: {}", tCrB.layout) # tCrB is not printable, but we want to print its layout
+                cute.printf("tCrB.layout: {}", tCrB.layout) # tCrB is not printable, so only print its layout
                 
                 cute.printf("tCrC:")
                 cute.print_tensor(tCrC)
