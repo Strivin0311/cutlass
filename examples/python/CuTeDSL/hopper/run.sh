@@ -40,19 +40,22 @@ if [[ $PROFILE_MODE -eq 1 ]]; then
 fi
 
 
-USER_CMD="python dense_gemm.py                                   \
+SCRIPT_CMD="python dense_gemm.py                                   \
 --mnkl $M,$K,$N,1 --tile_shape_mn 128,256                      \
 --cluster_shape_mn 1,1 --a_dtype Float16 --b_dtype Float16           \
 --c_dtype Float16 --acc_dtype Float32                                \
 --a_major k --b_major k --c_major n "
 
+
+mkdir -p logs
+
 if [[ $PROFILE_MODE -eq 1 ]]; then
-    echo "Running in profile mode with $PROFILE_TYPE and logging to prof_dense_gemm.log ..."
-    eval $PROFILE_CMD $USER_CMD > prof_dense_gemm.log 2>&1
+    echo "Running in profile mode with $PROFILE_TYPE and logging to logs/prof_dense_gemm.log ..."
+    eval $PROFILE_CMD $SCRIPT_CMD > logs/prof_dense_gemm.log 2>&1
 elif [[ $DEBUG_MODE -eq 1 ]]; then
-    echo "Running in debug mode and logging to debug_dense_gemm.log ..."
-    eval $USER_CMD > debug_dense_gemm.log 2>&1
+    echo "Running in debug mode and logging to logs/debug_dense_gemm.log ..."
+    eval $SCRIPT_CMD > logs/debug_dense_gemm.log 2>&1
 else
-    echo "Running in test mode and logging to test_dense_gemm.log ..."
-    eval $USER_CMD > test_dense_gemm.log 2>&1
+    echo "Running in test mode and logging to logs/test_dense_gemm.log ..."
+    eval $SCRIPT_CMD > logs/test_dense_gemm.log 2>&1
 fi
