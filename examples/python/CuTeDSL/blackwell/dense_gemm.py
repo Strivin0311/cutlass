@@ -211,13 +211,13 @@ class DenseGemmKernelSm100:
         self.mma_tiler = (*mma_tiler_mn, 1) # K dimension is deferred in _setup_attributes
         self.use_tma_store = use_tma_store
 
-        self.cta_group = (
+        self.cta_group = ( # tcgen05.mma.cta_group::N, where N can be 1 or 2
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
 
         self.occupancy = 1
-        self.threads_per_cta = 128
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.threads_per_cta = 128 # one warp group with 128 threads, to access 128 rows of tmem (one warp for 32 rows)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100") # the same as sm90, 227KB
         
         # NOTE: TMA smem alignment due to swizzle
         # since the maximum swizzle pattern SW(B3, M4, S3) has a period of 2^(3+4+3) = 2^10 = 1024B
@@ -255,16 +255,36 @@ class DenseGemmKernelSm100:
         - Computing A/B/C shared memory layout
         - Computing tensor memory allocation columns
         """
-        # Configure tiled mma
+        # Configure tiled umma
+        #
+        # umma atom:
+        #   Thr Layout VMNK: (CTA_GROUP=2,ATOM_M=1,ATOM_N=1,ATOM_K=1):(1,0,0,0)
+        #   Shape MNK: (tileM=256, tileN=128, tiledK=16)
+        #   TV Layout A: (CTA_GROUP=2, (CTA_M=128, CTA_K=16)):(128,(1,256))
+        #   TV Layout B: (CTA_GROUP=2, (CTA_N=64, CTA_K=16)):(64,(1,128))
+        #   TV Layout C: (CTA_GROUP=2,(CTA_M=128, CTA_N=128)):(128,(1,256))
+        # NOTE:
+        #   1. different from wgmma's thr layout (128,2,1,1), umma can use a CTA group (at most a CTA-pair for now)
+        #       to finish a umma together, while each CTA only needs one thread to issue the umma instructions
+        #       but one warp group to issue load/store, so the thr layout is just (2, (1,1,1))
+        #   2. different from wgmma's mem role, where A can be in rmem/smem, B must in smem and C must in rmem,
+        #       umma's  A can be in tmem/smem, B must in smem and C must in tmem
+        #   3. umma's K dim is still 32B (16 for bf16/fp16), and N dim is still range(8, 256+8, 8),
+        #       but umma's M dim raises up to 128 from wgmma's 64 for one CTA, and a CTA-pair can together handle M=256
+        #       where one CTA handles a half-row-sliced C (M128, N128) with half-row-sliced A (M=128, K16),
+        #       and half-col-sliced B (N64, K16), i.e. A is local in one CTA but B is shared in dist-smem across a CTA-pair
+        #       so each CTA needs to access the whole B tile via dist-smem to finish its half-row-sliced C job
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             ab_dtype=self.a_dtype,
             a_leading_mode=self.a_major_mode,
             b_leading_mode=self.b_major_mode,
             acc_dtype=self.acc_dtype,
             cta_group=self.cta_group,
-            mma_tiler_mn=self.mma_tiler[:2],
-            a_source=tcgen05.OperandSource.SMEM,
+            mma_tiler_mn=self.mma_tiler[:2], # (tileM=256, tileN=128)
+            a_source=tcgen05.OperandSource.SMEM, # SS
         )
+        self.atom_thr_shape = tiled_mma.thr_id.shape
+        self.atom_thr_size = cute.size(self.atom_thr_shape)
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
@@ -274,16 +294,16 @@ class DenseGemmKernelSm100:
             self.mma_tiler[1],
             mma_inst_shape_k * mma_inst_tile_k, # 16 x 4 = 64
         )
-        self.cta_tile_shape_mnk = ( # 2 CTAs per MMA tile slicing M dim
-            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape), # // 2
-            self.mma_tiler[1],
+        self.cta_tile_shape_mnk = ( # 2 CTAs slicing M dim per MMA tile
+            self.mma_tiler[0] // cute.size(self.atom_thr_shape), # // 2
+            self.mma_tiler[1], # N dim only sharded but not sliced by CTAs
             self.mma_tiler[2],
         )
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
-            (tiled_mma.thr_id.shape,),
+            (self.atom_thr_shape,),
         )
 
         # Compute number of multicast CTAs for A/B
@@ -371,7 +391,7 @@ class DenseGemmKernelSm100:
             print()
             
             print()
-            print("self.tiled_mma: ", self.tiled_mma, f"\n\nshape_mnk: {self.tiled_mma.shape_mnk}", f"thr_id.shape: {self.tiled_mma.thr_id.shape}")
+            print("self.tiled_mma: ", self.tiled_mma, f"\n\nshape_mnk: {self.tiled_mma.shape_mnk}", f"thr_id.shape: {self.atom_thr_shape}")
             print()
             
 
@@ -420,7 +440,7 @@ class DenseGemmKernelSm100:
         self._setup_attributes()
 
         tiled_mma = self.tiled_mma
-        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+        atom_thr_size = self.atom_thr_size
 
         # Setup TMA load for A
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
@@ -603,14 +623,14 @@ class DenseGemmKernelSm100:
             if const_expr(self.use_tma_store):
                 cpasync.prefetch_descriptor(tma_atom_c)
 
-        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        use_2cta_instrs = self.atom_thr_size == 2
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup cta/thread coordinates
         # /////////////////////////////////////////////////////////////////////////////
         
         # Coords inside cluster
-        mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+        mma_tile_coord_v = bidx % self.atom_thr_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
@@ -622,7 +642,7 @@ class DenseGemmKernelSm100:
         # Coords outside cluster
         cta_coord = (bidx, bidy, bidz)
         mma_tile_coord_mnl = (
-            cta_coord[0] // cute.size(tiled_mma.thr_id.shape),
+            cta_coord[0] // self.atom_thr_size,
             cta_coord[1],
             cta_coord[2],
         )
