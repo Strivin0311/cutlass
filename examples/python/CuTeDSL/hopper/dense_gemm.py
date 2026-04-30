@@ -41,7 +41,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 from cutlass import const_expr
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -336,7 +336,7 @@ class WgmmaDenseGemmKernelSm90:
             acc_dtype=self.acc_dtype,
             atom_layout_mnk=self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1]),
-            a_source=cute.nvgpu.warpgroup.OperandSource.SMEM,
+            a_source=warpgroup.OperandSource.SMEM,
         )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
@@ -1119,7 +1119,7 @@ class WgmmaDenseGemmKernelSm90:
         # NOTE: we only allocate tCrC for the accumulator of WGMMA, but we don't zeros it,
         # so the first WGMMA needs to set ACCUMULATE to False to avoid using the uninitialized value in tCrC, 
         # and then set it back to True for the rest WGMMA in the mainloop
-        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
         for k_tile in cutlass.range_constexpr(prologue_mmas):
             # Wait for the current stage of full mbar, i.e. A/B smem buffer to be ready,  using `mbarrier_wait`
             # since we try wait earlier, so if peek_ab_full_status is true (token == 1),
@@ -1140,7 +1140,7 @@ class WgmmaDenseGemmKernelSm90:
             # 
             # case3: Otherwise, we don't have to call it between each iteration of WGMMA in the mainloop, 
             #   since no memory operations by generic proxy in between.
-            cute.nvgpu.warpgroup.fence()
+            warpgroup.fence()
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
                     None,
@@ -1163,12 +1163,12 @@ class WgmmaDenseGemmKernelSm90:
                 
                 # After the first WGMMA, we set ACCUMULATE to True 
                 # for the rest WGMMA in the mainloop to accumulate on the result in tCrC
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
 
             # Commit the num_k_blocks WGMMA calls in the current k_tile
             # to let wgmma engine runs them as a batch
             # NOTE: we don't wait it finished until the first iteration in mainloop
-            cute.nvgpu.warpgroup.commit_group()
+            warpgroup.commit_group()
             
             # Advance to next block of global A/B and next stage of smem A/B buffer
             mainloop_consumer_read_state.advance()
@@ -1195,7 +1195,7 @@ class WgmmaDenseGemmKernelSm90:
             # /////////////////////////////////////////////////////////////////////////////
             #  WGMMA
             # /////////////////////////////////////////////////////////////////////////////
-            cute.nvgpu.warpgroup.fence()
+            warpgroup.fence()
             for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                 k_block_coord = (
                     None,
@@ -1214,14 +1214,14 @@ class WgmmaDenseGemmKernelSm90:
                     c=tCrC,
                 )
 
-            cute.nvgpu.warpgroup.commit_group()
+            warpgroup.commit_group()
             
             # Wait on the wgmma barrier 
             # to allow at most `prologue_mmas` wgmmas unfinished
             # i.e. the queue window size is `prologue_mmas` so the previous wgmmas out of the window must complete
             # and we already issued `prologue_mmas + 1` wgmmas (including current one) at this point,
             # so this wait equals to waiting for the very earliest issued wgmma (i.e. the current k_tile - prologue_mmas) to complete 
-            cute.nvgpu.warpgroup.wait_group(prologue_mmas)
+            warpgroup.wait_group(prologue_mmas)
 
             # When the current k_tile's WGMMA is done, then we can release the current stage of A/B buffer 
             # by arriving the empty mbar for the current stage, using `mbarrier_arrive_and_expect_tx` where tx_count = 0
@@ -1333,7 +1333,7 @@ class WgmmaDenseGemmKernelSm90:
         
         # Wait all issued wgmmas to complete, 
         # to ensure the accumulated results in tCrC are ready to be stored
-        cute.nvgpu.warpgroup.wait_group(0)
+        warpgroup.wait_group(0)
         
         if cute.size(self.cluster_shape_mn) > 1:
             # Wait for all threads in the cluster to finish, avoiding early release of smem
@@ -1627,7 +1627,7 @@ class WgmmaDenseGemmKernelSm90:
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None)) # (tileM, tileK)
 
         a_is_k_major = (
-            a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+            a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
         )
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW128 if k-major
@@ -1638,7 +1638,7 @@ class WgmmaDenseGemmKernelSm90:
             # where 2^(B3 + M4) = 2^7 = 128B
             major_mode_size=a_major_mode_size,
         )
-        a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,64) if k-major
+        a_smem_layout_atom = warpgroup.make_smem_layout_atom( # (8,64) if k-major
             kind=a_smem_layout_atom_kind,
             element_type=a_dtype,
         )
@@ -1651,7 +1651,7 @@ class WgmmaDenseGemmKernelSm90:
 
         b_smem_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         b_is_k_major = (
-            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+            b_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
         )
         b_major_mode_size = tile_shape_mnk[2 if b_is_k_major else 1]
         b_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW128 if k-major
@@ -1659,7 +1659,7 @@ class WgmmaDenseGemmKernelSm90:
             element_type=b_dtype,
             major_mode_size=b_major_mode_size,
         )
-        b_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,64) if k-major
+        b_smem_layout_atom = warpgroup.make_smem_layout_atom( # (8,64) if k-major
             kind=b_smem_layout_atom_kind,
             element_type=b_dtype,
         )
@@ -1679,7 +1679,7 @@ class WgmmaDenseGemmKernelSm90:
             # so can use SW64, i.e. SW(B2, M4, S3), where 2^(B2 + M4) = 2^6 = 64B
             major_mode_size=c_major_mode_size,
         )
-        c_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom( # (8,32) if n-major
+        c_smem_layout_atom = warpgroup.make_smem_layout_atom( # (8,32) if n-major
             kind=c_smem_layout_atom_kind,
             element_type=c_dtype,
         )

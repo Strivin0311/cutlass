@@ -219,6 +219,9 @@ class DenseGemmKernelSm100:
         self.threads_per_cta = 128
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         
+        # NOTE: TMA smem alignment due to swizzle
+        # since the maximum swizzle pattern SW(B3, M4, S3) has a period of 2^(3+4+3) = 2^10 = 1024B
+        # so we have to align to 1024B
         self.buffer_align_bytes = 1024
         
         self.debug_print = debug_print
@@ -260,6 +263,7 @@ class DenseGemmKernelSm100:
             acc_dtype=self.acc_dtype,
             cta_group=self.cta_group,
             mma_tiler_mn=self.mma_tiler[:2],
+            a_source=tcgen05.OperandSource.SMEM,
         )
 
         # Compute mma/cluster/tile shapes
