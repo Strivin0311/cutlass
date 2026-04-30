@@ -208,14 +208,15 @@ class DenseGemmKernelSm100:
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
-        self.mma_tiler = (*mma_tiler_mn, 1) # K dimension is deferred in _setup_attributes
+        self.mma_tiler_mnk = (*mma_tiler_mn, 1) # K dimension is deferred in _setup_attributes
         self.use_tma_store = use_tma_store
 
         self.cta_group = ( # tcgen05.mma.cta_group::N, where N can be 1 or 2
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
 
-        self.occupancy = 1
+        self.occupancy = 1 # TODO(REVIEW): what does occupancy mean, the block occupancy in one SM ?
+        
         self.threads_per_cta = 128 # one warp group with 128 threads, to access 128 rows of tmem (one warp for 32 rows)
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100") # the same as sm90, 227KB
         
@@ -280,7 +281,7 @@ class DenseGemmKernelSm100:
             b_leading_mode=self.b_major_mode,
             acc_dtype=self.acc_dtype,
             cta_group=self.cta_group,
-            mma_tiler_mn=self.mma_tiler[:2], # (tileM=256, tileN=128)
+            mma_tiler_mn=self.mma_tiler_mnk[:2], # (tileM=256, tileN=128)
             a_source=tcgen05.OperandSource.SMEM, # SS
         )
         self.atom_thr_shape = tiled_mma.thr_id.shape
@@ -289,30 +290,35 @@ class DenseGemmKernelSm100:
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
-        self.mma_tiler = (
-            self.mma_tiler[0],
-            self.mma_tiler[1],
+        self.mma_tiler_mnk = (
+            self.mma_tiler_mnk[0],
+            self.mma_tiler_mnk[1],
             mma_inst_shape_k * mma_inst_tile_k, # 16 x 4 = 64
         )
+        
+        # Compute CTA tile shape
+        # (CTA_tileM=126, tileN=128, tileK=64)
         self.cta_tile_shape_mnk = ( # 2 CTAs slicing M dim per MMA tile
-            self.mma_tiler[0] // cute.size(self.atom_thr_shape), # // 2
-            self.mma_tiler[1], # N dim only sharded but not sliced by CTAs
-            self.mma_tiler[2],
+            self.mma_tiler_mnk[0] // cute.size(self.atom_thr_shape), # // 2
+            self.mma_tiler_mnk[1], # N dim only sharded but not sliced by CTAs
+            self.mma_tiler_mnk[2],
         )
 
         # Compute cluster layout
+        # (CTA_GROUP=(2), CTA_M=1, CTA_N=1, CTA_K=1)
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (self.atom_thr_shape,),
         )
 
         # Compute number of multicast CTAs for A/B
-        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2]) # mcast along CTA_N dim
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1]) # mcast along CTA_M dim
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
+        # (epiM=128:1, epiN=32:1)
         if const_expr(self.use_tma_store):
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
                 cta_tile_shape=self.cta_tile_shape_mnk,
@@ -326,7 +332,7 @@ class DenseGemmKernelSm100:
         # Setup A/B/C stage count in shared memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
             tiled_mma,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             self.a_dtype,
             self.b_dtype,
             self.epi_tile,
@@ -339,15 +345,18 @@ class DenseGemmKernelSm100:
         )
 
         # Compute A/B/C shared memory layout
+        # sA: S<3,4,3> o 0 o (MMA=(128,16), MMA_M=1, MMA_K=4, STAGE=8):((64,1),0,16,8192)
+        # sB: S<3,4,3> o 0 o (MMA=(64,16), MMA_N=1, MMA_K=4, STAGE=8):((64,1),0,16,4096)
+        # sC: S<2,4,3> o 0 o (epi_M=(8,16), epi_N=(32,1), epi_stages=(1,2)):((32,256),(1,0),(0,4096))
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma=tiled_mma,
-            mma_tiler_mnk=self.mma_tiler,
+            mma_tiler_mnk=self.mma_tiler_mnk,
             a_dtype=self.a_dtype,
             num_stages=self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma=tiled_mma,
-            mma_tiler_mnk=self.mma_tiler,
+            mma_tiler_mnk=self.mma_tiler_mnk,
             b_dtype=self.b_dtype,
             num_stages=self.num_ab_stage,
         )
@@ -363,15 +372,16 @@ class DenseGemmKernelSm100:
         )
 
         # Compute the number of tensor memory allocation columns
+        # MMA_C=(128, 128) with dtype fp32 => 128 rows x 128 cols in tmem
         self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
-            tiled_mma, self.mma_tiler
+            tiled_mma, self.mma_tiler_mnk
         )
         
         self.tiled_mma = tiled_mma
         
         if const_expr(self.debug_print):
             print()
-            print(f"MMA Tiler (M,N,K): {self.mma_tiler=}")
+            print(f"MMA Tiler (M,N,K): {self.mma_tiler_mnk=}")
             print(f"CTA Tile Shape (M,N,K): {self.cta_tile_shape_mnk=}")
             print(f"Cluster Shape (M,N): {self.cluster_shape_mn=}")
             print(f"Cluster Layout: {self.cluster_layout_vmnk=}")
@@ -454,7 +464,7 @@ class DenseGemmKernelSm100:
             op=a_op,
             gmem_tensor=a,
             smem_layout=a_smem_layout,
-            mma_tiler_mnk=self.mma_tiler,
+            mma_tiler_mnk=self.mma_tiler_mnk,
             tiled_mma=tiled_mma,
             cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
             internal_type=(
@@ -474,7 +484,7 @@ class DenseGemmKernelSm100:
             op=b_op,
             gmem_tensor=b,
             smem_layout=b_smem_layout,
-            mma_tiler_mnk=self.mma_tiler,
+            mma_tiler_mnk=self.mma_tiler_mnk,
             tiled_mma=tiled_mma,
             cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
             internal_type=(
@@ -543,6 +553,7 @@ class DenseGemmKernelSm100:
         
         if const_expr(self.debug_print):
             print()
+            print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.a_major_mode=}, {self.b_major_mode=}, {self.c_layout=}")
             print(f"{a_smem_size=}, {b_smem_size=}, {c_smem_size=}, {c_cta_v_layout=}")
             print(f"{a_copy_size=}, {b_copy_size=}, {atom_thr_size=}, {self.num_tma_load_bytes=}")
             print()
@@ -801,19 +812,19 @@ class DenseGemmKernelSm100:
         # (tileM, tileK, restM, restK, restL)
         gA_mkl = cute.local_tile(
             input=mA_mkl,
-            tiler=cute.slice_(self.mma_tiler, (None, 0, None)), # (M, K)
+            tiler=cute.slice_(self.mma_tiler_mnk, (None, 0, None)), # (M, K)
             coord=(None, None, None)
         )
         # (tileN, tileK, restN, restK, restL)
         gB_nkl = cute.local_tile(
             input=mB_nkl, 
-            tiler=cute.slice_(self.mma_tiler, (0, None, None)), # (N, K)
+            tiler=cute.slice_(self.mma_tiler_mnk, (0, None, None)), # (N, K)
             coord=(None, None, None)
         )
         # (tileM, tileN, restM, restN, restL)
         gC_mnl = cute.local_tile(
             input=mC_mnl, 
-            tiler=cute.slice_(self.mma_tiler, (None, None, 0)), # (M, N)
+            tiler=cute.slice_(self.mma_tiler_mnk, (None, None, 0)), # (M, N)
             coord=(None, None, None)
         )
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
@@ -926,7 +937,7 @@ class DenseGemmKernelSm100:
         # (MMA=1, MMA_N=1, MMA_K=4, STAGE=8)
         tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA=(128,128), MMA_M=1, MMA_N=1)
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
         
         if const_expr(self.debug_print):
@@ -1571,38 +1582,46 @@ class DenseGemmKernelSm100:
                  (ACC stages, A/B operand stages, epilogue stages)
         :rtype: tuple[int, int, int]
         """
-        # Default ACC stages
+        
+        # Default one ACC stage to copy tmem to rmem, 
+        # TODO(REVIEW): TMEM usually does not need double buffering, does it ?
         num_acc_stage = 1
-        # Default C stages
+        
+        # Default C stages to copy C from smem to gmem
         num_c_stage = 2 if use_tma_store else 0
 
-        # Calculate smem layout and size for one stage of A, B, and C
+        # Calculate smem layout and size for one stage of A, B, and C with heuristics
+        # sA: S<3,4,3> o 0 o (MMA=(128,16), MMA_M=1,MMA_K=4,1):((64,1),0,16,0)
+        # sB: S<3,4,3> o 0 o (MMA=(64,16), MMA_M=1,MMA_K=4,1):((64,1),0,16,0)
+        # sC: S<2,4,3> o 0 o (EPI_M=(8,16), EPI_N=(32,1),(1,1)):((32,256),(1,0),(0,0))
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
             tiled_mma=tiled_mma,
             mma_tiler_mnk=mma_tiler_mnk,
             a_dtype=a_dtype,
-            num_stages=1,  # a tmp 1 stage is provided
+            num_stages=1,
         )
         b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
             tiled_mma=tiled_mma,
             mma_tiler_mnk=mma_tiler_mnk,
             b_dtype=b_dtype,
-            num_stages=1,  # a tmp 1 stage is provided
+            num_stages=1,
         )
         c_smem_layout_staged_one = (
             sm100_utils.make_smem_layout_epi(
                 epi_dtype=c_dtype,
                 epi_layout=c_layout,
+                # selected by `sm100_utils.compute_epilogue_tile_shape` with heuristics
                 epi_tile=epi_tile,
                 epi_stage=1,
             )
             if use_tma_store
             else None
         )
+        
+        mbar_helpers_bytes = 1024
         ab_bytes_per_stage = cute.size_in_bytes(
             a_dtype, a_smem_layout_stage_one
         ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-        mbar_helpers_bytes = 1024
         c_bytes_per_stage = (
             cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
             if use_tma_store
@@ -1680,7 +1699,7 @@ class DenseGemmKernelSm100:
 
     @staticmethod
     def _compute_num_tmem_alloc_cols(
-        tiled_mma: cute.TiledMma, mma_tiler: Tuple[int, int, int]
+        tiled_mma: cute.TiledMma, mma_tiler_mnk: Tuple[int, int, int]
     ) -> int:
         """
         Compute the number of tensor memory allocation columns.
@@ -1693,9 +1712,19 @@ class DenseGemmKernelSm100:
         :return: The number of tensor memory allocation columns.
         :rtype: int
         """
-        acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
+        
+        # tCtAcc_fake layout: (MMA_C=(128,128),1,1):((65536,1),0,0)
+        # NOTE: since the 32-bit addr of tmem partitions into high 16-bit for rows and low 16-bit for columns, 
+        # so each row has a stride of 64k = 2^16
+        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
         # return sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake) # deprecated API
+        
+        # NOTE: tmem has 128 rows x 512 cols, 4B in each cell (128 x 512 x 4B = 256KB),
+        # and each thread in a warp group will handle each row,
+        # so we have to decide how many columns to allocate, in the range of [min_cols=32, max_cols=512] with power of 2,
+        # and since tCtAcc_fake has a MMA_C layout of (128,128) with dtype fp32(4B), 
+        # it needs 128 columns which satisfies the constraints
         return utils.get_num_tmem_alloc_cols(tCtAcc_fake) # new API
 
     @staticmethod

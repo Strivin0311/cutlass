@@ -286,7 +286,8 @@ class WgmmaDenseGemmKernelSm90:
         self.is_b_mcast = False
         self.tiled_mma = None
 
-        self.occupancy = 1
+        self.occupancy = 1 # TODO(REVIEW): what does occupancy mean, the block occupancy in one SM ?
+        
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.num_threads_per_warp_group = 128
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
