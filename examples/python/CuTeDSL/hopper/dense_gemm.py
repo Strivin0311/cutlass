@@ -1815,7 +1815,7 @@ class WgmmaDenseGemmKernelSm90:
         # so we can directly pass in epi_tile as the cta tiler just like tma atom of A/B
         # 
         # and the reason why cute needs to use this ID composition, is to make the cta tiler a TMA layout with the basis stride:
-        # e.g. epi_tiler=(128,32) => c_cta_v_layout: (128,32):(1@0,1@1)
+        # e.g. epi_tiler=(128,32) => c_cta_v_layout: (128,32):(1@0,1@1) (col-major)
         # it is different from the layout with normal stride, mapping a coord (m,n) to a flatten offset integer
         # which will map a coord to the multi-dim TMA coord tuple (d0, d1) to TMA
         # since TMA will store the strides of each dim itself and figure its own offset

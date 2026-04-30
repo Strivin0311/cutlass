@@ -284,7 +284,10 @@ class DenseGemmKernelSm100:
             mma_tiler_mn=self.mma_tiler_mnk[:2], # (tileM=256, tileN=128)
             a_source=tcgen05.OperandSource.SMEM, # SS
         )
-        self.atom_thr_shape = tiled_mma.thr_id.shape
+        
+        # Setup atom thread layout for tiled MMA (which equals to CTA layout by now)
+        self.atom_thr_id = tiled_mma.thr_id
+        self.atom_thr_shape = self.atom_thr_id.shape
         self.atom_thr_size = cute.size(self.atom_thr_shape)
 
         # Compute mma/cluster/tile shapes
@@ -385,6 +388,7 @@ class DenseGemmKernelSm100:
             print(f"CTA Tile Shape (M,N,K): {self.cta_tile_shape_mnk=}")
             print(f"Cluster Shape (M,N): {self.cluster_shape_mn=}")
             print(f"Cluster Layout: {self.cluster_layout_vmnk=}")
+            print(f"Thread layout (CTA_GROUP, ATOM_M, ATOM_N, ATOM_K): {self.atom_thr_id=}")
             print(f"Number of multicast CTAs for A: {self.num_mcast_ctas_a=}")
             print(f"Number of multicast CTAs for B: {self.num_mcast_ctas_b=}")
             print(f"Epilogue Tile Shape (M,N): {self.epi_tile=}")
@@ -403,8 +407,7 @@ class DenseGemmKernelSm100:
             print()
             print("self.tiled_mma: ", self.tiled_mma, f"\n\nshape_mnk: {self.tiled_mma.shape_mnk}", f"thr_id.shape: {self.atom_thr_shape}")
             print()
-            
-
+    
     @cute.jit
     def __call__(
         self,
@@ -450,12 +453,14 @@ class DenseGemmKernelSm100:
         self._setup_attributes()
 
         tiled_mma = self.tiled_mma
-        atom_thr_size = self.atom_thr_size
 
         # Setup TMA load for A
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            cluster_shape_mnk=self.cluster_shape_mn, 
-            atom_thr_id=tiled_mma.thr_id
+        # sA: S<3,4,3> o 0 o (MMA=(128,16),MMA_M=1,MMA_k=4,STAGE=8):((64,1),0,16,8192)
+        # tma_atom_a: ThrID=(2:1), TV_src=(2,8192), TV_dst=(2,8192), where 8192 = 128 x 16 x 4, (2:1) for a CTA-pair
+        # tma_tensor_a: (pM=2048,pK=1024,pL=1):(1@1,1@0,1@2)
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A( # cp.async GMEM -> SMEM bulk tensor copy Operation
+            cluster_shape_mnk=self.cluster_shape_mn, # (2, 1)
+            atom_thr_id=self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0)) # removing the pipeline stage dim
         a_smem_size = cute.cosize(self.a_smem_layout_staged.outer)
@@ -466,16 +471,19 @@ class DenseGemmKernelSm100:
             smem_layout=a_smem_layout,
             mma_tiler_mnk=self.mma_tiler_mnk,
             tiled_mma=tiled_mma,
-            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
-            internal_type=(
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape, # ((2),1,1,1)
+            internal_type=( # if fp32 input, we just directly use tf32 in tma load, since it will be converted to fp32 in umma anyway
                 cutlass.TFloat32 if a.element_type is cutlass.Float32 else None
             ),
         )
 
         # Setup TMA load for B
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+        # sB: S<3,4,3> o 0 o (MMA=(64,16),MMA_M=1,MMA_k=4,STAGE=8):((64,1),0,16,4096)
+        # tma_atom_b: ThrID=(2:1), TV_src=(2,4096), TV_dst=(2,4096), where 4096 = 64 x 16 x 4, (2:1) for a CTA-pair
+        # tma_tensor_b: (N=4096,K=1024,1):(1@1,1@0,1@2)
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B( # cp.async GMEM -> SMEM bulk tensor copy Operation
             cluster_shape_mnk=self.cluster_shape_mn, 
-            atom_thr_id=tiled_mma.thr_id
+            atom_thr_id=self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0)) # removing the pipeline stage dim
         b_smem_size = cute.cosize(self.b_smem_layout_staged.outer)
@@ -493,13 +501,14 @@ class DenseGemmKernelSm100:
         )
 
         # Setup store for C
-        tma_atom_c = None
-        tma_tensor_c = None
-        c_smem_size = 0
-        c_cta_v_layout = None
+        # sC: S<2,4,3> o 0 o (epi_M=(8,16),epi_N=(32,1),epi_STAGES=(1,2)):((32,256),(1,0),(0,4096))
+        # tma_atom_c: ThrID=(1:0), TV_src=(1,4096), TV_dst=(1,4096), where 4096 = 8X16 x 32 x 2, (1:0) for a single CTA
+        # tma_tensor_c: (2048,4096,1):(1@1,1@0,1@2)
+        tma_atom_c, tma_tensor_c = None, None
+        c_smem_size, c_cta_v_layout = 0, None
         if const_expr(self.use_tma_store):
-            c_op = cpasync.CopyBulkTensorTileS2GOp()
-            c_cta_v_layout = cute.composition(
+            c_op = cpasync.CopyBulkTensorTileS2GOp() # cp.async SMEM -> GMEM bulk tensor copy Operation 
+            c_cta_v_layout = cute.composition( # (128,32):(1@0,1@1), col-major
                 cute.make_identity_layout(c.shape), self.epi_tile
             )
             epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0)) # removing the pipeline stage dim
@@ -513,17 +522,29 @@ class DenseGemmKernelSm100:
             )
 
         # Compute grid size
-        self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
+        # NOTE: the number of TMA load bytes (tx_count for main pipeline) combines the sA and sB size one stage, 
+        # and needs to times the CTA-pair number since we need all the sA, sB data loaded for both CTAs to start the umma 
+        self.num_tma_load_bytes = (a_copy_size + b_copy_size) * self.atom_thr_size
         grid = self._compute_grid(c, self.cta_tile_shape_mnk, self.cluster_shape_mn)
 
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
+            # mainloop full/empty mbar array ptrs for each ab stage
+            # to synchronize the producer (TMA-loading sA and sB) 
+            # with the consumer (UMMA using sA and sB) for each ab stage in the mainloop
             ab_full_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            
+            # tmem accumulation full mbar for each acc stage
+            # to synchronize the producer (UMMA writing accumulators to tmem) 
+            # with the consumer (tcgen05.ld loading accumulators from tmem to rmem) for each acc stage in the epilogue
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             
+            # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
             tmem_dealloc_mbar_ptr: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
+            
+            # the smem buffer to hold the allocated tmem address
+            tmem_holding_smem_buf: cutlass.Int32
 
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
@@ -541,7 +562,7 @@ class DenseGemmKernelSm100:
                 self.buffer_align_bytes,
             ]
             
-            # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            # (EPI_M, EPI_N, EPI_STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
                     self.c_dtype, c_smem_size
@@ -555,15 +576,15 @@ class DenseGemmKernelSm100:
             print()
             print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.a_major_mode=}, {self.b_major_mode=}, {self.c_layout=}")
             print(f"{a_smem_size=}, {b_smem_size=}, {c_smem_size=}, {c_cta_v_layout=}")
-            print(f"{a_copy_size=}, {b_copy_size=}, {atom_thr_size=}, {self.num_tma_load_bytes=}")
+            print(f"{a_copy_size=}, {b_copy_size=}, {self.num_tma_load_bytes=}")
             print()
             
             print()
-            print("TMA A: op: ", a_op, "\natom: ", tma_atom_a)
+            print("TMA A: a_op: ", a_op, "\ntma_atom_a: ", tma_atom_a)
             print()
-            print("TMA B: op: ", b_op, "\natom: ", tma_atom_b)
+            print("TMA B: b_op: ", b_op, "\ntma_atom_b: ", tma_atom_b)
             print()
-            print("TMA C: op: ", c_op, "\natom: ", tma_atom_c)
+            print("TMA C: c_op: ", c_op, "\ntma_atom_c: ", tma_atom_c)
             print()
             
             cute.printf("")
@@ -673,7 +694,7 @@ class DenseGemmKernelSm100:
 
         # Fetch (mbar) data ptrs
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_smem_buf = storage.tmem_holding_smem_buf
         ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
         acc_full_mbar_ptr = storage.acc_full_mbar_ptr.data_ptr()
 
@@ -960,7 +981,7 @@ class DenseGemmKernelSm100:
         if warp_idx == 0: # only warp0 handles tmem lifecycle
             cute.arch.alloc_tmem(
                 num_columns=self.num_tmem_alloc_cols, 
-                smem_ptr_to_write_address=tmem_holding_buf, 
+                smem_ptr_to_write_address=tmem_holding_smem_buf, 
                 is_two_cta=use_2cta_instrs
             )
 
@@ -974,7 +995,7 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         tmem_ptr = cute.arch.retrieve_tmem_ptr(
             self.acc_dtype, alignment=16, 
-            ptr_to_buffer_holding_addr=tmem_holding_buf
+            ptr_to_buffer_holding_addr=tmem_holding_smem_buf
         )
         # (MMA=(128, 128), MMA_M=1, MMA_N=1)
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1688,11 +1709,11 @@ class DenseGemmKernelSm100:
 
         grid = cute.round_up(
             (
-                cute.ceil_div(c.layout.shape[0], cta_tile_shape_mnk[0]),
-                cute.ceil_div(c.layout.shape[1], cta_tile_shape_mnk[1]),
-                c.layout.shape[2],
+                cute.ceil_div(c.layout.shape[0], cta_tile_shape_mnk[0]), # pM // CTA_tileM
+                cute.ceil_div(c.layout.shape[1], cta_tile_shape_mnk[1]), # pN // CTA_tileN
+                c.layout.shape[2], # pL
             ),
-            cluster_shape_mnl,
+            cluster_shape_mnl, # (2, 1, 1)
         )
 
         return grid
