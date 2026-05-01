@@ -2150,6 +2150,7 @@ def run(
         iterations=iterations,
     )
     
+    # Profiling
     profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
     if profile_mode:
         import sys

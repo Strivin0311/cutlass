@@ -2287,9 +2287,11 @@ def run_dense_gemm(
     compiled_gemm = cute.compile(gemm, a_tensor, b_tensor, c_tensor, stream)
 
     # Launch GPU kernel
+    
     # Warm up
     for i in range(warmup_iterations):
         compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
+    
     # Execution
     for i in range(iterations):
         compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
@@ -2346,6 +2348,26 @@ def run_dense_gemm(
             atol=tolerance,
             rtol=1e-05,
         )
+        
+    # Profiling
+    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
+    if profile_mode:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+        
+        flops = 2 * m * n * k
+        event_str = f"{mnkl=} ({flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            
+            with add_nvtx_event(event_str):
+                compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
 
 
 if __name__ == "__main__":

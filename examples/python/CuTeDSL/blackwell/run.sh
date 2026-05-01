@@ -83,6 +83,23 @@ else
     exit 1
 fi
 
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+if [[ $PROFILE_MODE -eq 1 ]]; then
+    echo "Profiling configuration: M=$M, K=$K, N=$N, Profile Type=$PROFILE_TYPE"
+
+    if [[ $PROFILE_TYPE == "nsys" ]]; then
+        mkdir -p nsys_reps
+        PROFILE_CMD="nsys profile -o nsys_reps/${TEST_SCRIPT}_$TIMESTAMP -f true --capture-range=cudaProfilerApi "
+    elif [[ $PROFILE_TYPE == "ncu" ]]; then
+        mkdir -p ncu_reps
+        PROFILE_CMD="ncu --set full --kernel-name regex:kernel_cutlass -f -o ncu_reps/${TEST_SCRIPT}_$TIMESTAMP "
+    else
+        echo "Unsupported PROFILE_TYPE: $PROFILE_TYPE"
+        exit 1
+    fi
+fi
+
 mkdir -p logs
 
 if [[ $PROFILE_MODE -eq 1 ]]; then
