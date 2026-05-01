@@ -2010,10 +2010,12 @@ def run(
     )
 
     # Compute max active clusters on current device
-    hardware_info = cutlass.utils.HardwareInfo()
+    hardware_info = utils.HardwareInfo()
+    max_sms = hardware_info.get_device_multiprocessor_count()
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    print(f"Max active clusters: {max_active_clusters} for cluster shape {cluster_shape_mn} on device with {max_sms} SMs")
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
