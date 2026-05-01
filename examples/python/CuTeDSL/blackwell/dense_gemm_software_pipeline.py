@@ -1116,8 +1116,9 @@ class PipelinedDenseGemmKernelSm100:
         
         if warp_idx == 0: # tma-load producer, as well as umma consumer/t2r producer if leader CTA
             # NOTE: we can just pass in `prefetch_stages` argument, 
-            # to allow producer prefetching automatically, and no need to peek the states, right ?
+            # to allow producer prefetching automatically, and no need to peek the states
             # which makes code much neater and less error-prone, as we don't need to manually maintain the prefetching logic and states
+            # and what's better, it proves to a little bit better performance than the manual one, probably because of better scheduling flexibility with the automatic prefetching
             for k_tile in cutlass.range(k_tile_cnt, prefetch_stages=prefetch_stages):
                 # /////////////////////////////////////////////////////////////////////////////
                 # TMA Producer
@@ -2069,9 +2070,11 @@ def run_dense_gemm(
     compiled_gemm = cute.compile(gemm, a_tensor, b_tensor, c_tensor, stream)
 
     # Launch GPU kernel
+    
     # Warm up
     for i in range(warmup_iterations):
         compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
+    
     # Execution
     for i in range(iterations):
         compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
@@ -2128,6 +2131,26 @@ def run_dense_gemm(
             atol=tolerance,
             rtol=1e-05,
         )
+
+    # Profiling
+    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
+    if profile_mode:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+        
+        flops = 2 * m * n * k
+        event_str = f"{mnkl=} ({flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            
+            with add_nvtx_event(event_str):
+                compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
 
 
 if __name__ == "__main__":
