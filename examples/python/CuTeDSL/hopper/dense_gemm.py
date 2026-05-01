@@ -1015,7 +1015,7 @@ class WgmmaDenseGemmKernelSm90:
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch
         # /////////////////////////////////////////////////////////////////////////////
-        prologue_mmas = 1
+        prologue_mmas = 1 # no larger than `prefetch_k_tile_cnt`
         k_tile_cnt = cute.size(gA_mkl, mode=[2]) # rest_k dim as the k_tile cnt (16)
         num_k_blocks = cute.size(tCrA, mode=[2]) # kloop dim as the k_block cnt (4)
         prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0) # min(rest_k, stages) = stages = 4
@@ -1076,20 +1076,19 @@ class WgmmaDenseGemmKernelSm90:
                 # /////////////////////////////////////////////////////////////////////////////
                 # NOTE: TMA load for A/B shares the same tma mbar, 
                 # as the tx_count is set to the sum of A and B copy size earlier
-                tma_bar_ptr = mainloop_pipeline.producer_get_barrier(mainloop_producer_state)
-                
+                tma_full_mbar_ptr = mainloop_pipeline.producer_get_barrier(mainloop_producer_state)
                 cute.copy(
                     atom=tma_atom_a,
                     src=tAgA_k,
                     dst=tAsA_pipe,
-                    tma_bar_ptr=tma_bar_ptr,
+                    tma_bar_ptr=tma_full_mbar_ptr,
                     mcast_mask=a_mcast_mask, # 0(0b00), since A won't be multicast for cluster shape (2,1,1)
                 )
                 cute.copy(
                     atom=tma_atom_b,
                     src=tBgB_k,
                     dst=tBsB_pipe,
-                    tma_bar_ptr=tma_bar_ptr,
+                    tma_bar_ptr=tma_full_mbar_ptr,
                     mcast_mask=b_mcast_mask, # 3(0b11), since B will be multicast along m mode for cluster shape (2,1,1)
                 )
                 
@@ -1158,16 +1157,13 @@ class WgmmaDenseGemmKernelSm90:
                     k_block_idx,
                     mainloop_consumer_read_state.index,
                 )
-                tCrA_1phase = tCrA[k_block_coord]
-                tCrB_1phase = tCrB[k_block_coord]
-
                 # D = A*B + C, where A and B are from smem and C is from register, 
                 # and the result is stored back to register D (which can be alias to C)
                 cute.gemm(
                     atom=tiled_mma,
                     d=tCrC,
-                    a=tCrA_1phase,
-                    b=tCrB_1phase,
+                    a=tCrA[k_block_coord],
+                    b=tCrB[k_block_coord],
                     c=tCrC,
                 )
                 
@@ -1213,14 +1209,11 @@ class WgmmaDenseGemmKernelSm90:
                     k_block_idx,
                     mainloop_consumer_read_state.index,
                 )
-                tCrA_1phase = tCrA[k_block_coord]
-                tCrB_1phase = tCrB[k_block_coord]
-
                 cute.gemm(
                     atom=tiled_mma,
                     d=tCrC,
-                    a=tCrA_1phase,
-                    b=tCrB_1phase,
+                    a=tCrA[k_block_coord],
+                    b=tCrB[k_block_coord],
                     c=tCrC,
                 )
 
@@ -1299,43 +1292,6 @@ class WgmmaDenseGemmKernelSm90:
                 # Mainloop pipeline's producer commit is a NOP
                 mainloop_pipeline.producer_commit(mainloop_producer_state)
                 mainloop_producer_state.advance()
-
-        # NOTE: Do NOT call mainloop_pipeline.producer_tail(mainloop_producer_state) here.
-        #
-        # producer_tail() is designed for persistent kernels where a single CTA reuses smem
-        # across multiple tiles in a loop.  In that scenario the producer must drain all
-        # "dangling" empty-mbar arrive signals before moving on to the next tile, because the
-        # same mbarrier objects will be reused and a late arrive from the previous tile would
-        # corrupt the next tile's synchronization.  producer_tail() achieves this by calling
-        # producer_acquire() on the last (num_stages - 1) pipeline stages that the consumer
-        # has not yet released, effectively waiting for every consumer_release() to land.
-        #
-        # Here, however, this is a NON-persistent kernel: each launch processes exactly one
-        # output tile and the kernel exits immediately after the epilogue.  This means:
-        #
-        #   1. The smem is never reused across tiles, so there is no risk of a late arrive
-        #      corrupting a future tile's mbarrier state.
-        #
-        #   2. More critically, calling producer_tail() would cause a DEADLOCK.
-        #      At the end of the mainloop the pipeline states are in the following condition:
-        #        - mainloop_producer_state  : count = k_tile_cnt (=16), index = 0
-        #        - mainloop_consumer_release_state : points to one stage behind the last
-        #          consumed stage (the last consumer_release() in the loop body released
-        #          the stage that finished WGMMA prologue_mmas iterations ago, not the very
-        #          last consumed stage).
-        #      producer_tail() internally calls producer_acquire() after advancing
-        #      (num_stages - 1) = 3 times from the current producer state.  That acquire
-        #      waits on the empty mbar of a stage that no thread will ever arrive on again,
-        #      because the mainloop has already exited without issuing the corresponding
-        #      consumer_release().  The kernel therefore hangs indefinitely.
-        #
-        #   3. The cluster_wait() / sync_threads() barrier immediately above this point
-        #      already ensures that all threads have completed the mainloop and that all
-        #      wgmma.wait_group(0) results are visible before entering the epilogue,
-        #      which is the only synchronization guarantee we actually need here.
-        #
-        # if warp_idx == 0:
-        #     mainloop_pipeline.producer_tail(mainloop_producer_state)
 
         # /////////////////////////////////////////////////////////////////////////////
         #  EPILOG
@@ -1511,11 +1467,24 @@ class WgmmaDenseGemmKernelSm90:
             # Wait for warp0 to issue the S2G copy before entering the next epi_tile iteration
             cute.arch.barrier()
 
+        # Wait epilogue stores to complete
         if warp_idx == 0:
             # `producer_tail` for TMAStoreFence will issue `cp.async.bulk.wait_group(0)`
             # to wait for all committed TMA store groups to complete before the producer (warp0) can exit
             c_pipeline.producer_tail()
-
+            
+        # Wait for the wgmma consumer to complete before the producer can exit
+        if warp_idx == 0: # producer
+            exposed_stages = prefetch_k_tile_cnt - prologue_mmas # the stages out of overlapped mainloop
+            stages_to_advance = exposed_stages - 1 # producer state is advanced to next stage in last iteration, so minus 1
+            tail_stages_to_advance = self.ab_stage - 1 # the stages `producer_tail` will advance
+            stages_to_reverse = tail_stages_to_advance - stages_to_advance # but we only need to advance `stages_to_advance`, so reverse several steps
+            for i in range(stages_to_reverse):
+                mainloop_producer_state.reverse()
+            
+            # Now advance `tail_stages_to_advance` will actually advance `stages_to_advance` steps
+            # and we can wait for the last issued mbar arrive signal by the consumer to avoid it dangling when the producer exits too early
+            mainloop_pipeline.producer_tail(mainloop_producer_state)
 
     @staticmethod
     def _compute_stages(
