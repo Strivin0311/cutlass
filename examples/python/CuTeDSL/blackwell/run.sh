@@ -49,6 +49,7 @@ elif [[ $TEST_SCRIPT == "dense_gemm_software_pipeline" ]]; then
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_gemm_persistent" ]]; then
+    # TFLOPS: 1431
     SCRIPT_CMD="
     python dense_gemm_persistent.py                          \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \

@@ -2108,6 +2108,26 @@ def run(
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
+    
+    # Profiling
+    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
+    if profile_mode:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+        
+        flops = 2 * m * n * k
+        event_str = f"{mnkl=} ({flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            
+            with add_nvtx_event(event_str):
+                compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
 
     return exec_time  # Return execution time in microseconds
 
@@ -2191,7 +2211,7 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run(
+    exec_time = run(
         args.mnkl,
         args.ab_dtype,
         args.c_dtype,
@@ -2209,4 +2229,5 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
     )
-    print("PASS")
+    
+    print(f"PASS with execution time: {exec_time} ms")
