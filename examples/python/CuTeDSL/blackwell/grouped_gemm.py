@@ -78,7 +78,7 @@ To collect performance with NCU profiler:
       --num_groups 4  --tensormap_update_mode SMEM                                            \
       --warmup_iterations 1 --iterations 10 --skip_ref_check
 
-There are some constrains for this example. Besides the constrains from the Balckwell dense GEMM persistent example,
+There are some constrains for this example. Besides the constrains from the Blackwell dense GEMM persistent example,
 there are also the following constrains:
 * Only fp16 and bf16 data types are supported as inputs.
 * Output data types could be fp16, bf16 or fp32.
@@ -88,7 +88,7 @@ there are also the following constrains:
 """
 
 
-class GroupedGemmKernel:
+class GroupedGemmPersistentKernelSm100:
     def __init__(
         self,
         acc_dtype: type[cutlass.Numeric],
@@ -270,7 +270,7 @@ class GroupedGemmKernel:
         if (
             mbar_smem_bytes
             + tensormap_smem_bytes
-            + GroupedGemmKernel.tensor_memory_management_bytes
+            + GroupedGemmPersistentKernelSm100.tensor_memory_management_bytes
             > self.reserved_smem_bytes
         ):
             raise ValueError(
@@ -409,8 +409,8 @@ class GroupedGemmKernel:
         self.size_tensormap_in_i64 = (
             0
             if self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
-            else GroupedGemmKernel.num_tensormaps
-            * GroupedGemmKernel.bytes_per_tensormap
+            else GroupedGemmPersistentKernelSm100.num_tensormaps
+            * GroupedGemmPersistentKernelSm100.bytes_per_tensormap
             // 8
         )
 
@@ -549,10 +549,10 @@ class GroupedGemmKernel:
             tensormap_smem_ptr = storage.tensormap_buffer.data_ptr()
             tensormap_a_smem_ptr = tensormap_smem_ptr
             tensormap_b_smem_ptr = (
-                tensormap_a_smem_ptr + GroupedGemmKernel.bytes_per_tensormap // 8
+                tensormap_a_smem_ptr + GroupedGemmPersistentKernelSm100.bytes_per_tensormap // 8
             )
             tensormap_c_smem_ptr = (
-                tensormap_b_smem_ptr + GroupedGemmKernel.bytes_per_tensormap // 8
+                tensormap_b_smem_ptr + GroupedGemmPersistentKernelSm100.bytes_per_tensormap // 8
             )
         ab_full_mbar_ptr = storage.ab_full_mbar_ptr.data_ptr()
         ab_empty_mbar_ptr = storage.ab_empty_mbar_ptr.data_ptr()
@@ -734,7 +734,7 @@ class GroupedGemmKernel:
         )
 
         tensormap_manager = utils.TensorMapManager(
-            self.tensormap_update_mode, GroupedGemmKernel.bytes_per_tensormap
+            self.tensormap_update_mode, GroupedGemmPersistentKernelSm100.bytes_per_tensormap
         )
         tensormap_a_ptr = tensormap_manager.get_tensormap_ptr(
             tensormaps[(tensormap_workspace_idx, 0, None)].iterator
@@ -1662,7 +1662,7 @@ class GroupedGemmKernel:
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
             smem_capacity // occupancy
-            - GroupedGemmKernel.reserved_smem_bytes
+            - GroupedGemmPersistentKernelSm100.reserved_smem_bytes
             - epi_bytes
         ) // ab_bytes_per_stage
 
@@ -1672,7 +1672,7 @@ class GroupedGemmKernel:
         remaining_smem = (
             smem_capacity
             - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (GroupedGemmKernel.reserved_smem_bytes + epi_bytes)
+            - occupancy * (GroupedGemmPersistentKernelSm100.reserved_smem_bytes + epi_bytes)
         )
         num_epi_stage += remaining_smem // (occupancy * epi_bytes_per_stage)
         return num_acc_stage, num_ab_stage, num_epi_stage
@@ -1756,7 +1756,7 @@ class GroupedGemmKernel:
             return 0
         elif tensormap_update_mode == utils.TensorMapUpdateMode.SMEM:
             return (
-                GroupedGemmKernel.bytes_per_tensormap * GroupedGemmKernel.num_tensormaps
+                GroupedGemmPersistentKernelSm100.bytes_per_tensormap * GroupedGemmPersistentKernelSm100.num_tensormaps
             )
         else:
             raise ValueError(f"Invalid tensormap update mode: {tensormap_update_mode}")
@@ -2075,8 +2075,8 @@ def run(
     num_tensormap_buffers = sm_count
     tensormap_shape = (
         num_tensormap_buffers,
-        GroupedGemmKernel.num_tensormaps,
-        GroupedGemmKernel.bytes_per_tensormap // 8,
+        GroupedGemmPersistentKernelSm100.num_tensormaps,
+        GroupedGemmPersistentKernelSm100.bytes_per_tensormap // 8,
     )
     tensor_of_tensormap, tensor_of_tensormap_torch = cutlass_torch.cute_tensor_like(
         torch.empty(tensormap_shape, dtype=torch.int64),
@@ -2084,7 +2084,7 @@ def run(
         is_dynamic_layout=False,
     )
 
-    grouped_gemm = GroupedGemmKernel(
+    grouped_gemm = GroupedGemmPersistentKernelSm100(
         acc_dtype,
         use_2cta_instrs,
         mma_tiler_mn,
