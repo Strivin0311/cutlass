@@ -607,6 +607,7 @@ class WgmmaDenseGemmKernelSm90:
             # NOTE: we don't and had better not to prefetch tma desc for tma_atom_c
             # since it is not used until the epilogue, thus no need to prefetch 
             # not to mention waste the limited prefetch slots and L2 cache lines
+            # cpasync.prefetch_descriptor(tma_atom_c)
             
         # /////////////////////////////////////////////////////////////////////////////
         #  Make CTA layout
@@ -667,24 +668,25 @@ class WgmmaDenseGemmKernelSm90:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get mcast mask
         # ///////////////////////////////////////////////////////////////////////////////
-        a_mcast_mask = cute.make_layout_image_mask(
-            # multicast the same A along the given mode1 (i.e. N dimension) of the cluster
-            # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have different A slices
-            # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
-            # is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
-            # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have the same A slice,
-            # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp
+        
+        # NOTE: multicast the same A along the given mode1 (i.e. N dimension) of the cluster
+        # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have different A slices
+        # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
+        # is 0b(01) or 0b(10) in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
+        # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have the same A slice,
+        # so the mcast mask is 11 in binary with CopyBulkTensorTileG2SMulticastOp
+        a_mcast_mask = cute.make_layout_image_mask(    
             lay=cta_layout_mnk, coord=cluster_coord_mnk, mode=1 # multicast mode
         )
         a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         
+        # NOTE: multicast the same B along the given mode0 (i.e. M dimension) of the cluster
+        # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have the same B slice,
+        # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
+        # is 0b(11) in binary with CopyBulkTensorTileG2SMulticastOp,
+        # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have different B slices,
+        # so the mcast mask is 0b(01) or 0b(10) in binary (but the better way is to use 0b(00) with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
         b_mcast_mask = cute.make_layout_image_mask(
-            # multicast the same B along the given mode0 (i.e. M dimension) of the cluster
-            # e.g. if cluster_shape_mn is (2,1), then two CTAs in the same cluster will have the same B slice,
-            # so the mcast mask (16bit integer, since a GPC has 16 SMs for a largest cluster) 
-            # is 11 in binary with CopyBulkTensorTileG2SMulticastOp,
-            # while if cluster_shape_mn is (1,2), then two CTAs in the same cluster will have different B slices,
-            # so the mcast mask is 01 or 10 in binary (but the better way is to use 00 with CopyBulkTensorTileG2SOp, i.e. no multicast at all)
             lay=cta_layout_mnk, coord=cluster_coord_mnk, mode=0 # multicast mode
         )
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
@@ -697,7 +699,7 @@ class WgmmaDenseGemmKernelSm90:
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init AB full/empty + ACC full mbar (pipeline)
         # /////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         
         # Get the tma copy bytes for each stage,
@@ -714,7 +716,7 @@ class WgmmaDenseGemmKernelSm90:
 
         # Define producer group for mainloop pipeline
         # only warp0 will be the producer to load the data, 
-        # thus size=1 (the lane0 in warp0 will participate the pipeline and accquire/issue the tma load)
+        # thus size=1 (the inner logic will only elect one lane to issue the `mbarrier_arrive_and_expect_tx`)
         num_producer_warps = 1
         mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size=num_producer_warps
@@ -722,10 +724,17 @@ class WgmmaDenseGemmKernelSm90:
         
         # Define consumer group for mainloop pipeline
         # all warps in the CTA will consume the data produced by the producer group, 
-        # thus size=num_warps (the lane0 in each warp will participate the pipeline and wait/release the tma data)
-        # note that when cluster feature is enabled, we need to `x mcast_size` of multicast CTAs,
+        # thus size=num_warps, but when cluster feature is enabled, we need to `x mcast_size` of multicast CTAs,
         # which equals to the sum of number of multicast CTAs for A(row) and B(col), minus 1, 
         # since the current CTA itself counts twice in A(row) and B(col)
+        # 
+        # NOTE: different from the full mbar's arrive in `producer_acquire`, which elects one lane to issue the `mbarrier_arrive_and_expect_tx`,
+        # the empty mbar's arrive in `consumer_release` is just a `mbarrier_arrive` by the tagged `is_signalling_thread` lanes (no election), 
+        # and to issue `mcast_size` times of `mbarrier_arrive`, in the `init_empty_barrier_arrive_signal` function,
+        # the inner logic will tag the first `mcast_size` of lanes in the warp as `is_signalling_thread`, each lane handles a `dst_rank` (i.e. peer CTA)
+        # then during runtime, each lane will firstly use `mapa.shared::cluster` to map the dst rank's mbar addr to itself, 
+        # and then issue the `mbarrier_arrive` on the mapped remote mbar, to make sure the smem buffer consumed by all multicasted CTAs
+        # before producer issues the next multicasted TMA load to update the smem buffer.
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         num_warps = self.threads_per_cta // 32
         num_consumer_warps = mcast_size * num_warps
@@ -1357,13 +1366,13 @@ class WgmmaDenseGemmKernelSm90:
         # (since each tiled copy a (m128, n16) tiler in C, so repeating 2 times along N will cover the (m128, n32) epi_tile of C),
         # and 4 times along the pipeline stage to finish copying a subtile (m128, n128) of C
         # then repeating the whole thing for the next subtile (m128, n128) of C to cover the whole tile (m128, n256) of C
-        tRS_sD = thr_copy_r2s.partition_D(sC)
+        tRS_sD = thr_copy_r2s.partition_D(sC) # smem is public and global, so using `partition` to get the private tiled view for each thread
         
         # Since tCrC has a mma layout of ( (2,2,32), 1, 1 ) to hold 128 fp32 elems of C in this thread
         # while the tiled copy atom (stmatrix inst) needs 8=(2,4) contiguous fp32 elems in one go,
         # so we need to retile tCrC to have a layout of (8,16):(1,8) to match the tiled copy atom layout,
         # where 8 elems in one tiled copy, and repeat 16 = R2S_N=2 x PIPE_D=4 x LOOP=(256/128)=2 times to cover the whole tile (m128, n256) of C
-        tRS_rC = epi_tiled_copy_r2s.retile(tCrC)
+        tRS_rC = epi_tiled_copy_r2s.retile(tCrC) # register is private and local, so using `retile` instead of `partition`
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -1739,6 +1748,7 @@ class WgmmaDenseGemmKernelSm90:
         tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(atom=copy_atom_r2s, mma=tiled_mma)
 
         # Using the two copy atoms above to make the final R2S tiled copy for the accumulator C of the tiled mma
+        # using the TV layout of the source registers, to make sure the tiled copy can directly copy the data without needing extra re-layout in registers
         # sharing the same Tiler-MN as `tiled_copy_C_Atom` but different TV layout of ((4,64),((2,2,2),1))
         # which is more suitable for R2S copy with a pipeling-stage mode placeholder 1, instead of (4,8,8),(2,2,2) for tiled_mma
         # NOTE: the src (R) and dst (S) memory are all assumed in the same dtype with 2B, 

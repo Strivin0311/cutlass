@@ -644,6 +644,7 @@ class DenseGemmKernelSm100:
         bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        use_2cta_instrs = self.use_2cta_instrs
         is_thread0 = tidx == 127 and bidx == 15 and bidy == 31 and bidz == 0 # used only for debug print
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -653,27 +654,27 @@ class DenseGemmKernelSm100:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             if const_expr(self.use_tma_store):
+                # TODO(REVIEW): in Hopper, we do not use prefetch tma atom for C's S2G, why prefetch for Blackwell ?
                 cpasync.prefetch_descriptor(tma_atom_c)
-
-        use_2cta_instrs = self.atom_thr_size == 2
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup cta/thread coordinates
         # /////////////////////////////////////////////////////////////////////////////
         
         # Coords inside cluster
-        mma_tile_coord_v = bidx % self.atom_thr_size
-        is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+        mma_tile_coord_v = bidx % self.atom_thr_size # CTA idx in the CTA-pair
+        is_leader_cta = mma_tile_coord_v == 0 # CTA0 is the leader
+        cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+        block_in_cluster_coord_mnk = cute.arch.block_in_cluster_idx() # CTA xyz coord in the cluster
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord( # CTA (pair_v, rest_pair_xyz) coord in the cluster
             cta_rank_in_cluster
         )
         
         # Coords outside cluster
-        cta_coord = (bidx, bidy, bidz)
-        mma_tile_coord_mnl = (
+        cta_coord = (bidx, bidy, bidz) # CTA idx in the grid
+        mma_tile_coord_mnl = ( # CTA-pair idx in the grid, i.e. the (REST_M,REST_N,REST_L) idx
             cta_coord[0] // self.atom_thr_size,
             cta_coord[1],
             cta_coord[2],
@@ -683,8 +684,10 @@ class DenseGemmKernelSm100:
             if is_thread0:
                 cute.printf("")
                 cute.printf("tidx: {}, warp_idx: {}, block_idx: ({}, {}, {})", tidx, warp_idx, bidx, bidy, bidz)
-                cute.printf("mma_tile_coord_v: {}, is_leader_cta: {}, cta_rank_in_cluster: {}, block_in_cluster_coord_vmnk: ({}, {}, {})", mma_tile_coord_v, is_leader_cta, cta_rank_in_cluster, block_in_cluster_coord_vmnk[0], block_in_cluster_coord_vmnk[1], block_in_cluster_coord_vmnk[2])
-                cute.printf("MMA tile coord (M,N,L): ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                cute.printf("mma_tile_coord_v: {}, is_leader_cta: {}, cta_rank_in_cluster: {}, ", mma_tile_coord_v, is_leader_cta, cta_rank_in_cluster)
+                cute.printf("block_in_cluster_coord_mnk: {}", block_in_cluster_coord_mnk)
+                cute.printf("block_in_cluster_coord_vmnk: {}", block_in_cluster_coord_vmnk)
+                cute.printf("mma_tile_coord_mnl: {}", mma_tile_coord_mnl)
         
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc and init: a+b full/empty, accumulator full, tensor memory dealloc barrier
@@ -692,13 +695,19 @@ class DenseGemmKernelSm100:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        # Fetch (mbar) data ptrs
+        # Fetch smem data ptrs
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
         tmem_holding_smem_buf = storage.tmem_holding_smem_buf
         ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
         acc_full_mbar_ptr = storage.acc_full_mbar_ptr.data_ptr()
 
         # Initialize mainloop ab_pipeline (barrier) and states
+        # NOTE: different from Hopper's warp-group level warp specialization pipeline,
+        # Blackwell's pipeline only involves the first warp for each CTA (elected one lane to actually issue), where:
+        #   1. warp0 for each CTA is the TMA producer, to load its A and (sharded) B from gmem to smem
+        #   2. warp0 for each CTA is also the TMA consumer, to wait for the sA and sB to be ready
+        #   3. only warp0 in the leader CTA (CTA0 in a CTA-pair) is responsible for issuing the UMMA
+        # i.e., both producer and consumer warps are of size 1 and be the same warp itself
         num_tma_producer = 1
         ab_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size=num_tma_producer
@@ -707,7 +716,7 @@ class DenseGemmKernelSm100:
             pipeline.PipelineUserType.Producer, self.num_ab_stage
         )
         
-        num_tma_consumer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1 # counting itself twice
+        num_tma_consumer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1 # mutlicast along M/N dim, counting itself twice, thus minus 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size=num_tma_consumer
         )
@@ -725,6 +734,11 @@ class DenseGemmKernelSm100:
         )
 
         # Initialize acc_pipeline (barrier) and states
+        # NOTE: this is the tmem -> rmem pipeline for the first step in the epilogue, where:
+        #   1. warp0 for each CTA is the tmem producer (elected one lane), waiting for all the UMMA in the mainloop finished
+        #       to arrive the acc full mbar with `tcgen05.commit.mbarrier::arrive::one`
+        #   2. all threads (one warp group) in each CTA are the tmem consumers, waiting for the acc full mbar
+        #       to issue `tcgen05.ld` to load the accumulators from tmem to rmem
         num_acc_producer = 1
         acc_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, size=num_acc_producer
@@ -751,13 +765,13 @@ class DenseGemmKernelSm100:
 
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
-            if warp_idx == 0: # only warp0 handles tmem lifecycle
+            if warp_idx == 0: # tmem producer
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(
                         tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
                     )
-        cute.arch.mbarrier_init_fence()
+        cute.arch.mbarrier_init_fence() # fence.mbarrier_init: to ensure the mbarrier init is visible to all threads in the CTA
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -774,16 +788,16 @@ class DenseGemmKernelSm100:
         #  Setup smem tensor A/B/C
         # /////////////////////////////////////////////////////////////////////////////
         
-        # (MMA, MMA_M, MMA_K, STAGE)
+        # (MMA=(128,16), MMA_M=1, MMA_K=4, STAGE=8)
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
         )
-        # (MMA, MMA_N, MMA_K, STAGE)
+        # (MMA=(64,16), MMA_N=1, MMA_K=4, STAGE=8)
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
+        # (EPI_M=(8,16), EPI_N=(32,1), EPI_STAGE=2)
         sC = (
             storage.sC.get_tensor(
                 c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
@@ -806,8 +820,9 @@ class DenseGemmKernelSm100:
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
+            # NOTE: it calls `cute.make_layout_image_mask` internally
             a_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(10), only for itself
-                cta_layout_vmnk=cluster_layout_vmnk, 
+                cta_layout_vmnk=cluster_layout_vmnk,
                 cta_coord_vmnk=block_in_cluster_coord_vmnk, 
                 mcast_mode=2 # multicast along N dim
             )
@@ -828,27 +843,29 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         
         # NOTE: we don't manually compute tile coordinates for global local tiles below
-        # so they all start with (0, 0, 0) offset in the tiles
+        # since we carry the (REST_M, REST_N, REST_K) dims in the local tile iter the whole time
+        # and at the right time, we will use `mma_tile_coord_mnl` to index the right local tile out
+        # so they all start with (0, 0, 0) offset in the tiles for now
         
-        # (tileM, tileK, restM, restK, restL)
+        # (tileM=256, tileK=64, restM=8, restK=16, restL=1)
         gA_mkl = cute.local_tile(
             input=mA_mkl,
             tiler=cute.slice_(self.mma_tiler_mnk, (None, 0, None)), # (M, K)
             coord=(None, None, None)
         )
-        # (tileN, tileK, restN, restK, restL)
+        # (tileN=128, tileK=64, restN=32, restK=16, restL=1)
         gB_nkl = cute.local_tile(
             input=mB_nkl, 
             tiler=cute.slice_(self.mma_tiler_mnk, (0, None, None)), # (N, K)
             coord=(None, None, None)
         )
-        # (tileM, tileN, restM, restN, restL)
+        # (tileM=256, tileN=128, restM=8, restN=32, restL=1)
         gC_mnl = cute.local_tile(
-            input=mC_mnl, 
+            input=mC_mnl,
             tiler=cute.slice_(self.mma_tiler_mnk, (None, None, 0)), # (M, N)
             coord=(None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cute.size(gA_mkl, mode=[3]) # restK dim for the iterations in the mainloop
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -880,13 +897,17 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        thr_mma = tiled_mma.get_slice(mma_tile_coord_v) # use the block idx in cluster to slice tiled mma
         
-        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
+        # NOTE: different from Hopper, which uses the consumer tidx to slice the tiled wgmma,
+        # we use the CTA idx in the CTA-pair to slice tiled umma, since each CTA has only one warp for it
+        # and each CTA is responsible for half-row-sliced A/C once, and half-column-sliced B twice (each shared sB distributed in each CTA)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        
+        # (MMA=(128,16), MMA_M=1, MMA_K=4, RestM=8, RestK=16, RestL=1)
         tCgA = thr_mma.partition_A(gA_mkl)
-        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
+        # (MMA=(64,16), MMA_N=1, MMA_K=4, RestN=32, RestK=16, RestL=1)
         tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+        # (MMA=(128,128), MMA_M=1, MMA_N=1, RestM=8, RestN=32, RestL=1)
         tCgC = thr_mma.partition_C(gC_mnl)
         
         if const_expr(self.debug_print):
@@ -902,13 +923,17 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         
         # TMA load A partition_S/D
-        sA_for_tma_partition = cute.group_modes(sA, 0, 3) # ((MMA, MMA_M, MMA_K), PIPE)
-        tCgA_for_tma_partition = cute.group_modes(tCgA, 0, 3) # ((MMA, MMA_M, MMA_K), RestM, RestK, RestL)
-        a_cta_layout = cute.make_layout( # only need the 3rd N dim
+        # sA_for_tma_partition: ((MMA, MMA_M, MMA_K)=((128,16),1,4), PIPE=8)
+        # tCgA_for_tma_partition: ((MMA, MMA_M, MMA_K)=((128,16),1,4), RestM=8, RestK=16, RestL=1)
+        sA_for_tma_partition = cute.group_modes(sA, 0, 3)
+        tCgA_for_tma_partition = cute.group_modes(tCgA, 0, 3)
+        
+        a_cta_layout = cute.make_layout( # only need the 3rd N dim, (1):(0)
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
-        # tAsA: ((TMA_atom_v, rest_v), STAGE)
-        # tAgA: ((TMA_atom_v, rest_v), RestM, RestK, RestL)
+        
+        # tAsA: ((TMA_atom_v, rest_v)=(8192,1), PIPE=8)
+        # tAgA: ((TMA_atom_v, rest_v)=((64,128),1), RestM=8, RestK=16, RestL=1)
         tAsA, tAgA = cpasync.tma_partition(
             atom=tma_atom_a,
             cta_coord=block_in_cluster_coord_vmnk[2], # along N
@@ -918,13 +943,17 @@ class DenseGemmKernelSm100:
         )
         
         # TMA load B partition_S/D
-        sB_for_tma_partition = cute.group_modes(sB, 0, 3) # ((MMA, MMA_N, MMA_K), PIPE)
-        tCgB_for_tma_partition = cute.group_modes(tCgB, 0, 3) # ((MMA, MMA_N, MMA_K), RestN, RestK, RestL)
-        b_cta_layout = cute.make_layout( # only need the 2nd M dim
+        # sB_for_tma_partition: ((MMA, MMA_N, MMA_K)=((64,16),1,4), PIPE=8)
+        # tCgB_for_tma_partition: ((MMA, MMA_N, MMA_K)=((64,16),1,4), RestN=32, RestK=16, RestL=1)
+        sB_for_tma_partition = cute.group_modes(sB, 0, 3)
+        tCgB_for_tma_partition = cute.group_modes(tCgB, 0, 3)
+        
+        b_cta_layout = cute.make_layout( # only need the 2nd M dim: (1):(0)
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
-        # tBsB: ((TMA_atom_v, rest_v), STAGE)
-        # tBgB: ((TMA_atom_v, rest_v), RestN, RestK, RestL)
+        
+        # tBsB: ((TMA_atom_v, rest_v)=(4096,1), PIPE=8)
+        # tBgB: ((TMA_atom_v, rest_v)=(((64,64),1), RestN=32, RestK=16, RestL=1)
         tBsB, tBgB = cpasync.tma_partition(
             atom=tma_atom_b,
             cta_coord=block_in_cluster_coord_vmnk[1], # along M
@@ -953,13 +982,16 @@ class DenseGemmKernelSm100:
         #  Partition shared/tensor memory tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
         
-        # (MMA=1, MMA_M=1, MMA_K=4, STAGE=8)
-        tCrA = tiled_mma.make_fragment_A(sA)
-        # (MMA=1, MMA_N=1, MMA_K=4, STAGE=8)
-        tCrB = tiled_mma.make_fragment_B(sB)
-        # (MMA=(128,128), MMA_M=1, MMA_N=1)
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        # (MMA=1, MMA_M=1, MMA_K=4, STAGE=8):(0,0,2,1024)
+        tCrA = thr_mma.make_fragment_A(sA)
+        # (MMA=1, MMA_N=1, MMA_K=4, STAGE=8):(0,0,2,512)
+        tCrB = thr_mma.make_fragment_B(sB)
+        # NOTE: different from Hopper's private rmem layout per thread like tCrC: ((2,2,32),1,1):((1,2,4),0,0),
+        # Blackwell's tCtAcc is shared across the CTA: (MMA=(128,128), MMA_M=1, MMA_N=1) : ((65536,1),0,0)
+        acc_shape = thr_mma.partition_shape_C(self.mma_tiler_mnk[:2])
+        # NOTE: this is only a fake fragment with layout, the actual tCtAcc needs to be in tmem,
+        # but we haven't allocate and retrieve its addr yet
+        tCtAcc_fake = thr_mma.make_fragment_C(acc_shape)
         
         if const_expr(self.debug_print):
             if is_thread0:
@@ -973,28 +1005,31 @@ class DenseGemmKernelSm100:
         #  Cluster wait before tensor memory alloc
         # /////////////////////////////////////////////////////////////////////////////
         if cute.size(self.cluster_shape_mn) > 1:
+            # wait for all CTAs in the cluster to arrive 
+            # before warp0 of each CTA allocates the tmem
             cute.arch.cluster_wait()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Alloc tensor memory buffer
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == 0: # only warp0 handles tmem lifecycle
+        if warp_idx == 0: # tmem producer
+            # Allocate a tmem buffer and store the tmem address in smem
+            # using `tcgen05.alloc.cta_group::2 [smem_addr], cols`
             cute.arch.alloc_tmem(
-                num_columns=self.num_tmem_alloc_cols, 
+                num_columns=self.num_tmem_alloc_cols, # 128 cols for 128 CTA_tileN
                 smem_ptr_to_write_address=tmem_holding_smem_buf, 
                 is_two_cta=use_2cta_instrs
             )
-
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Bar sync for retrieve tensor memory ptr from shared memory
-        # /////////////////////////////////////////////////////////////////////////////
+            
+        # Bar.sync before each thread retrieves the stored tmem ptr from smem
         cute.arch.barrier()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Retrieving tensor memory ptr and make accumulator tensor
         # /////////////////////////////////////////////////////////////////////////////
         tmem_ptr = cute.arch.retrieve_tmem_ptr(
-            self.acc_dtype, alignment=16, 
+            self.acc_dtype, 
+            alignment=16, 
             ptr_to_buffer_holding_addr=tmem_holding_smem_buf
         )
         # (MMA=(128, 128), MMA_M=1, MMA_N=1)
@@ -1009,6 +1044,8 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition for epilogue
         # /////////////////////////////////////////////////////////////////////////////
+        
+        # Make T2R tiled copy
         tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
             tidx, 
             tAcc=tCtAcc, 
@@ -1021,20 +1058,28 @@ class DenseGemmKernelSm100:
         tTR_rC, tiled_copy_r2s, simt_atom = None, None, None
         tRS_rC, tRS_sC, bSG_sC, bSG_gC, tTR_gC = None, None, None, None, None
         if const_expr(self.use_tma_store):
+            # Make R2S tiled copy
             # tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype) # deprecated API
-            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype) # new API
-            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype) # new API, the bf16 version of tTR_rAcc
+            tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition( 
                 tiled_copy_t2r=tiled_copy_t2r, 
                 tTR_rC=tTR_rC, 
-                tidx=tidx, sC=sC, 
+                tidx=tidx, 
+                sC=sC, 
                 is_thread0=is_thread0
             )
+            
+            # Make S2G TMA tiled copy
             tma_atom_c, bSG_sC, bSG_gC = self.epilog_gmem_copy_and_partition(
-                tidx=tidx, atom=tma_atom_c, tCgC=tCgC, 
-                epi_tile=epi_tile, sC=sC,
+                tidx=tidx, 
+                atom=tma_atom_c, 
+                tCgC=tCgC, 
+                epi_tile=epi_tile, 
+                sC=sC,
                 is_thread0=is_thread0
             )
         else:
+            # Make R2G tiled copy
             simt_atom, tTR_rC, tTR_gC = self.epilog_gmem_copy_and_partition(
                 tidx=tidx, tiled_copy_t2r=tiled_copy_t2r, tCgC=tCgC, 
                 epi_tile=epi_tile, sC=sC
@@ -1044,17 +1089,21 @@ class DenseGemmKernelSm100:
         #  Slice to per mma tile index
         # /////////////////////////////////////////////////////////////////////////////
         
-        # ((atom_v, rest_v), RestK)
-        tAgA = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
-        # ((atom_v, rest_v), RestK)
-        tBgB = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+        # From: ((TMA_atom_v, rest_v)=((64,128),1), RestM=8, RestK=16, RestL=1)
+        # To: ((TMA_atom_v, rest_v)=((64,128),1), RestK)
+        tAgA = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])] # slice (RestM, RestL) idx
+        # From: ((TMA_atom_v, rest_v)=(((64,64),1), RestN=32, RestK=16, RestL=1)
+        # To: ((TMA_atom_v, rest_v)=(((64,64),1), RestK=16)
+        tBgB = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])] # slice (RestN, RestL) idx
         if const_expr(self.use_tma_store):
-            # ((ATOM_V, REST_V), EPI_M, EPI_N)
-            bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
+            # From: ((ATOM_V, REST_V)=((32,128),1), EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1)
+            # To: ((ATOM_V, REST_V)=((32,128),1), EPI_M=1, EPI_N=4)
+            bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)] # slice (RestM, RestN, RestL) idx
         else:
-            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-            tTR_gC = tTR_gC[(None, None, None, None, None, *mma_tile_coord_mnl)]
-            
+            # From: (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+            # To: (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+            tTR_gC = tTR_gC[(None, None, None, None, None, *mma_tile_coord_mnl)] # slice (RestM, RestN, RestL) idx
+        
         if const_expr(self.debug_print):
             if is_thread0:
                 cute.printf("")
@@ -1364,29 +1413,50 @@ class DenseGemmKernelSm100:
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
         # Make tiledCopy for tensor memory load
+        # op: Ld32x32bOp(Repetition(32), Pack.NONE) => `tcgen05.ld.sync.aligned.32x32b.x32`, where:
+        #   tcgen05.ld.sync.aligned.shape1.num{.pack}.b32    r, [taddr];
+        #       .shape1 = { .16x64b, .16x128b, .16x256b, .32x32b } = num_rows x num_bits_per_thread
+        #       .num    = { .x1, .x2, .x4, .x8, .x16, .x32, .x64, .x128 } = rep times along cols, i.e. num_cols
+        #   so this copy atom means 32rows x 32cols of 32bits (4B, fp32) tmem, i.e. 1024 fp32 tC elems
+        #   with properties:
+        #       num_dp   = 32 (datapath / row / lane)
+        #       num_bits = 32 (element bits)
+        #       num_rep  = 32 (cols)
+        #       pack     = Pack.NONE (no packing two 16-bit elements into one 32-bit)
+        #
+        # layout_src_tv: (32,1024):(0,1) => one warp handles 1024 fp32 elems (32rows x 32cols) in tmem, 
+        #   all threads in the warp sharing the same base addr (so stride0=0)
+        # layout_dst_tv: (32,32):(32,1) => each thread in one warp holds 32 fp32 elems in register, 
+        #   contiguous in the thread dimension
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
-            self.cta_tile_shape_mnk,
-            self.c_layout,
-            self.c_dtype,
-            self.acc_dtype,
-            epi_tile,
-            use_2cta_instrs,
+            cta_tile_shape=self.cta_tile_shape_mnk,
+            layout_d=self.c_layout,
+            elem_ty_d=self.c_dtype,
+            elem_ty_acc=self.acc_dtype,
+            epi_tile=epi_tile,
+            use_2cta_instrs=use_2cta_instrs,
         )
         
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)
+        # Tile the tAcc of layout (MMA=(128, 128), MMA_M=1, MMA_N=1):((65536,1),0,0)
+        # with epi_tile (epi_tileM=128, epi_tileN=32) into 
+        # tAcc_epi: (epi_tileM=128, epi_tileN=32, epi_M=1, epi_N=4):(65536,1,0,32)
         tAcc_epi = cute.flat_divide(
-            tAcc[((None, None), 0, 0)],
+            tAcc[((None, None), 0, 0)], # only take MMA dims
             epi_tile,
         )
+        
+        # Make t2r tiled copy
+        # layout_src_tv_tiled: ((WARP, NUM_WARPS)=(32,4), (T2R_ROWS,T2R_COLS)=((32,32),1)):((0,1),((128,4),0))
+        # layout_dst_tv_tiled: ((WARP, NUM_WARPS)=(32,4), T2R=(32,1)):((4,1),(128,0))
         # (EPI_TILE_M, EPI_TILE_N)
         tiled_copy_t2r = tcgen05.make_tmem_copy(
             atom=copy_atom_t2r, 
-            tmem_tensor=tAcc_epi[(None, None, 0, 0)] # only take (EPI_TILE_M, EPI_TILE_N)
+            tmem_tensor=tAcc_epi[(None, None, 0, 0)] # only take epi tile dims (epi_tileM=128, epi_tileN=32)
         )
 
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
         
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+        # (T2R=((T2R_COLS=32, T2R_ROWS=32),1), T2R_M=1, T2R_N=1, EPI_M=1, EPI_N=4):(((1,65536),0),0,0,0,32)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
 
         # from: (MMA=(128,128), MMA_M=1, MMA_N=1, RestM=8, RestN=32, RestL=1)
@@ -1403,7 +1473,7 @@ class DenseGemmKernelSm100:
         # tTR_rAcc = cute.make_fragment( # deprecated API
         tTR_rAcc = cute.make_rmem_tensor( # new API
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, # fetch only (T2R, T2R_M, T2R_N) dims
-            self.acc_dtype
+            self.acc_dtype # fp32 rmem buffer for t2r dst
         )
         
         if const_expr(self.debug_print):
@@ -1448,23 +1518,43 @@ class DenseGemmKernelSm100:
             - tRS_sC: The partitioned tensor C (smem destination)
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
+        
+        # Fetch some properties of the t2r tiled copy
+        num_dp, num_bits, num_rep, pack = tcgen05.get_tmem_copy_properties(tiled_copy_t2r)
+        
+        # Make R2S copy atom from T2R tiled copy
+        # since our T2R tiled copy is 32rows x 32cols, violating all `stmatrix` insts inside (m8n8xn, or m16n8xn)
+        # it fall backs to `CopyUniversalOp`, where: layout_src_tv: (1,1):(0,0) | layout_dst_tv: (1,1):(0,0)
+        # i.e. each thread needs to store 32 times for its 32 fp32 elements to smem
         copy_atom_r2s = sm100_utils.get_smem_store_op(
-            self.c_layout, self.c_dtype, self.acc_dtype,
+            layout_d=self.c_layout, 
+            elem_ty_d=self.c_dtype, 
+            elem_ty_acc=self.acc_dtype,
             tiled_tmem_load=tiled_copy_t2r
         )
-        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         
+        # NOTE: different from Hopper's epilogue that making the R2Stiled copy using the `make_tiled_copy_S`
+        # since the `register` is on the source side of the tiled mma as well as the CAtom tiled copy, 
+        # here we use `make_tiled_copy_D` since the `register` is on the destination side of the T2R copy
+        # but the underlying reason is the same: we want to use the same register TV layout
+        # to directly copy the data without needing extra re-layout in registers
+        # 
+        # layout_src_tv_tiled: ((WARP,NUM_WARPS)=(32,4), VAL_PER_THREAD=(1,32)):((4,1),(0,128))
+        # layout_dst_tv_tiled: ((WARP,NUM_WARPS)=(32,4),(1,32)):((4,1),(0,128))
+        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         
-        # (R2S=(1,32), R2S_M=1, R2S_N=1, PIPE_D=2)
+        # FROM: (epi_M=(8,16), epi_N=(32,1), epi_stages=(1,2))
+        # TO: (R2S=(1,32), R2S_M=1, R2S_N=1, epi_stages=2)
         tRS_sC = thr_copy_r2s.partition_D(sC)
         
-        # (T2R=(32,1), T2R_M=1, T2R_N=1) 
-        # -> (R2S=(1,32), R2S_M=1, R2S_N=1)
+        # FROM: (T2R=(32,1), T2R_M=1, T2R_N=1) 
+        # TO: (R2S=(1,32), R2S_M=1, R2S_N=1)
         tRS_rC = tiled_copy_r2s.retile(tTR_rC)
         
         if const_expr(self.debug_print):
             if is_thread0:
+                print(f"tiled_copy_t2r properties: num_dp: {num_dp} | num_bits: {num_bits} | num_rep: {num_rep} | pack: {pack}")
                 cute.printf("")
                 cute.printf("copy_atom_r2s: layout_src_tv: {} | layout_dst_tv: {}", copy_atom_r2s.layout_src_tv, copy_atom_r2s.layout_dst_tv)
                 cute.printf("tiled_copy_r2s: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_r2s.layout_src_tv, tiled_copy_r2s.layout_src_tv_tiled, tiled_copy_r2s.layout_dst_tv, tiled_copy_r2s.layout_dst_tv_tiled)
@@ -1511,19 +1601,24 @@ class DenseGemmKernelSm100:
                 - tTR_gC: The partitioned global tensor C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
         """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
+        
+        # From: (MMA=(128,128), MMA_M=1, MMA_N=1, RestM=8, RestN=32, RestL=1)
+        # to: (EPI_TILE_M=128, EPI_TILE_N=32, EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1)
         gC_epi = cute.flat_divide(
-            tCgC[((None, None), 0, 0, None, None, None)], 
+            tCgC[((None, None), 0, 0, None, None, None)],  # removing MMA_M and MMA_N dims
             epi_tile
         )
         
         if const_expr(self.use_tma_store):
             tma_atom_c = atom
+            
+            # sC_for_tma_partition: (epi_tile=((8,16),(32,1)), epi_stages=(1,2))
+            # gC_for_tma_partition: (epi_tile=(128,32), EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1)
             sC_for_tma_partition = cute.group_modes(sC, 0, 2)
             gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
             
-            # bSG_sC: ((ATOM_V, REST_V), EPI_M, EPI_N)
-            # bSG_gC: ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
+            # bSG_sC: ((ATOM_V, REST_V)=(4096,1), EPI_M=1, EPI_N=4)
+            # bSG_gC: ((ATOM_V, REST_V)=((32,128),1), EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1)
             bSG_sC, bSG_gC = cpasync.tma_partition(
                 tma_atom_c,
                 cta_coord=0,
