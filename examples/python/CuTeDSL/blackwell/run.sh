@@ -7,8 +7,8 @@ export DEBUG_MODE=1
 export PROFILE_MODE=0 # set to 1 to enable profiling with either Nsight Systems (nsys) or Nsight Compute (ncu)
 export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_MODE
 
-TEST_SCRIPT="dense_gemm"
-# TEST_SCRIPT="dense_gemm_software_pipeline"
+# TEST_SCRIPT="dense_gemm"
+TEST_SCRIPT="dense_gemm_software_pipeline"
 # TEST_SCRIPT="dense_gemm_persistent"
 # TEST_SCRIPT="dense_blockscaled_gemm_persistent"
 # TEST_SCRIPT="grouped_gemm"

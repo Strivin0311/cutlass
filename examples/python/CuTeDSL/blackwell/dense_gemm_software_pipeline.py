@@ -581,7 +581,7 @@ class PipelinedDenseGemmKernelSm100:
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, self.threads_per_cta, self.threads_per_cta
+            pipeline.Agent.Thread, self.threads_per_cta
         )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
@@ -862,7 +862,7 @@ class PipelinedDenseGemmKernelSm100:
         if cutlass.const_expr(self.use_tma_store):
             # Initialize tma store c_pipeline
             c_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.threads_per_cta, self.threads_per_cta
+                pipeline.Agent.Thread, self.threads_per_cta
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage,
