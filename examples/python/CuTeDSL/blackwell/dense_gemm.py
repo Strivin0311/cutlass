@@ -597,7 +597,7 @@ class DenseGemmKernelSm100:
         
             cute.printf("grid: {}", grid)
         
-        # Launch the kernel synchronously
+        # Launch the kernel
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -701,7 +701,9 @@ class DenseGemmKernelSm100:
         ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
         acc_full_mbar_ptr = storage.acc_full_mbar_ptr.data_ptr()
 
-        # Initialize mainloop ab_pipeline (barrier) and states
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Initialize mainloop ab_pipeline (barrier) and states
+        # /////////////////////////////////////////////////////////////////////////////
         # NOTE: different from Hopper's warp-group level warp specialization pipeline,
         # Blackwell's pipeline only involves the first warp for each CTA (elected one lane to actually issue), where:
         #   1. warp0 for each CTA is the TMA producer, to load its A and (sharded) B from gmem to smem
@@ -733,7 +735,9 @@ class DenseGemmKernelSm100:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Initialize acc_pipeline (barrier) and states
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Initialize acc_pipeline (barrier) and states
+        # /////////////////////////////////////////////////////////////////////////////
         # NOTE: this is the tmem -> rmem pipeline for the first step in the epilogue, where:
         #   1. warp0 for each CTA is the tmem producer (elected one lane), waiting for all the UMMA in the mainloop finished
         #       to arrive the acc full mbar with `tcgen05.commit.mbarrier::arrive::one`
@@ -763,7 +767,9 @@ class DenseGemmKernelSm100:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Tensor memory dealloc barrier init
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Tensor memory dealloc barrier init
+        # /////////////////////////////////////////////////////////////////////////////
         if use_2cta_instrs:
             if warp_idx == 0: # tmem manager
                 num_tmem_dealloc_threads = 32
@@ -971,6 +977,8 @@ class DenseGemmKernelSm100:
                 cute.printf("tAsA: {}", tAsA)
                 cute.printf("tAgA: {}", tAgA)
                 cute.printf("")
+                
+                cute.printf("")
                 cute.printf("b_cta_layout: {}", b_cta_layout)
                 cute.printf("sB_for_tma_partition: {}", sB_for_tma_partition)
                 cute.printf("tCgB_for_tma_partition: {}", tCgB_for_tma_partition)
@@ -1090,7 +1098,7 @@ class DenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         
         # From: ((TMA_atom_v, rest_v)=((64,128),1), RestM=8, RestK=16, RestL=1)
-        # To: ((TMA_atom_v, rest_v)=((64,128),1), RestK)
+        # To: ((TMA_atom_v, rest_v)=((64,128),1), RestK=16)
         tAgA = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])] # slice (RestM, RestL) idx
         # From: ((TMA_atom_v, rest_v)=(((64,64),1), RestN=32, RestK=16, RestL=1)
         # To: ((TMA_atom_v, rest_v)=(((64,64),1), RestK=16)
@@ -1646,7 +1654,7 @@ class DenseGemmKernelSm100:
             sC_for_tma_partition = cute.group_modes(sC, 0, 2)
             gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
             
-            # bSG_sC: ((ATOM_V, REST_V)=(4096,1), EPI_M=1, EPI_N=4)
+            # bSG_sC: ((ATOM_V, REST_V)=(4096,1), epi_stages=(1,2))
             # bSG_gC: ((ATOM_V, REST_V)=((32,128),1), EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1)
             bSG_sC, bSG_gC = cpasync.tma_partition(
                 tma_atom_c,
