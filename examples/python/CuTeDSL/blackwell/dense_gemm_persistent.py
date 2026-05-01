@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
 import argparse
 from typing import Optional, Type, Tuple, Union
 
@@ -41,6 +42,7 @@ import cutlass.pipeline as pipeline
 import cutlass.cute.testing as testing
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
+from cutlass import const_expr
 
 
 """
@@ -110,6 +112,8 @@ Constraints are same as dense_gemm.py:
 * OOB tiles are not allowed when TMA store is disabled
 """
 
+DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+
 
 class DenseGemmPersistentKernelSm100:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
@@ -170,6 +174,7 @@ class DenseGemmPersistentKernelSm100:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         use_tma_store: bool,
+        debug_print: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -203,7 +208,7 @@ class DenseGemmPersistentKernelSm100:
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
-        self.mma_tiler = (*mma_tiler_mn, 1)
+        self.mma_tiler = (*mma_tiler_mn, 1) # (tileM256, tileN128)
         self.use_tma_store = use_tma_store
 
         self.cta_group = (
@@ -211,23 +216,36 @@ class DenseGemmPersistentKernelSm100:
         )
 
         self.occupancy = 1
+        
         # Set specialized warp ids
-        self.epilog_warp_id = (
-            0,
-            1,
-            2,
-            3,
-        )
+        self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.threads_per_cta = 32 * len(
+        self.threads_per_cta = 32 * len( # 6 warps = 192 threads
             (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
         )
+        
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        
+        self.debug_print = debug_print
+        
+        if const_expr(self.debug_print):
+            print()
+            print(f"Initialized DenseGemmPersistentKernelSm100 with configurations:")
+            print(f"  acc_dtype: {self.acc_dtype=}")
+            print(f"  use_2cta_instrs: {self.use_2cta_instrs=}")
+            print(f"  mma_tiler: {self.mma_tiler=}")
+            print(f"  cluster_shape_mn: {self.cluster_shape_mn=}")
+            print(f"  use_tma_store: {self.use_tma_store=}")
+            print(f"  CTA group for MMA: {self.cta_group=}")
+            print(f"  threads_per_cta: {self.threads_per_cta=}")
+            print(f"  warp ids: {self.epilog_warp_id=}, {self.mma_warp_id=}, {self.tma_warp_id=}")
+            print(f"  barrier ids: {self.cta_sync_bar_id=}, {self.epilog_sync_bar_id=}, {self.tmem_ptr_sync_bar_id=}")
+            print(f"  smem_capacity: {self.smem_capacity} bytes")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1988,6 +2006,7 @@ def run(
         mma_tiler_mn,
         cluster_shape_mn,
         use_tma_store,
+        debug_print=DEBUG_MODE
     )
 
     # Compute max active clusters on current device
