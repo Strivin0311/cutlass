@@ -102,7 +102,7 @@ Constraints:
   see detailed valid dtype combinations in below DenseGemmKernelSm100 class documentation
 * A/B tensor must have the same data type
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
-* Mma tiler N must be 32-256, step 32
+* Mma tiler N must be 8-256, step 8
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
 * Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
@@ -271,7 +271,7 @@ class DenseGemmKernelSm100:
         #   2. different from wgmma's mem role, where A can be in rmem/smem, B must in smem and C must in rmem,
         #       umma's  A can be in tmem/smem, B must in smem and C must in tmem
         #   3. umma's K dim is still 32B (16 for bf16/fp16), and N dim is still range(8, 256+8, 8),
-        #       but umma's M dim raises up to 128 from wgmma's 64 for one CTA, and a CTA-pair can together handle M=256
+        #       but umma's M dim raises up to either 64 or 128 from wgmma's only 64 for one CTA, and a CTA-pair can together handle M=128/256 resp.
         #       where one CTA handles a half-row-sliced C (M128, N128) with half-row-sliced A (M=128, K16),
         #       and half-col-sliced B (N64, K16), i.e. A is local in one CTA but B is shared in dist-smem across a CTA-pair
         #       so each CTA needs to access the whole B tile via dist-smem to finish its half-row-sliced C job
