@@ -2399,17 +2399,19 @@ def run(
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
         c_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
     )
+    
+    divisibility = 2 if ab_dtype == cutlass.Float4E2M1FN else 1
 
     # Mark tensor to be byte aligned
     a_tensor.mark_compact_shape_dynamic(
         mode=1 if a_major == "k" else 0,
         stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+        divisibility=divisibility,
     )
     b_tensor.mark_compact_shape_dynamic(
         mode=1 if b_major == "k" else 0,
         stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-        divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+        divisibility=divisibility,
     )
     c_tensor.mark_compact_shape_dynamic(
         mode=1 if c_major == "n" else 0,
@@ -2589,12 +2591,12 @@ def run(
         a_tensor.mark_compact_shape_dynamic(
             mode=1 if a_major == "k" else 0,
             stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=divisibility,
         )
         b_tensor.mark_compact_shape_dynamic(
             mode=1 if b_major == "k" else 0,
             stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-            divisibility=2 if ab_dtype == cutlass.Float4E2M1FN else 1,
+            divisibility=divisibility,
         )
         c_tensor.mark_compact_shape_dynamic(
             mode=1 if c_major == "n" else 0,
@@ -2637,7 +2639,7 @@ def run(
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event
 
-        flops = 2 * m * n * k
+        flops = 2 * m * n * k * divisibility
         event_str = f"{mnkl=} ({flops=})"
         iters, start, end = 10, 6, 9
         for i in range(iters):

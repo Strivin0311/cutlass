@@ -31,7 +31,7 @@ fi
 
 
 if [[ $TEST_SCRIPT == "dense_gemm" ]]; then
-    # TFLOPS: 1288
+    # PFLOPS: 1.288 for fp16
     SCRIPT_CMD="
     python dense_gemm.py                                     \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
@@ -40,7 +40,7 @@ if [[ $TEST_SCRIPT == "dense_gemm" ]]; then
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_gemm_software_pipeline" ]]; then
-    # TFLOPS: 1338
+    # PFLOPS: 1.338 for fp16
     SCRIPT_CMD="
     python dense_gemm_software_pipeline.py                   \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
@@ -49,7 +49,7 @@ elif [[ $TEST_SCRIPT == "dense_gemm_software_pipeline" ]]; then
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_gemm_persistent" ]]; then
-    # TFLOPS: 1431
+    # PFLOPS: 1.431 for fp16
     SCRIPT_CMD="
     python dense_gemm_persistent.py                          \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                  \
@@ -58,6 +58,7 @@ elif [[ $TEST_SCRIPT == "dense_gemm_persistent" ]]; then
     --use_tma_store --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "dense_blockscaled_gemm_persistent" ]]; then
+    # PFLOPS: 10.8 for fp4
     SCRIPT_CMD="
     python dense_blockscaled_gemm_persistent.py            \
     --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16        \
