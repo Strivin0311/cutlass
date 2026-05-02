@@ -311,7 +311,7 @@ class DenseGemmPersistentKernelSm100:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        if cutlass.const_expr(self.use_tma_store):
+        if const_expr(self.use_tma_store):
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape( # (epi_tileM128:1, epi_tileN32:1)
                 self.cta_tile_shape_mnk,
                 self.use_2cta_instrs,
@@ -359,7 +359,7 @@ class DenseGemmPersistentKernelSm100:
                 epi_tile=self.epi_tile,
                 epi_stage=self.num_c_stage,
             )
-            if cutlass.const_expr(self.use_tma_store)
+            if const_expr(self.use_tma_store)
             else None
         )
 
@@ -434,7 +434,7 @@ class DenseGemmPersistentKernelSm100:
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
         # Check if input data types are compatible with MMA instruction
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
+        if const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
         # Setup attributes that dependent on gemm inputs
@@ -494,7 +494,7 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         tma_atom_c, tma_tensor_c = None, None
         c_smem_size, c_cta_v_layout = 0, None
-        if cutlass.const_expr(self.use_tma_store):
+        if const_expr(self.use_tma_store):
             c_op = cpasync.CopyBulkTensorTileS2GOp()
             c_cta_v_layout = cute.composition( # (128,32):(1@0,1@1), col-major
                 cute.make_identity_layout(c.shape), self.epi_tile
@@ -609,7 +609,7 @@ class DenseGemmPersistentKernelSm100:
             tma_atom_b,
             tma_tensor_b,
             tma_atom_c,
-            tma_tensor_c if cutlass.const_expr(self.use_tma_store) else c,
+            tma_tensor_c if const_expr(self.use_tma_store) else c,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -646,8 +646,15 @@ class DenseGemmPersistentKernelSm100:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        use_2cta_instrs = self.use_2cta_instrs
+        
+        # used only for debug print
+        is_print_block = (bidx == 0) and (bidy == 0) and (bidz == 2)
+        is_print_thread = (tidx == 127) and is_print_block
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch tma descriptor
@@ -655,28 +662,21 @@ class DenseGemmPersistentKernelSm100:
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            if cutlass.const_expr(self.use_tma_store):
+            if const_expr(self.use_tma_store):
                 cpasync.prefetch_descriptor(tma_atom_c)
-
-        use_2cta_instrs = self.use_2cta_instrs
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup cta/thread coordinates
         # /////////////////////////////////////////////////////////////////////////////
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
-        mma_tile_coord_v = bidx % self.atom_thr_size
-        is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+        mma_tile_coord_v = bidx % self.atom_thr_size  # CTA idx in the CTA-pair
+        is_leader_cta = mma_tile_coord_v == 0  # CTA idx in the CTA-pair
+        cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord( # CTA (pair_v, rest_pair_xyz) coord in the cluster
             cta_rank_in_cluster
         )
-        # Coord inside cta
-        tidx, _, _ = cute.arch.thread_idx()
-        is_print_block = (bidx == 0) and (bidy == 0) and (bidz == 0)  # used only for debug print
-        is_print_thread = (tidx == 0) and is_print_block               # first thread of first block
 
         if const_expr(self.debug_print):
             if is_print_thread:
@@ -691,6 +691,7 @@ class DenseGemmPersistentKernelSm100:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        # Fetch smem data ptrs
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
         tmem_holding_smem_buf = storage.tmem_holding_smem_buf
         ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
@@ -699,10 +700,13 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Initialize mainloop ab_pipeline (barrier) and states
         # /////////////////////////////////////////////////////////////////////////////
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        num_tma_producer = 1
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_tma_producer
+        )
+        num_tma_consumer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_tma_producer
+            pipeline.Agent.Thread, size=num_tma_consumer
         )
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=ab_full_empty_mbar_ptr,
@@ -716,12 +720,14 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Initialize acc_pipeline (barrier) and states
         # /////////////////////////////////////////////////////////////////////////////
-        acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
+        num_acc_producer = 1
+        acc_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, size=num_acc_producer
         )
+        # all the epilogue warps in the CTA-pair are the acc consumers
+        num_acc_consumer = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_acc_consumer_threads
+            pipeline.Agent.Thread, size=num_acc_consumer
         )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=acc_full_empty_mbar_ptr,
@@ -735,13 +741,13 @@ class DenseGemmPersistentKernelSm100:
         #  Tensor memory dealloc barrier init
         # /////////////////////////////////////////////////////////////////////////////
         if use_2cta_instrs:
-            if warp_idx == self.tma_warp_id:
+            if warp_idx == self.tma_warp_id: # the tma producer is also the tmem manager
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(
                         tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
                     )
-        cute.arch.mbarrier_init_fence()
+        cute.arch.mbarrier_init_fence() # fence.mbarrier_init: to ensure the mbarrier init is visible to all threads in the CTA
 
         # Cluster arrive after barrier init
         if cute.size(self.cluster_shape_mn) > 1:
@@ -750,21 +756,22 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup smem tensor A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
+        
+        # (MMA=(128,16), MMA_M=1, MMA_K=4, STAGE=8) => M-sliced within CTA-pair
+        sA = storage.sA.get_tensor(
+            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+        )
+        # (MMA=(64,16), MMA_N=1, MMA_K=4, STAGE=8) => N-shared within CTA-pair
+        sB = storage.sB.get_tensor(
+            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+        )
+        # (EPI_M=(8,16), EPI_N=(32,1), EPI_STAGE=4)
         sC = (
             storage.sC.get_tensor(
                 c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
             )
-            if cutlass.const_expr(self.use_tma_store)
+            if const_expr(self.use_tma_store)
             else None
-        )
-        # (MMA, MMA_M, MMA_K, STAGE)
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
-        )
-        # (MMA, MMA_N, MMA_K, STAGE)
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
         if const_expr(self.debug_print):
@@ -780,7 +787,7 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         a_full_mcast_mask = None
         b_full_mcast_mask = None
-        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
+        if const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
@@ -1219,7 +1226,7 @@ class DenseGemmPersistentKernelSm100:
             bSG_sC = None
             bSG_gC_partitioned = None
             tTR_gC_partitioned = None
-            if cutlass.const_expr(self.use_tma_store):
+            if const_expr(self.use_tma_store):
                 tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                     tiled_copy_t2r, tTR_rC, epi_tidx, sC
@@ -1247,7 +1254,7 @@ class DenseGemmPersistentKernelSm100:
                     cute.printf("  [Epilog warp] tTR_tAcc_base: {}", tTR_tAcc_base)
                     cute.printf("  [Epilog warp] tTR_rAcc: {}", tTR_rAcc)
                     cute.printf("")
-                    if cutlass.const_expr(self.use_tma_store):
+                    if const_expr(self.use_tma_store):
                         cute.printf("  [Epilog warp] tiled_copy_r2s: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_r2s.layout_src_tv, tiled_copy_r2s.layout_src_tv_tiled, tiled_copy_r2s.layout_dst_tv, tiled_copy_r2s.layout_dst_tv_tiled)
                         cute.printf("  [Epilog warp] tTR_rC: {}", tTR_rC)
                         cute.printf("  [Epilog warp] tRS_rC: {}", tRS_rC)
@@ -1273,7 +1280,7 @@ class DenseGemmPersistentKernelSm100:
             )
 
             c_pipeline = None
-            if cutlass.const_expr(self.use_tma_store):
+            if const_expr(self.use_tma_store):
                 # Threads/warps participating in tma store pipeline
                 c_producer_group = pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
@@ -1298,7 +1305,7 @@ class DenseGemmPersistentKernelSm100:
                 # /////////////////////////////////////////////////////////////////////////////
                 bSG_gC = None
                 tTR_gC = None
-                if cutlass.const_expr(self.use_tma_store):
+                if const_expr(self.use_tma_store):
                     # ((ATOM_V, REST_V), EPI_M, EPI_N)
                     bSG_gC = bSG_gC_partitioned[
                         (
@@ -1333,7 +1340,7 @@ class DenseGemmPersistentKernelSm100:
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                if cutlass.const_expr(self.use_tma_store):
+                if const_expr(self.use_tma_store):
                     bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
                 else:
                     tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
@@ -1351,7 +1358,7 @@ class DenseGemmPersistentKernelSm100:
                         cute.printf("  [Epilog warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
                         cute.printf("  [Epilog warp] tTR_tAcc (post-group): {}", tTR_tAcc)
                         cute.printf("  [Epilog warp] subtile_cnt: {}", subtile_cnt)
-                        if cutlass.const_expr(self.use_tma_store):
+                        if const_expr(self.use_tma_store):
                             cute.printf("  [Epilog warp] bSG_gC (post-group): {}", bSG_gC)
                         else:
                             cute.printf("  [Epilog warp] tTR_gC (post-group): {}", tTR_gC)
@@ -1364,7 +1371,7 @@ class DenseGemmPersistentKernelSm100:
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    if cutlass.const_expr(self.use_tma_store):
+                    if const_expr(self.use_tma_store):
                         # /////////////////////////////////////////////////////////////////////////////
                         #  Convert to C type
                         # /////////////////////////////////////////////////////////////////////////////
@@ -1457,7 +1464,7 @@ class DenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Wait for C store complete
             # /////////////////////////////////////////////////////////////////////////////
-            if cutlass.const_expr(self.use_tma_store):
+            if const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
 
     def epilog_tmem_copy_and_partition(
@@ -1598,7 +1605,7 @@ class DenseGemmPersistentKernelSm100:
         gC_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
-        if cutlass.const_expr(self.use_tma_store):
+        if const_expr(self.use_tma_store):
             tma_atom_c = atom
             sC_for_tma_partition = cute.group_modes(sC, 0, 2)
             gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)

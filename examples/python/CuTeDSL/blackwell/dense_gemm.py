@@ -538,6 +538,10 @@ class DenseGemmKernelSm100:
             # tmem accumulation full mbar for each acc stage
             # to synchronize the producer (UMMA writing accumulators to tmem) 
             # with the consumer (tcgen05.ld loading accumulators from tmem to rmem) for each acc stage in the epilogue
+            # 
+            # NOTE: we don't need empty mbar since `self.num_acc_stage` is fixed to 1
+            # and the epilogue is synchronized with the mainloop, so we only need one full signal
+            # to notify the acc consumers to start T2R copy
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             
             # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation

@@ -560,6 +560,9 @@ class PipelinedDenseGemmKernelSm100:
             ab_full_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             
             # tmem accumulation full mbar for each acc stage
+            # NOTE: we don't need empty mbar since `self.num_acc_stage` is fixed to 1
+            # and the epilogue is synchronized with the mainloop, so we only need one full signal
+            # to notify the acc consumers to start T2R copy
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             
             # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
@@ -685,7 +688,7 @@ class PipelinedDenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         # Coords inside cluster
         mma_tile_coord_v = bidx % self.atom_thr_size # CTA idx in the CTA-pair
-        is_leader_cta = mma_tile_coord_v == 0 # CTA0 is the leader
+        is_leader_cta = mma_tile_coord_v == 0 c
         cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
