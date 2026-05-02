@@ -9,8 +9,8 @@ export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_M
 
 # TEST_SCRIPT="dense_gemm"
 # TEST_SCRIPT="dense_gemm_software_pipeline"
-TEST_SCRIPT="dense_gemm_persistent"
-# TEST_SCRIPT="dense_blockscaled_gemm_persistent"
+# TEST_SCRIPT="dense_gemm_persistent"
+TEST_SCRIPT="dense_blockscaled_gemm_persistent"
 # TEST_SCRIPT="grouped_gemm"
 # TEST_SCRIPT="fmha"
 
@@ -63,7 +63,7 @@ elif [[ $TEST_SCRIPT == "dense_blockscaled_gemm_persistent" ]]; then
     --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16        \
     --c_dtype Float16                                                        \
     --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
-    --mnkl 8192,8192,1024,1
+    --mnkl $M,$K,$N,1
     "
 elif [[ $TEST_SCRIPT == "grouped_gemm" ]]; then
     SCRIPT_CMD="
