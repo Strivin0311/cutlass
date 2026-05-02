@@ -220,12 +220,15 @@ class DenseGemmPersistentKernelSm100:
         self.buffer_align_bytes = 1024
         
         # Set specialized warp ids
-        self.epilog_warp_id = (0, 1, 2, 3)
-        self.mma_warp_id = 4
-        self.tma_warp_id = 5
+        self.epilog_warp_id = (0, 1, 2, 3) # the first warp group forms the epilogue consumer warps
+        self.mma_warp_id = 4 # a single warp for umma consumer / acc producer
+        self.tma_warp_id = 5 # a single warp for tma producer
         self.threads_per_cta = 32 * len( # 6 warps = 192 threads
             (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
         )
+        
+        self.epilogue_threads = 32 * len(self.epilog_warp_id)
+        self.tmem_ptr_read_threads = 32 + self.epilogue_threads  # all threads in mma warp and epilogue warps can read tmem ptr from shared memory
         
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
@@ -963,6 +966,9 @@ class DenseGemmPersistentKernelSm100:
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1048,10 +1054,9 @@ class DenseGemmPersistentKernelSm100:
             # Bar sync for retrieve tensor memory ptr from shared mem
             # NOTE: both umma consumer warp and epilogue warps need to sync here before retriving the tmem ptr,
             # to ensure its visibility, allocated by the first epilogue warp and stored in shared mem
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
-                number_of_threads=tmem_ptr_read_threads,
+                number_of_threads=self.tmem_ptr_read_threads,
             )
 
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -1077,6 +1082,9 @@ class DenseGemmPersistentKernelSm100:
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1188,10 +1196,9 @@ class DenseGemmPersistentKernelSm100:
             # Bar sync for retrieve tensor memory ptr from shared memory
             # NOTE: both umma consumer warp and epilogue warps need to sync here before retriving the tmem ptr,
             # to ensure its visibility, allocated by the first epilogue warp and stored in shared mem
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
-                number_of_threads=tmem_ptr_read_threads,
+                number_of_threads=self.tmem_ptr_read_threads,
             )
 
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -1217,7 +1224,7 @@ class DenseGemmPersistentKernelSm100:
             # tiled_copy_t2r: 
             #   layout_src_tv: (32,1024):(0,1) | layout_src_tv_tiled: ((32,4),((32,32),1)):((0,1),((128,4),0))
             #   layout_dst_tv: (32,32):(32,1) | layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))
-            # tTR_tAcc: (((32,32),1),1,1,1,4):(((1,65536),0),0,0,0,32)
+            # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, EPI_STAGES=2):(((1,65536),0),0,0,0,32,128)
             # tTR_rAcc: ((32,1),1,1):((1,0),0,0)
             epi_tidx = tidx
             (
@@ -1236,7 +1243,7 @@ class DenseGemmPersistentKernelSm100:
                 #   layout_src_tv: (1,1):(0,0) | layout_src_tv_tiled: ((32,4),(1,32)):((4,1),(0,128))
                 #   layout_dst_tv: (1,1):(0,0) | layout_dst_tv_tiled: ((32,4),(1,32)):((4,1),(0,128))
                 # tTR_rC: ((32,1),1,1):((1,0),0,0) | tRS_rC: ((1,32),1,1):((0,1),0,0)
-                # tRS_sC: (R2S=(1,32),1,1,epi_stages=(1,2)):((0,1),0,0,(0,4096))
+                # tRS_sC: (R2S=(1,32), 1,1, epi_stages=(1,4)):((0,1),0,0,(0,4096))
                 # tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype) # deprecated API
                 tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype) # new API, the bf16 version of tTR_rAcc
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
@@ -1245,7 +1252,7 @@ class DenseGemmPersistentKernelSm100:
                 
                 # Make S2G TMA tiled copy
                 # bSG_sC: (TMA=(4096,1), epi_stages=(1,4)):((1,0),(0,4096))
-                # bSG_gC_partitioned: (TMA=((32,128),1),EPI_M=1, EPI_N=4, RestM=8, RestN=32, RestL=1):(((1@0,1@1),0),0,32@0,256@1,128@0,1@2)
+                # bSG_gC_partitioned: (TMA=((32,128),1),EPI_M=1,EPI_N=4,RestM=8,RestN=32,RestL=1):(((1@0,1@1),0),0,32@0,256@1,128@0,1@2)
                 (
                     tma_atom_c,
                     bSG_sC,
@@ -1286,10 +1293,11 @@ class DenseGemmPersistentKernelSm100:
             # Make S2G TMA store pipeline
             c_pipeline = None
             if const_expr(self.use_tma_store):
-                # Threads/warps participating in tma store pipeline
+                # NOTE: the `c_producer_group` is only a dummy placeholder, no matter waht the arguments are
+                # and we need to manually bar sync the participating threads
                 c_producer_group = pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
-                    size=32 * len(self.epilog_warp_id),
+                    size=self.epilogue_threads,
                 )
                 c_pipeline = pipeline.PipelineTmaStore.create(
                     num_stages=self.num_c_stage,
@@ -1300,11 +1308,14 @@ class DenseGemmPersistentKernelSm100:
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
-                cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_mnl = (
+                cur_tile_coord = work_tile.tile_idx # block coord
+                mma_tile_coord_mnl = ( # cluster coord
                     cur_tile_coord[0] // self.atom_thr_size,
                     cur_tile_coord[1],
                     cur_tile_coord[2],
@@ -1317,12 +1328,13 @@ class DenseGemmPersistentKernelSm100:
                 tTR_gC = None
                 if const_expr(self.use_tma_store):
                     # ((ATOM_V, REST_V), EPI_M, EPI_N)
+                    # (TMA=((32,128),1),EPI_M=1, EPI_N=4)
                     bSG_gC = bSG_gC_partitioned[
                         (
                             None,
                             None,
                             None,
-                            *mma_tile_coord_mnl,
+                            *mma_tile_coord_mnl, # slice RestM8 and RestN32 and RestL1 idx
                         )
                     ]
                 else:
@@ -1334,31 +1346,34 @@ class DenseGemmPersistentKernelSm100:
                             None,
                             None,
                             None,
-                            *mma_tile_coord_mnl,
+                            *mma_tile_coord_mnl, # slice RestM8 and RestN32 and RestL1 idx
                         )
                     ]
 
                 # Set tensor memory buffer for current tile
-                # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+                # (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4)
                 tTR_tAcc = tTR_tAcc_base[
                     (None, None, None, None, None, acc_consumer_state.index)
                 ]
 
-                # /////////////////////////////////////////////////////////////////////////////
-                #  Wait for accumulator buffer full
-                # /////////////////////////////////////////////////////////////////////////////
+                # Wait for the first acc full mbar to be arrived by the epilogue producer only by the leader CTA
+                # NOTE: we don't need to reset the count
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
+                # Group the EPI_M and EPI_N modes together
+                # tTR_tAcc: (T2R=((T2R_COLS=32, T2R_ROWS=32),1), T2R_M=1,T2R_N=1, (EPI_M, EPI_N)=(1,4))
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 if const_expr(self.use_tma_store):
+                    # bSG_gC: ((ATOM_V, REST_V)=((32,128),1), (EPI_M, EPI_N)=(1,4))
                     bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
                 else:
+                    # tTR_gC: (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
                     tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
 
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Store accumulator to global memory in subtiles
                 # /////////////////////////////////////////////////////////////////////////////
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3]) # EPI_M x EPI_N = 4
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
                 if const_expr(self.debug_print):
@@ -1368,6 +1383,7 @@ class DenseGemmPersistentKernelSm100:
                         cute.printf("[Epilog warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
                         cute.printf("[Epilog warp] tTR_tAcc (post-group): {}", tTR_tAcc)
                         cute.printf("[Epilog warp] subtile_cnt: {}", subtile_cnt)
+                        cute.printf("[Epilog warp] num_prev_subtiles: {}", num_prev_subtiles)
                         if const_expr(self.use_tma_store):
                             cute.printf("[Epilog warp] bSG_gC (post-group): {}", bSG_gC)
                         else:
@@ -1375,107 +1391,109 @@ class DenseGemmPersistentKernelSm100:
                         cute.printf("")
 
                 for subtile_idx in cutlass.range(subtile_cnt):
-                    # /////////////////////////////////////////////////////////////////////////////
-                    #  Load accumulator from tensor memory buffer to register
-                    # /////////////////////////////////////////////////////////////////////////////
+                    # T2R copy to store accumulator from tmem to rmem
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     if const_expr(self.use_tma_store):
-                        # /////////////////////////////////////////////////////////////////////////////
-                        #  Convert to C type
-                        # /////////////////////////////////////////////////////////////////////////////
+                        # Perform epilogue op on accumulator and convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tRS_rC.store(acc_vec)
 
-                        # /////////////////////////////////////////////////////////////////////////////
-                        #  Store C to shared memory
-                        # /////////////////////////////////////////////////////////////////////////////
-                        c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
+                        # R2S copy to store C from rmem to smem
+                        # NOTE: we need to plus `num_prev_subtiles` to `subtile_idx` to get the correct stage index in the pipeline
+                        # TODO(REVIEW): maybe it's better to add a `t2r_consumer_state` ?
+                        c_stage_idx = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                         cute.copy(
                             tiled_copy_r2s,
                             tRS_rC,
-                            tRS_sC[(None, None, None, c_buffer)],
+                            tRS_sC[(None, None, None, c_stage_idx)],
                         )
-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+                        
+                        # Fence and barrier all the epilogue threads
+                        # to make sure shared memory store is visible to TMA store
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
                             space=cute.arch.SharedSpace.shared_cta,
                         )
-                        epilog_threads = 32 * len(self.epilog_warp_id)
                         cute.arch.barrier(
                             barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
+                            number_of_threads=self.epilogue_threads,
                         )
 
-                        # /////////////////////////////////////////////////////////////////////////////
-                        #  TMA store C to global memory
-                        # /////////////////////////////////////////////////////////////////////////////
-                        if warp_idx == self.epilog_warp_id[0]:
+                        # S2G TMA store C from smem to gmem
+                        if warp_idx == self.epilog_warp_id[0]: # only the first epilogue warp is responsible to issue TMA store
                             cute.copy(
                                 tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
+                                bSG_sC[(None, c_stage_idx)],
                                 bSG_gC[(None, subtile_idx)],
                             )
-                            # Fence and barrier to make sure shared memory store is visible to TMA store
-                            c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
-                        cute.arch.barrier(
+                            
+                            c_pipeline.producer_commit() # `cp.async.bulk.commit_group`
+                            c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1)` 
+                        
+                        cute.arch.barrier( # wait warp0 before next iteration
                             barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=epilog_threads,
+                            number_of_threads=self.epilogue_threads,
                         )
                     else:
-                        # /////////////////////////////////////////////////////////////////////////////
-                        #  Convert to C type
-                        # /////////////////////////////////////////////////////////////////////////////
+                        # Perform epilogue op on accumulator and convert to C type
                         acc_vec = tTR_rAcc.load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tTR_rC.store(acc_vec)
 
-                        # /////////////////////////////////////////////////////////////////////////////
-                        #  Store C to global memory
-                        # /////////////////////////////////////////////////////////////////////////////
+                        # R2G copy to store C from rmem to gmem
                         cute.copy(
                             simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)]
                         )
 
-                # /////////////////////////////////////////////////////////////////////////////
-                #  Async arrive accumulator buffer empty
-                # /////////////////////////////////////////////////////////////////////////////
+                # Arrive the acc empty mbar
+                # NOTE: acc_pipeline is an instance of `PipelineUmmaAsync`, 
+                # whose `consumer_release` is inherited from simple `PipelineAsync`,
+                # which does not elect the issuing thread automatically like `PipelineTmaAsync`,
+                # and whose empty sync object's type is just a simple `AsyncThread`, not the specific `TCGen05Mma` like ab_pipeline,
+                # all in all, we have to manually elect one thread to arrive the mbarrier for acc_pipeline
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
-                # /////////////////////////////////////////////////////////////////////////////
-                #  Advance to next tile
-                # /////////////////////////////////////////////////////////////////////////////
+                # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Dealloc the tensor memory buffer
             # /////////////////////////////////////////////////////////////////////////////
-            if warp_idx == self.epilog_warp_id[0]:
+            if warp_idx == self.epilog_warp_id[0]: # only the first epilogue warp is responsible to deallocate tmem
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilog_threads = 32 * len(self.epilog_warp_id)
+            
             cute.arch.barrier(
-                barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
+                barrier_id=self.epilog_sync_bar_id,
+                number_of_threads=self.epilogue_threads
             )
-            if warp_idx == self.epilog_warp_id[0]:
+            
+            if warp_idx == self.epilog_warp_id[0]: # only the first epilogue warp is responsible to deallocate tmem
                 if use_2cta_instrs:
+                    # Arrive at the peer CTA's dealloc mbar
+                    # by mapping the peer's mbar addr using `mapa.shared::cluster`
                     cute.arch.mbarrier_arrive(
-                        tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1
+                        tmem_dealloc_mbar_ptr,
+                        peer_cta_rank_in_cluster=cta_rank_in_cluster ^ 1 # peer rank
                     )
+                    # Wait for self CTA's dealloc mbar to be arrived by the peer CTA
                     cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+                
+                # Deallocate the tmem buffer using `tcgen05.dealloc.cta_group::2.sync.aligned.b32`
                 cute.arch.dealloc_tmem(
                     tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
                 )
+            
             # /////////////////////////////////////////////////////////////////////////////
             #  Wait for C store complete
             # /////////////////////////////////////////////////////////////////////////////
             if const_expr(self.use_tma_store):
-                c_pipeline.producer_tail()
+                c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0)`
 
     def epilog_tmem_copy_and_partition(
         self,
@@ -1514,11 +1532,13 @@ class DenseGemmPersistentKernelSm100:
             epi_tile,
             use_2cta_instrs,
         )
+        
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
         tAcc_epi = cute.flat_divide(
             tAcc[((None, None), 0, 0, None)],
             epi_tile,
         )
+        
         # (EPI_TILE_M, EPI_TILE_N)
         tiled_copy_t2r = tcgen05.make_tmem_copy(
             copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)]
@@ -1532,12 +1552,16 @@ class DenseGemmPersistentKernelSm100:
         gC_mnl_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
+        
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
+        
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        # tTR_rAcc = cute.make_fragment( # deprecated API
+        tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
+        
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_copy_and_partition(
@@ -1615,6 +1639,7 @@ class DenseGemmPersistentKernelSm100:
         gC_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
+        
         if const_expr(self.use_tma_store):
             tma_atom_c = atom
             sC_for_tma_partition = cute.group_modes(sC, 0, 2)
@@ -1635,7 +1660,8 @@ class DenseGemmPersistentKernelSm100:
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTR_gC = thr_copy_t2r.partition_D(gC_epi)
             # (T2R, T2R_M, T2R_N)
-            tTR_rC = cute.make_fragment(
+            # tTR_rC = cute.make_fragment( # deprecated API
+            tTR_rC = cute.make_rmem_tensor(
                 tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.c_dtype
             )
             simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)

@@ -1192,7 +1192,7 @@ class PipelinedDenseGemmKernelSm100:
 
         # tTR_tAcc: (T2R=((T2R_COLS=32, T2R_ROWS=32),1), T2R_M=1, T2R_N=1, (EPI_M, EPI_N)=(1,4))
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3]) # EPI_M x EPI_N = 4
         if cutlass.const_expr(self.use_tma_store):
             # bSG_gC: ((ATOM_V, REST_V)=((32,128),1), (EPI_M, EPI_N)=(1,4))
             bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
@@ -1256,7 +1256,6 @@ class PipelinedDenseGemmKernelSm100:
                         bSG_gC[(None, subtile_idx)],
                     )
                     
-                    # Fence and barrier to make sure TMA store is completed to recollect C buffer
                     c_pipeline.producer_commit() # `cp.async.bulk.commit_group`
                     c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1)` 
                 
