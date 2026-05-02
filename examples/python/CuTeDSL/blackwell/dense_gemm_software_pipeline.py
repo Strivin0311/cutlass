@@ -476,6 +476,7 @@ class PipelinedDenseGemmKernelSm100:
             atom_thr_id=self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+        a_smem_size = cute.cosize(self.a_smem_layout_staged.outer)
         
         # tma_atom_a: Src: (2,8192):(8192,1) | Dst: (2,8192):(8192,1), where CTA_tileM128 x tileK64 = 8192
         # tma_tensor_a: (pM=2048, pK=1024,1):(1@1,1@0,1@2)
@@ -499,6 +500,7 @@ class PipelinedDenseGemmKernelSm100:
             atom_thr_id=self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        b_smem_size = cute.cosize(self.b_smem_layout_staged.outer)
         
         # tma_atom_b: Src: (2,4096):(4096,1) | Dst: (2,4096):(4096,1), where CTA_tileN64 x tileK64 = 4096
         # tma_tensor_b: (pN=4096, pK=1024,1):(1@1,1@0,1@2)
@@ -560,25 +562,16 @@ class PipelinedDenseGemmKernelSm100:
             # tmem accumulation full mbar for each acc stage
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             
-           # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
+            # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
             tmem_dealloc_mbar_ptr: cutlass.Int64
             
             # the smem buffer to hold the allocated tmem address
             tmem_holding_smem_buf: cutlass.Int32
             
-            # (EPI_TILE_M, EPI_TILE_N, STAGE)
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype,
-                    c_smem_size,
-                ],
-                self.buffer_align_bytes,
-            ]
-            
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.a_dtype, a_smem_size,
                 ],
                 self.buffer_align_bytes,
             ]
@@ -586,7 +579,15 @@ class PipelinedDenseGemmKernelSm100:
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.b_dtype, b_smem_size,
+                ],
+                self.buffer_align_bytes,
+            ]
+            
+            # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype, c_smem_size,
                 ],
                 self.buffer_align_bytes,
             ]

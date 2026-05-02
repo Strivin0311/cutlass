@@ -450,6 +450,7 @@ class DenseGemmPersistentKernelSm100:
             self.cluster_shape_mn, self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+        a_smem_size = cute.cosize(self.a_smem_layout_staged.outer)
         
         # tma_atom_a: Src: (2,8192):(8192,1) | Dst: (2,8192):(8192,1), where CTA_tileM128 x tileK64 = 8192
         # tma_tensor_a: (pM=2048,pK=1024,1):(1@1,1@0,1@2)
@@ -472,6 +473,7 @@ class DenseGemmPersistentKernelSm100:
             self.cluster_shape_mn, self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        b_smem_size = cute.cosize(self.b_smem_layout_staged.outer)
         
         # tma_atom_b: Src: (2,4096):(4096,1) | Dst: (2,4096):(4096,1), where CTA_tileN64 x tileK64 = 4096
         # tma_tensor_b: (pN=4096, pK=1024,1):(1@1,1@0,1@2)
@@ -531,31 +533,38 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         @cute.struct
         class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
-            ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+            # mainloop full/empty mbar array ptrs for each ab stage
+            ab_full_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            
+            # tmem accumulation full/empty mbar for each acc stage
+            acc_full_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
+            
+            # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
             tmem_dealloc_mbar_ptr: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-            # (EPI_TILE_M, EPI_TILE_N, STAGE)
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype,
-                    c_smem_size,
-                ],
-                self.buffer_align_bytes,
-            ]
+            
+            # the smem buffer to hold the allocated tmem address
+            tmem_holding_smem_buf: cutlass.Int32
+            
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.a_dtype, a_smem_size,
                 ],
                 self.buffer_align_bytes,
             ]
+            
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged.outer)
+                    self.b_dtype, b_smem_size,
+                ],
+                self.buffer_align_bytes,
+            ]
+            
+            # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype, c_smem_size,
                 ],
                 self.buffer_align_bytes,
             ]
@@ -683,7 +692,9 @@ class DenseGemmPersistentKernelSm100:
         storage = smem.allocate(self.shared_storage)
 
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_smem_buf = storage.tmem_holding_smem_buf
+        ab_full_empty_mbar_ptr = storage.ab_full_empty_mbar_ptr.data_ptr()
+        acc_full_empty_mbar_ptr = storage.acc_full_empty_mbar_ptr.data_ptr()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Initialize mainloop ab_pipeline (barrier) and states
@@ -694,7 +705,7 @@ class DenseGemmPersistentKernelSm100:
             pipeline.Agent.Thread, num_tma_producer
         )
         ab_pipeline = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
+            barrier_storage=ab_full_empty_mbar_ptr,
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
@@ -713,7 +724,7 @@ class DenseGemmPersistentKernelSm100:
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
+            barrier_storage=acc_full_empty_mbar_ptr,
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
@@ -1023,7 +1034,7 @@ class DenseGemmPersistentKernelSm100:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
+                ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1158,7 +1169,7 @@ class DenseGemmPersistentKernelSm100:
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.alloc_tmem(
                     self.num_tmem_alloc_cols,
-                    tmem_holding_buf,
+                    tmem_holding_smem_buf,
                     is_two_cta=use_2cta_instrs,
                 )
 
@@ -1177,7 +1188,7 @@ class DenseGemmPersistentKernelSm100:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
+                ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
