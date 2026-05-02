@@ -223,12 +223,10 @@ class DenseGemmPersistentKernelSm100:
         self.epilog_warp_id = (0, 1, 2, 3) # the first warp group forms the epilogue consumer warps
         self.mma_warp_id = 4 # a single warp for umma consumer / acc producer
         self.tma_warp_id = 5 # a single warp for tma producer
-        self.threads_per_cta = 32 * len( # 6 warps = 192 threads
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
-        )
         
         self.epilogue_threads = 32 * len(self.epilog_warp_id)
         self.tmem_ptr_read_threads = 32 + self.epilogue_threads  # all threads in mma warp and epilogue warps can read tmem ptr from shared memory
+        self.threads_per_cta = 32 + self.tmem_ptr_read_threads
         
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
@@ -247,9 +245,11 @@ class DenseGemmPersistentKernelSm100:
             print(f"  cluster_shape_mn: {self.cluster_shape_mn=}")
             print(f"  use_tma_store: {self.use_tma_store=}")
             print(f"  CTA group for MMA: {self.cta_group=}")
-            print(f"  threads_per_cta: {self.threads_per_cta=}")
             print(f"  warp ids: {self.epilog_warp_id=}, {self.mma_warp_id=}, {self.tma_warp_id=}")
             print(f"  barrier ids: {self.cta_sync_bar_id=}, {self.epilog_sync_bar_id=}, {self.tmem_ptr_sync_bar_id=}")
+            print(f"  epilogue_threads: {self.epilogue_threads=}")
+            print(f"  tmem_ptr_read_threads: {self.tmem_ptr_read_threads=}")
+            print(f"  threads_per_cta: {self.threads_per_cta=}")
             print(f"  smem_capacity: {self.smem_capacity=} bytes")
             print(f"  Buffer alignment (bytes): {self.buffer_align_bytes=}")
 

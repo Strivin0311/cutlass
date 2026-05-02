@@ -28,6 +28,7 @@
 
 import argparse
 import functools
+import os
 from typing import List, Type, Union
 from inspect import isclass
 
@@ -41,6 +42,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.torch as cutlass_torch
+from cutlass import const_expr
 
 """
 A grouped GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -88,6 +90,9 @@ there are also the following constrains:
 """
 
 
+DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+
+
 class GroupedGemmPersistentKernelSm100:
     def __init__(
         self,
@@ -96,6 +101,7 @@ class GroupedGemmPersistentKernelSm100:
         mma_tiler_mn: tuple[int, int],
         cluster_shape_mn: tuple[int, int],
         tensormap_update_mode: utils.TensorMapUpdateMode = utils.TensorMapUpdateMode.SMEM,
+        debug_print: bool = False,
     ):
         """Initializes the configuration for a Blackwell grouped GEMM kernel.
 
@@ -160,6 +166,23 @@ class GroupedGemmPersistentKernelSm100:
         self.tensormap_ab_init_bar_id = 4
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tma_load_bytes = 0
+
+        self.debug_print = debug_print
+
+        if const_expr(self.debug_print):
+            print()
+            print(f"Initialized GroupedGemmPersistentKernelSm100 with configurations:")
+            print(f"  acc_dtype: {self.acc_dtype=}")
+            print(f"  use_2cta_instrs: {self.use_2cta_instrs=}")
+            print(f"  mma_tiler: {self.mma_tiler=}")
+            print(f"  cluster_shape_mn: {self.cluster_shape_mn=}")
+            print(f"  CTA group for MMA: {self.cta_group=}")
+            print(f"  tensormap_update_mode: {self.tensormap_update_mode=}")
+            print(f"  delegate_tensormap_ab_init: {self.delegate_tensormap_ab_init=}")
+            print(f"  threads_per_cta: {self.threads_per_cta=}")
+            print(f"  warp ids: {self.epilog_warp_id=}, {self.mma_warp_id=}, {self.tma_warp_id=}")
+            print(f"  barrier ids: {self.cta_sync_bar_id=}, {self.epilog_sync_bar_id=}, {self.tmem_ptr_sync_bar_id=}, {self.tensormap_ab_init_bar_id=}")
+            print(f"  smem_capacity: {self.smem_capacity=} bytes")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -230,6 +253,7 @@ class GroupedGemmPersistentKernelSm100:
             self.c_layout,
             self.smem_capacity,
             self.occupancy,
+            debug_print=self.debug_print,
         )
 
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -282,6 +306,32 @@ class GroupedGemmPersistentKernelSm100:
         self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
             tiled_mma, self.mma_tiler, self.num_acc_stage
         )
+
+        if const_expr(self.debug_print):
+            print()
+            print(f"Setup attributes dependent on GEMM inputs:")
+            print(f"  MMA tiler (M, N, K): {self.mma_tiler=}")
+            print(f"  CTA tile shape (M, N, K): {self.cta_tile_shape_mnk=}")
+            print(f"  Cluster tile shape (M, N, K): {self.cluster_tile_shape_mnk=}")
+            print(f"  Cluster layout: {self.cluster_layout_vmnk=}")
+            print(f"  Number of multicast CTAs for A: {self.num_mcast_ctas_a=}")
+            print(f"  Number of multicast CTAs for B: {self.num_mcast_ctas_b=}")
+            print(f"  Epilogue tile shape: {self.epi_tile=}")
+            print(f"  Number of accumulator stages: {self.num_acc_stage=}")
+            print(f"  Number of A/B stages: {self.num_ab_stage=}")
+            print(f"  Number of epi stages: {self.num_epi_stage=}")
+            print(f"  Number of tmem alloc cols: {self.num_tmem_alloc_cols=}")
+            print()
+
+            print()
+            print(f"A SMEM layout (a_smem_layout_staged) (MMA,MMA_M,MMA_K,STAGE): {self.a_smem_layout_staged}")
+            print(f"B SMEM layout (b_smem_layout_staged) (MMA,MMA_N,MMA_K,STAGE): {self.b_smem_layout_staged}")
+            print(f"Epi SMEM layout (epi_smem_layout_staged) (EPI_M,EPI_N,STAGE): {self.epi_smem_layout_staged}")
+            print()
+
+            print()
+            print("tiled_mma: ", tiled_mma, f"\n\nshape_mnk: {tiled_mma.shape_mnk}", f"thr_id.shape: {tiled_mma.thr_id.shape}")
+            print()
 
     @cute.jit
     def __call__(
@@ -355,7 +405,9 @@ class GroupedGemmPersistentKernelSm100:
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
-        # Setup TMA load for A
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA load for A
+        # /////////////////////////////////////////////////////////////////////////////
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -369,7 +421,9 @@ class GroupedGemmPersistentKernelSm100:
             self.cluster_layout_vmnk.shape,
         )
 
-        # Setup TMA load for B
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA load for B
+        # /////////////////////////////////////////////////////////////////////////////
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
@@ -387,7 +441,9 @@ class GroupedGemmPersistentKernelSm100:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
-        # Setup TMA store for C
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA store for C
+        # /////////////////////////////////////////////////////////////////////////////
         tma_atom_c = None
         tma_tensor_c = None
         c_cta_v_layout = cute.composition(
@@ -405,6 +461,9 @@ class GroupedGemmPersistentKernelSm100:
             total_num_clusters, self.cluster_shape_mn, max_active_clusters
         )
 
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Define shared storage for kernel
+        # /////////////////////////////////////////////////////////////////////////////
         self.buffer_align_bytes = 1024
         self.size_tensormap_in_i64 = (
             0
@@ -414,7 +473,6 @@ class GroupedGemmPersistentKernelSm100:
             // 8
         )
 
-        # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
             tensormap_buffer: cute.struct.MemRange[
@@ -451,7 +509,33 @@ class GroupedGemmPersistentKernelSm100:
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
+        if const_expr(self.debug_print):
+            print()
+            print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.a_major_mode=}, {self.b_major_mode=}, {self.c_layout=}")
+            print(f"{a_copy_size=}, {b_copy_size=}, {self.num_tma_load_bytes=}")
+            print(f"{self.tile_sched_params=}")
+            print()
+
+            print()
+            print("TMA A: a_op: ", a_op, "\ntma_atom_a: ", tma_atom_a)
+            print()
+            print("TMA B: b_op: ", b_op, "\ntma_atom_b: ", tma_atom_b)
+            print()
+            print("TMA C: tma_atom_c: ", tma_atom_c)
+            print()
+
+            cute.printf("")
+            cute.printf("tma_tensor_a: {}", tma_tensor_a)
+            cute.printf("")
+            cute.printf("tma_tensor_b: {}", tma_tensor_b)
+            cute.printf("")
+            cute.printf("tma_tensor_c: {}", tma_tensor_c)
+            cute.printf("")
+            cute.printf("grid: {}", grid)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Launch the kernel
+        # /////////////////////////////////////////////////////////////////////////////
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -508,9 +592,9 @@ class GroupedGemmPersistentKernelSm100:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-        #
-        # Prefetch tma desc
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Prefetch tma descriptor
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -518,9 +602,9 @@ class GroupedGemmPersistentKernelSm100:
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
-        # Setup cta/thread coordinates
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup cta/thread coordinates
+        # /////////////////////////////////////////////////////////////////////////////
         # Coord inside cluster
         bid = cute.arch.block_idx()
         mma_tile_coord_v = bid[0] % cute.size(tiled_mma.thr_id.shape)
@@ -534,9 +618,20 @@ class GroupedGemmPersistentKernelSm100:
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
-        # Alloc and init: tensormap buffer, a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        #
+        # used only for debug print
+        is_print_block = False  # DE-BUG
+        # is_print_block = (bid[0] == 0) and (bid[1] == 0) and (bid[2] == 0)
+        is_print_thread = (tidx == 127) and is_print_block
+
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("tidx: {}, warp_idx: {}, block_idx: ({}, {}, {})", tidx, warp_idx, bid[0], bid[1], bid[2])
+                cute.printf("mma_tile_coord_v: {}, is_leader_cta: {}, cta_rank_in_cluster: {}", mma_tile_coord_v, is_leader_cta, cta_rank_in_cluster)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Alloc and init: tensormap buffer, a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
+        # /////////////////////////////////////////////////////////////////////////////
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
@@ -592,9 +687,9 @@ class GroupedGemmPersistentKernelSm100:
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
-        #
-        # Setup smem tensor A/B/C
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup smem tensor A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
@@ -608,9 +703,16 @@ class GroupedGemmPersistentKernelSm100:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
-        #
-        # Compute multicast mask for A/B buffer full and empty
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("sA layout: {}", sA.layout)
+                cute.printf("sB layout: {}", sB.layout)
+                cute.printf("sC layout: {}", sC.layout)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Compute multicast mask for A/B buffer full and empty
+        # /////////////////////////////////////////////////////////////////////////////
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         ab_empty_mcast_mask = None
@@ -645,9 +747,15 @@ class GroupedGemmPersistentKernelSm100:
                 )
             )
 
-        #
-        # Local_tile partition global tensors
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("a_full_mcast_mask: {}, b_full_mcast_mask: {}, ab_empty_mcast_mask: {}, acc_full_mcast_mask: {}",
+                    a_full_mcast_mask, b_full_mcast_mask, ab_empty_mcast_mask, acc_full_mcast_mask)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Local_tile partition global tensors
+        # /////////////////////////////////////////////////////////////////////////////
         # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
@@ -661,9 +769,16 @@ class GroupedGemmPersistentKernelSm100:
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
 
-        #
-        # Partition global tensor for TiledMMA_A/B/C
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("gA_mkl layout: {}", gA_mkl.layout)
+                cute.printf("gB_nkl layout: {}", gB_nkl.layout)
+                cute.printf("gC_mnl layout: {}", gC_mnl.layout)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition global tensor for TiledMMA_A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
@@ -672,9 +787,16 @@ class GroupedGemmPersistentKernelSm100:
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
-        #
-        # Partition global/shared tensor for load A, B with TMA
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("tCgA layout: {}", tCgA.layout)
+                cute.printf("tCgB layout: {}", tCgB.layout)
+                cute.printf("tCgC layout: {}", tCgC.layout)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition global/shared tensor for load A, B with TMA
+        # /////////////////////////////////////////////////////////////////////////////
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -701,9 +823,18 @@ class GroupedGemmPersistentKernelSm100:
             cute.group_modes(tCgB, 0, 3),
         )
 
-        #
-        # Partition shared/tensor memory tensor for TiledMMA_A/B/C
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("a_cta_layout: {}, b_cta_layout: {}", a_cta_layout, b_cta_layout)
+                cute.printf("tAsA layout: {}", tAsA.layout)
+                cute.printf("tAgA layout: {}", tAgA.layout)
+                cute.printf("tBsB layout: {}", tBsB.layout)
+                cute.printf("tBgB layout: {}", tBgB.layout)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Partition shared/tensor memory tensor for TiledMMA_A/B/C
+        # /////////////////////////////////////////////////////////////////////////////
         # (MMA, MMA_M, MMA_K, STAGE)
         tCrA = tiled_mma.make_fragment_A(sA)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -715,9 +846,16 @@ class GroupedGemmPersistentKernelSm100:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        #
-        # Cluster wait before tensor memory alloc
-        #
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("tCrA layout: {}", tCrA.layout)
+                cute.printf("tCrB layout: {}", tCrB.layout)
+                cute.printf("tCtAcc_fake layout: {}", tCtAcc_fake.layout)
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Cluster wait before tensor memory alloc
+        # /////////////////////////////////////////////////////////////////////////////
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
         else:
@@ -725,9 +863,9 @@ class GroupedGemmPersistentKernelSm100:
                 barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta
             )
 
-        #
-        # Get tensormap buffer address
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Get tensormap buffer address
+        # /////////////////////////////////////////////////////////////////////////////
         grid_dim = cute.arch.grid_dim()
         tensormap_workspace_idx = (
             bid[2] * grid_dim[1] * grid_dim[0] + bid[1] * grid_dim[0] + bid[0]
@@ -757,9 +895,9 @@ class GroupedGemmPersistentKernelSm100:
             tensormap_b_init_ptr = tensormap_b_ptr
             tensormap_c_init_ptr = tensormap_c_ptr
 
-        #
-        # Specialized TMA load warp
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Specialized TMA load warp
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.tma_warp_id:
             # Initialize tensormaps for A, B
             if cutlass.const_expr(self.delegate_tensormap_ab_init == False):
@@ -769,9 +907,9 @@ class GroupedGemmPersistentKernelSm100:
                 tensormap_manager.init_tensormap_from_atom(
                     tma_atom_b, tensormap_b_init_ptr, self.tma_warp_id
                 )
-            #
-            # Persistent tile scheduling loop
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop (TMA warp)
+            # /////////////////////////////////////////////////////////////////////////////
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, bid, grid_dim
             )
@@ -848,9 +986,9 @@ class GroupedGemmPersistentKernelSm100:
                     0,
                 )
 
-                #
-                # Slice to per mma tile index
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Slice to per mma tile index (TMA warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
@@ -859,6 +997,14 @@ class GroupedGemmPersistentKernelSm100:
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
+
+                if const_expr(self.debug_print):
+                    if is_print_thread:
+                        cute.printf("")
+                        cute.printf("[TMA warp] mma_tile_coord_mnl: ({}, {}, {}), cur_group_idx: {}, cur_k_tile_cnt: {}",
+                            mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2], cur_group_idx, cur_k_tile_cnt)
+                        cute.printf("tAgA_slice layout: {}", tAgA_slice.layout)
+                        cute.printf("tBgB_slice layout: {}", tBgB_slice.layout)
 
                 num_prev_k_blk = total_k_tile_cnt
                 total_k_tile_cnt += cur_k_tile_cnt
@@ -878,9 +1024,9 @@ class GroupedGemmPersistentKernelSm100:
                 if is_group_changed:
                     tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
-                #
-                # Tma load loop
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Tma load loop
+                # /////////////////////////////////////////////////////////////////////////////
                 for k_tile in cutlass.range(0, cur_k_tile_cnt, 1, unroll=1):
                     tma_wr_k_tile_next = tma_wr_k_tile + 1
                     smem_wr_buffer_next = (
@@ -942,14 +1088,16 @@ class GroupedGemmPersistentKernelSm100:
                     smem_wr_buffer = smem_wr_buffer_next
                     tma_wr_ab_empty_phase = tma_wr_ab_empty_phase_next
 
-                # Advance to next tile
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Advance to next tile (TMA warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
                 last_group_idx = cur_group_idx
 
-        #
-        # Specialized MMA warp
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Specialized MMA warp
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             # initialize tensormap A, B for TMA warp
             if cutlass.const_expr(self.delegate_tensormap_ab_init):
@@ -981,9 +1129,9 @@ class GroupedGemmPersistentKernelSm100:
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
-            #
-            # Persistent tile scheduling loop
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop (MMA warp)
+            # /////////////////////////////////////////////////////////////////////////////
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, bid, grid_dim
             )
@@ -1031,9 +1179,9 @@ class GroupedGemmPersistentKernelSm100:
                     mma_rd_ab_full_phase,
                 )
 
-                #
-                # Wait for accumulator buffer empty
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Wait for accumulator buffer empty (MMA warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 if is_leader_cta:
                     acc_empty_phase = (
                         tile_sched.num_tiles_executed // self.num_acc_stage % 2 ^ 1
@@ -1042,14 +1190,14 @@ class GroupedGemmPersistentKernelSm100:
                         acc_empty_mbar_ptr + acc_buf_idx, acc_empty_phase
                     )
 
-                #
-                # Reset the ACCUMULATE field for each tile
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Reset the ACCUMULATE field for each tile
+                # /////////////////////////////////////////////////////////////////////////////
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-                #
-                # Mma mainloop
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Mma mainloop
+                # /////////////////////////////////////////////////////////////////////////////
                 for k_tile in range(cur_k_tile_cnt):
                     mma_rd_k_tile_next = cutlass.Int32(k_tile + 1)
                     smem_rd_buffer_next = (
@@ -1105,9 +1253,9 @@ class GroupedGemmPersistentKernelSm100:
                     smem_rd_buffer = smem_rd_buffer_next
                     mma_rd_ab_full_phase = mma_rd_ab_full_phase_next
 
-                #
-                # Async arrive accumulator buffer full
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Async arrive accumulator buffer full
+                # /////////////////////////////////////////////////////////////////////////////
                 if is_leader_cta:
                     with cute.arch.elect_one():
                         tcgen05.commit(
@@ -1116,15 +1264,15 @@ class GroupedGemmPersistentKernelSm100:
                             self.cta_group,
                         )
 
-                #
-                # Advance to next tile
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Advance to next tile (MMA warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-        #
-        # Specialized epilogue warps
-        #
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Specialized epilogue warps
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.mma_warp_id:
             # initialize tensorap for C
             tensormap_manager.init_tensormap_from_atom(
@@ -1140,18 +1288,18 @@ class GroupedGemmPersistentKernelSm100:
                     is_two_cta=use_2cta_instrs,
                 )
 
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Bar sync for retrieve tensor memory ptr from shared memory (epilog warp)
+            # /////////////////////////////////////////////////////////////////////////////
             tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
                 number_of_threads=tmem_ptr_read_threads,
             )
 
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Retrieve tensor memory ptr and make accumulator tensor (epilog warp)
+            # /////////////////////////////////////////////////////////////////////////////
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
@@ -1161,9 +1309,9 @@ class GroupedGemmPersistentKernelSm100:
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
             epi_tidx = tidx
-            #
-            # Partition for epilogue
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Partition for epilogue
+            # /////////////////////////////////////////////////////////////////////////////
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
@@ -1182,9 +1330,20 @@ class GroupedGemmPersistentKernelSm100:
                 bSG_gC_partitioned,
             ) = self.epilog_gmem_copy_and_partition(tma_atom_c, tCgC, epi_tile, sC)
 
-            #
-            # Persistent tile scheduling loop
-            #
+            if const_expr(self.debug_print):
+                if is_print_thread:
+                    cute.printf("")
+                    cute.printf("[epilog warp] tCtAcc_base layout: {}", tCtAcc_base.layout)
+                    cute.printf("tTR_tAcc_base layout: {}", tTR_tAcc_base.layout)
+                    cute.printf("tTR_rAcc layout: {}", tTR_rAcc.layout)
+                    cute.printf("tRS_rC layout: {}", tRS_rC.layout)
+                    cute.printf("tRS_sC layout: {}", tRS_sC.layout)
+                    cute.printf("bSG_sC layout: {}", bSG_sC.layout)
+                    cute.printf("bSG_gC_partitioned layout: {}", bSG_gC_partitioned.layout)
+
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop (epilog warp)
+            # /////////////////////////////////////////////////////////////////////////////
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, bid, grid_dim
             )
@@ -1242,9 +1401,9 @@ class GroupedGemmPersistentKernelSm100:
                 cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
                 total_k_tile_cnt += cur_k_tile_cnt
 
-                #
-                # Slice to per mma tile index
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Slice to per mma tile index (epilog warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 # ((ATOM_V, REST_V), EPI_M, EPI_N)
                 bSG_gC = bSG_gC_partitioned[
                     (
@@ -1260,9 +1419,9 @@ class GroupedGemmPersistentKernelSm100:
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_buf_idx)]
 
-                #
-                # Wait for accumulator buffer full
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Wait for accumulator buffer full (epilog warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 acc_full_phase = tile_sched.num_tiles_executed // self.num_acc_stage % 2
                 cute.arch.mbarrier_wait(acc_full_mbar_ptr + acc_buf_idx, acc_full_phase)
 
@@ -1272,26 +1431,35 @@ class GroupedGemmPersistentKernelSm100:
                 if is_group_changed:
                     if warp_idx == self.epilog_warp_id[0]:
                         tensormap_manager.fence_tensormap_update(tensormap_c_ptr)
-                #
-                # Store accumulator to global memory in subtiles
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Store accumulator to global memory in subtiles
+                # /////////////////////////////////////////////////////////////////////////////
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
+
+                if const_expr(self.debug_print):
+                    if is_print_thread:
+                        cute.printf("")
+                        cute.printf("[epilog warp] mma_tile_coord_mnl: ({}, {}, {}), subtile_cnt: {}, num_prev_subtiles: {}",
+                            mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2], subtile_cnt, num_prev_subtiles)
+                        cute.printf("tTR_tAcc layout: {}", tTR_tAcc.layout)
+                        cute.printf("bSG_gC layout: {}", bSG_gC.layout)
+
                 for subtile_idx in range(subtile_cnt):
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
+                    # /////////////////////////////////////////////////////////////////////////////
+                    #  Load accumulator from tensor memory buffer to register
+                    # /////////////////////////////////////////////////////////////////////////////
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    #
-                    # Convert to output type
-                    #
+                    # /////////////////////////////////////////////////////////////////////////////
+                    #  Convert to output type
+                    # /////////////////////////////////////////////////////////////////////////////
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     tRS_rC.store(acc_vec.to(self.c_dtype))
-                    #
-                    # Store C to shared memory
-                    #
+                    # /////////////////////////////////////////////////////////////////////////////
+                    #  Store C to shared memory
+                    # /////////////////////////////////////////////////////////////////////////////
                     epi_buffer = (num_prev_subtiles + subtile_idx) % self.num_epi_stage
                     cute.copy(
                         tiled_copy_r2s,
@@ -1308,9 +1476,9 @@ class GroupedGemmPersistentKernelSm100:
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
-                    #
-                    # store C to global memory with TMA
-                    #
+                    # /////////////////////////////////////////////////////////////////////////////
+                    #  Store C to global memory with TMA
+                    # /////////////////////////////////////////////////////////////////////////////
                     if warp_idx == self.epilog_warp_id[0]:
                         cute.copy(
                             tma_atom_c,
@@ -1329,25 +1497,25 @@ class GroupedGemmPersistentKernelSm100:
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
                     )
-                #
-                # Async arrive accumulator buffer empty
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Async arrive accumulator buffer empty
+                # /////////////////////////////////////////////////////////////////////////////
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive(
                         acc_empty_mbar_ptr + acc_buf_idx,
                         cta_rank_in_cluster // 2 * 2 if use_2cta_instrs else None,
                     )
 
-                #
-                # Advance to next tile
-                #
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Advance to next tile (epilog warp)
+                # /////////////////////////////////////////////////////////////////////////////
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
                 last_group_idx = cur_group_idx
 
-            #
-            # Dealloc the tensor memory buffer
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Dealloc the tensor memory buffer
+            # /////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
             epilog_threads = 32 * len(self.epilog_warp_id)
@@ -1364,9 +1532,9 @@ class GroupedGemmPersistentKernelSm100:
                     tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
                 )
 
-            #
-            # Wait a/b buffer empty
-            #
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Wait a/b buffer empty
+            # /////////////////////////////////////////////////////////////////////////////
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.mbarrier_wait(
                     (ab_empty_mbar_ptr + ((total_k_tile_cnt - 1) % self.num_ab_stage)),
@@ -1600,6 +1768,7 @@ class GroupedGemmPersistentKernelSm100:
         c_layout: utils.LayoutEnum,
         smem_capacity: int,
         occupancy: int,
+        debug_print: bool = False,
     ) -> tuple[int, int, int]:
         """Computes the number of stages for accumulator, A/B operands, and epilogue based on heuristics.
 
@@ -1675,6 +1844,19 @@ class GroupedGemmPersistentKernelSm100:
             - occupancy * (GroupedGemmPersistentKernelSm100.reserved_smem_bytes + epi_bytes)
         )
         num_epi_stage += remaining_smem // (occupancy * epi_bytes_per_stage)
+
+        if const_expr(debug_print):
+            print()
+            print("a_smem_layout_stage_one: ", a_smem_layout_stage_one)
+            print("b_smem_layout_staged_one: ", b_smem_layout_staged_one)
+            print("epi_smem_layout_staged_one: ", epi_smem_layout_staged_one)
+            print(f"Bytes per A/B stage: {ab_bytes_per_stage=}")
+            print(f"Bytes per epi stage: {epi_bytes_per_stage=}")
+            print(
+                f"Computed stages - AB stages: {num_ab_stage}, ACC stages: {num_acc_stage}, Epi stages: {num_epi_stage}"
+            )
+            print()
+
         return num_acc_stage, num_ab_stage, num_epi_stage
 
     @staticmethod
@@ -1958,6 +2140,7 @@ def run(
     iterations: int,
     skip_ref_check: bool,
     use_cold_l2: bool = False,
+    debug_print: bool = False,
     **kwargs,
 ):
     """Run grouped GEMM example with specified configurations.
@@ -2090,6 +2273,7 @@ def run(
         mma_tiler_mn,
         cluster_shape_mn,
         tensormap_update_mode,
+        debug_print=debug_print,
     )
 
     # layout (num_groups, 4):(4, 1)
@@ -2289,6 +2473,28 @@ def run(
         iterations=iterations,
     )
 
+    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
+    if profile_mode:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+        event_str = f"grouped_gemm ({num_groups} groups)"
+        iters, start, end = 10, 6, 9
+        args_gen = generate_tensors()
+        for i in range(iters):
+            switch_profile(iter_id=i, start=start, end=end)
+            with add_nvtx_event(event_str):
+                compiled_grouped_gemm(
+                    args_gen.args[0],
+                    args_gen.args[1],
+                    args_gen.args[2],
+                    args_gen.args[3],
+                    args_gen.args[4],
+                    args_gen.args[5],
+                    args_gen.args[6],
+                    current_stream,
+                )
+
     return exec_time  # Return execution time in microseconds
 
 
@@ -2423,7 +2629,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(2025)
 
-    run(
+    exec_time = run(
         args.num_groups,
         args.problem_sizes_mnkl,
         args.ab_dtype,
@@ -2441,5 +2647,6 @@ if __name__ == "__main__":
         args.iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+        debug_print=DEBUG_MODE,
     )
-    print("PASS")
+    print(f"PASS with execution time: {exec_time} ms")
