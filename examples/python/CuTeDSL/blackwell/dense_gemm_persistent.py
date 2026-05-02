@@ -308,8 +308,8 @@ class DenseGemmPersistentKernelSm100:
         )
 
         # Compute number of multicast CTAs for A/B
-        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2]) # along N dim
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1]) # along M dim
+        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2]) # 1, along N dim
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1]) # 1, along M dim
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
@@ -555,7 +555,6 @@ class DenseGemmPersistentKernelSm100:
                 ],
                 self.buffer_align_bytes,
             ]
-            
             # (MMA, MMA_N, MMA_K, STAGE)
             sB: cute.struct.Align[
                 cute.struct.MemRange[
@@ -563,7 +562,6 @@ class DenseGemmPersistentKernelSm100:
                 ],
                 self.buffer_align_bytes,
             ]
-            
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
                 cute.struct.MemRange[
@@ -1836,8 +1834,8 @@ class DenseGemmPersistentKernelSm100:
                 "Computed tile scheduler parameters: "
                 "problem_layout_ncluster_mnl: {}, "
                 "problem_shape_ntile_mnl: {}",
-                tile_sched_params.problem_layout_ncluster_mnl,
-                tile_sched_params.problem_shape_ntile_mnl,
+                tile_sched_params.problem_layout_ncluster_mnl, # # (CM=8, CN=32, CL=1):(1,8,256), col-major
+                tile_sched_params.problem_shape_ntile_mnl, # (RestM16, RestN32, RestL1)
             )
             cute.printf("Computed grid shape for kernel launch: {}", grid)
             cute.printf("")
