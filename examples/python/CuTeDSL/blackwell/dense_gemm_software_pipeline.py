@@ -891,15 +891,12 @@ class PipelinedDenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v) # slice with CTA-pair idx
         
         # (MMA=(128,16), MMA_M=1, MMA_K=4, RestM=8, RestK=16, RestL=1)
         tCgA = thr_mma.partition_A(gA_mkl)
-        
         # (MMA=(64,16), MMA_N=1, MMA_K=4, RestN=32, RestK=16, RestL=1)
         tCgB = thr_mma.partition_B(gB_nkl)
-        
         # (MMA=(128,128), MMA_M=1, MMA_N=1, RestM=8, RestN=32, RestL=1)
         tCgC = thr_mma.partition_C(gC_mnl)
         
@@ -965,11 +962,9 @@ class PipelinedDenseGemmKernelSm100:
         
         # (MMA=1, MMA_M=1, MMA_K=4, STAGE=8):(0,0,2,1024)
         tCrA = thr_mma.make_fragment_A(sA)
-        
         # (MMA=1, MMA_N=1, MMA_K=4, STAGE=8):(0,0,2,512)
         tCrB = thr_mma.make_fragment_B(sB)
-        
-        # (MMA=(128,128), MMA_M=1, MMA_N=1) : ((65536,1),0,0)
+        # (MMA=(128,128), MMA_M=1, MMA_N=1):((65536,1),0,0)
         acc_shape = thr_mma.partition_shape_C(self.mma_tiler_mnk[:2])
         tCtAcc_fake = thr_mma.make_fragment_C(acc_shape)
         
@@ -1023,6 +1018,7 @@ class PipelinedDenseGemmKernelSm100:
         #  Partition for epilogue
         # /////////////////////////////////////////////////////////////////////////////
         
+        # Make T2R tiled copy
         # tiled_copy_t2r: 
         #   layout_src_tv: (32,1024):(0,1) | layout_src_tv_tiled: ((32,4),((32,32),1)):((0,1),((128,4),0))
         #   layout_dst_tv: (32,32):(32,1) | layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))

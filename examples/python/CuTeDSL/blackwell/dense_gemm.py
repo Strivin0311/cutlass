@@ -1215,7 +1215,7 @@ class DenseGemmKernelSm100:
                 # /////////////////////////////////////////////////////////////////////////////
                 # UMMA Consumer
                 # /////////////////////////////////////////////////////////////////////////////
-                if is_leader_cta:
+                if is_leader_cta: # only the leader CTA
                     # Wait for current full mbar to be arrived by the producer
                     ab_pipeline.consumer_wait(
                         ab_consumer_state,
