@@ -215,7 +215,7 @@ class DenseGemmPersistentKernelSm100:
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
 
-        self.occupancy = 1
+        self.occupancy = 1 # we only want one CTA to reside on one SM
         
         # Set specialized warp ids
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -262,6 +262,11 @@ class DenseGemmPersistentKernelSm100:
         - Computing tensor memory allocation columns
         """
         # Configure tiled mma
+        # Thr Layout VMNK: (2,1,1,1):(1,0,0,0)
+        # Shape MNK:       (256,128,16)
+        # TV Layout A:     (2,(128,16)):(128,(1,256)) => sliced along M
+        # TV Layout B:     (2,(64,16)):(64,(1,128)) => distributed along N
+        # TV Layout C:     (2,(128,128)):(128,(1,256)) => sliced along M
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -329,6 +334,9 @@ class DenseGemmPersistentKernelSm100:
         )
 
         # Compute A/B/C shared memory layout
+        # sA: S<3,4,3> o 0 o (MMA=(128,16),MMA_M=1,MMA_K=4,MMA_STAGES=8):((64,1),0,16,8192)
+        # sB: S<3,4,3> o 0 o (MMA=(64,16),MMA_N=1,MMA_K=4,MMA_STAGES=8):((64,1),0,16,4096)
+        # sC: S<2,4,3> o 0 o (epi_tileM=(8,16), epi_tileN=(32,1), epi_stages=(1,4)):((32,256),(1,0),(0,4096))
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma=tiled_mma,
             mma_tiler_mnk=self.mma_tiler_mnk,
@@ -353,7 +361,7 @@ class DenseGemmPersistentKernelSm100:
         )
 
         # Compute the number of tensor memory allocation columns
-        self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
+        self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols( # tileN128 x num_acc_stages2 = 256 cols
             tiled_mma, self.mma_tiler_mnk, self.num_acc_stage
         )
 
@@ -1626,39 +1634,45 @@ class DenseGemmPersistentKernelSm100:
                  (ACC stages, A/B operand stages, C stages)
         :rtype: tuple[int, int, int]
         """
-        # Default ACC stages
+        # Default ACC stages: use double buffer for epilogue warp to parallelize with MMA warps
         num_acc_stage = 2
 
         # Default C stages
         num_c_stage = 2 if use_tma_store else 0
 
         # Calculate smem layout and size for one stage of A, B, and C
+        # sA_stage_one: S<3,4,3> o 0 o (MMA=(128,16),MMA_M=1,MMA_K=4,MMA_STAGE=1):((64,1),0,16,0)
+        # sB_stage_one: S<3,4,3> o 0 o (MMA=(64,16),MMA_N=1,MMA_K=4,MMA_STAGE=1):((64,1),0,16,0)
+        # sC_stage_one: S<2,4,3> o 0 o (epi_tileM=(8,16), epi_tileN=(32,1), epi_stages=(1,1)):((32,256),(1,0),(0,0))
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
             tiled_mma,
             mma_tiler_mnk,
             a_dtype,
-            1,  # a tmp 1 stage is provided
+            num_stages=1,
         )
         b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
             tiled_mma,
             mma_tiler_mnk,
             b_dtype,
-            1,  # a tmp 1 stage is provided
+            num_stages=1,
         )
         c_smem_layout_staged_one = (
             sm100_utils.make_smem_layout_epi(
                 c_dtype,
                 c_layout,
                 epi_tile,
-                1,
+                num_stages=1,
             )
             if use_tma_store
             else None
         )
+        
         ab_bytes_per_stage = cute.size_in_bytes(
             a_dtype, a_smem_layout_stage_one
         ) + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
+        
         mbar_helpers_bytes = 1024
+        
         c_bytes_per_stage = (
             cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
             if use_tma_store

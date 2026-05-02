@@ -216,7 +216,7 @@ class PipelinedDenseGemmKernelSm100:
         )
 
         self.buffer_align_bytes = 1024
-        self.occupancy = 1
+        self.occupancy = 1 # we only want one CTA to reside on one SM
         self.threads_per_cta = 128 # one warp group
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100") # 227KB
         
@@ -1567,13 +1567,17 @@ class PipelinedDenseGemmKernelSm100:
             else 0
         )
         c_bytes = c_bytes_per_stage * num_c_stage
+        
+        # TODO(REVIEW): why use occupancy + 1 ?
+        occ_factor = (occupancy + 1)
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
-            smem_capacity - (occupancy + 1) * (mbar_helpers_bytes + c_bytes)
+            smem_capacity # TODO(REVIEW): why not divide capacity with occupancy ?
+            - occ_factor * (mbar_helpers_bytes + c_bytes)
         ) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -1583,8 +1587,8 @@ class PipelinedDenseGemmKernelSm100:
             num_c_stage += (
                 smem_capacity
                 - ab_bytes_per_stage * num_ab_stage
-                - (occupancy + 1) * (mbar_helpers_bytes + c_bytes)
-            ) // ((occupancy + 1) * c_bytes_per_stage)
+                - occ_factor * (mbar_helpers_bytes + c_bytes)
+            ) // (occ_factor * c_bytes_per_stage)
         
         if const_expr(debug_print):
             print()
