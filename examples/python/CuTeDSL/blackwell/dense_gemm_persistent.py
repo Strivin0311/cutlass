@@ -217,6 +217,8 @@ class DenseGemmPersistentKernelSm100:
 
         self.occupancy = 1 # we only want one CTA to reside on one SM
         
+        self.buffer_align_bytes = 1024
+        
         # Set specialized warp ids
         self.epilog_warp_id = (0, 1, 2, 3)
         self.mma_warp_id = 4
@@ -245,7 +247,8 @@ class DenseGemmPersistentKernelSm100:
             print(f"  threads_per_cta: {self.threads_per_cta=}")
             print(f"  warp ids: {self.epilog_warp_id=}, {self.mma_warp_id=}, {self.tma_warp_id=}")
             print(f"  barrier ids: {self.cta_sync_bar_id=}, {self.epilog_sync_bar_id=}, {self.tmem_ptr_sync_bar_id=}")
-            print(f"  smem_capacity: {self.smem_capacity} bytes")
+            print(f"  smem_capacity: {self.smem_capacity=} bytes")
+            print(f"  Buffer alignment (bytes): {self.buffer_align_bytes=}")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -440,76 +443,92 @@ class DenseGemmPersistentKernelSm100:
         tiled_mma = self.tiled_mma
         atom_thr_size = self.atom_thr_size
 
-        # Setup TMA load for A
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA load for A
+        # /////////////////////////////////////////////////////////////////////////////
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            self.cluster_shape_mn, tiled_mma.thr_id
+            self.cluster_shape_mn, self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+        
+        # tma_atom_a: Src: (2,8192):(8192,1) | Dst: (2,8192):(8192,1), where CTA_tileM128 x tileK64 = 8192
+        # tma_tensor_a: (pM=2048,pK=1024,1):(1@1,1@0,1@2)
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a,
-            a_smem_layout,
-            self.mma_tiler_mnk,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            op=a_op,
+            gmem_tensor=a,
+            smem_layout=a_smem_layout,
+            mma_tiler_mnk=self.mma_tiler_mnk,
+            tiled_mma=tiled_mma,
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
             internal_type=(
                 cutlass.TFloat32 if a.element_type is cutlass.Float32 else None
             ),
         )
 
-        # Setup TMA load for B
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA load for B
+        # /////////////////////////////////////////////////////////////////////////////
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
+            self.cluster_shape_mn, self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        
+        # tma_atom_b: Src: (2,4096):(4096,1) | Dst: (2,4096):(4096,1), where CTA_tileN64 x tileK64 = 4096
+        # tma_tensor_b: (pN=4096, pK=1024,1):(1@1,1@0,1@2)
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            b_smem_layout,
-            self.mma_tiler_mnk,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            op=b_op,
+            gmem_tensor=b,
+            smem_layout=b_smem_layout,
+            mma_tiler_mnk=self.mma_tiler_mnk,
+            tiled_mma=tiled_mma,
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
             internal_type=(
                 cutlass.TFloat32 if b.element_type is cutlass.Float32 else None
             ),
         )
 
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Setup TMA store for C
+        # /////////////////////////////////////////////////////////////////////////////
+        tma_atom_c, tma_tensor_c = None, None
+        c_smem_size, c_cta_v_layout = 0, None
+        if cutlass.const_expr(self.use_tma_store):
+            c_op = cpasync.CopyBulkTensorTileS2GOp()
+            c_cta_v_layout = cute.composition( # (128,32):(1@0,1@1), col-major
+                cute.make_identity_layout(c.shape), self.epi_tile
+            )
+            
+            epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+            c_smem_size = cute.cosize(self.c_smem_layout_staged.outer)
+            
+            # tma_atom_c: Src: (1,4096):(0,1) | Dst: (1,4096):(0,1), where epi_tileM128 x epi_tileN32 = 4096
+            # tma_tensor_c: (pM2048, pN4096,1):(1@1,1@0,1@2)
+            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+                op=c_op,
+                gmem_tensor=c,
+                smem_layout=epi_smem_layout,
+                cta_tiler=c_cta_v_layout, # it's ok to just pass in `self.epi_tile`
+            )
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Compute grid size
+        # /////////////////////////////////////////////////////////////////////////////
+        
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
-
-        # Setup TMA store for C
-        tma_atom_c = None
-        tma_tensor_c = None
-        c_cta_v_layout = None
-        c_op = None
-        if cutlass.const_expr(self.use_tma_store):
-            c_op = cpasync.CopyBulkTensorTileS2GOp()
-            c_cta_v_layout = cute.composition(
-                cute.make_identity_layout(c.shape), self.epi_tile
-            )
-            epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-                c_op,
-                c,
-                epi_smem_layout,
-                c_cta_v_layout,
-            )
-
-        # Compute grid size
+        
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
+            c, 
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters=max_active_clusters,
+            debug_print=self.debug_print,
         )
 
-        self.buffer_align_bytes = 1024
-
-        c_smem_size = (
-            cute.cosize(self.c_smem_layout_staged.outer)
-            if cutlass.const_expr(self.use_tma_store)
-            else 0
-        )
-
-        # Define shared storage for kernel
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Define shared storage for kernel
+        # /////////////////////////////////////////////////////////////////////////////
         @cute.struct
         class SharedStorage:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
@@ -571,7 +590,9 @@ class DenseGemmPersistentKernelSm100:
 
             cute.printf("grid: {}", grid)
 
-        # Launch the kernel synchronously
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Launch the kernel
+        # /////////////////////////////////////////////////////////////////////////////
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -593,7 +614,6 @@ class DenseGemmPersistentKernelSm100:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
         )
-        return
 
     # GPU device kernel
     @cute.kernel
@@ -1661,7 +1681,7 @@ class DenseGemmPersistentKernelSm100:
                 c_dtype,
                 c_layout,
                 epi_tile,
-                num_stages=1,
+                epi_stage=1,
             )
             if use_tma_store
             else None
@@ -1720,6 +1740,7 @@ class DenseGemmPersistentKernelSm100:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        debug_print: bool = False,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -1737,17 +1758,35 @@ class DenseGemmPersistentKernelSm100:
             - grid: Grid shape for kernel launch.
         :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
         """
-        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
-        gc = cute.zipped_divide(c, tiler=c_shape)
-        num_ctas_mnl = gc[(0, (None, None, None))].shape
-        cluster_shape_mnl = (*cluster_shape_mn, 1)
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0)) # (CTA_tileM128, CTA_tileN128)
+        gc = cute.zipped_divide(c, tiler=c_shape) # ((CTA_tileM128, CTA_tileN128), (RestM16, RestN32, RestL1))
+        num_ctas_mnl = gc[(0, (None, None, None))].shape # (RestM16, RestN32, RestL1)
+        cluster_shape_mnk = (*cluster_shape_mn, 1) # (2, 1, 1), then we have 8x32x1=256 clusters to activate
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl
+            problem_shape_ntile_mnl=num_ctas_mnl,
+            cluster_shape_mnk=cluster_shape_mnk
         )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape( # (CTA_M=2, CTA_N=1, num_persistent_clusters=74)
+            params=tile_sched_params,
+            # max_active_clusters = 74 = 148 // 2, 
+            # since cluster_shape_mn is (2, 1), and we have 148 SMs in total
+            max_active_clusters=max_active_clusters
         )
+        
+        if const_expr(debug_print):
+            cute.printf("")
+            cute.printf("zipped divided gc shape: {}", gc.shape)
+            cute.printf("Number of CTAs in MNL: {}", num_ctas_mnl)
+            cute.printf(
+                "Computed tile scheduler parameters: "
+                "problem_layout_ncluster_mnl: {}, "
+                "problem_shape_ntile_mnl: {}",
+                tile_sched_params.problem_layout_ncluster_mnl,
+                tile_sched_params.problem_shape_ntile_mnl,
+            )
+            cute.printf("Computed grid shape for kernel launch: {}", grid)
+            cute.printf("")
 
         return tile_sched_params, grid
 
