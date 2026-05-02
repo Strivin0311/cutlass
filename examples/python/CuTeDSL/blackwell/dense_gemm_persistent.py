@@ -2426,8 +2426,8 @@ def run(
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event
         
-        flops = 2 * m * n * k
-        event_str = f"{mnkl=} ({flops=})"
+        flops = 2 * m * n * k * l
+        event_str = f"dense gemm persistent ({mnkl=}, {flops=})"
         iters, start, end = 10, 6, 9
         for i in range(iters):
             switch_profile(

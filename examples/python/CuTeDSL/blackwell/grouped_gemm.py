@@ -2478,7 +2478,10 @@ def run(
         import sys
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event
-        event_str = f"grouped_gemm ({num_groups} groups)"
+        flops = 0
+        for m, n, k, l in problem_sizes_mnkl:
+            flops += 2 * m * n * k * l
+        event_str = f"grouped gemm ({num_groups=}, {flops=})"
         iters, start, end = 10, 6, 9
         args_gen = generate_tensors()
         for i in range(iters):
