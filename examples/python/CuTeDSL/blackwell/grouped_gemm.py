@@ -87,6 +87,100 @@ there are also the following constrains:
 * The contiguous dimension of each tensor must be at least 16 bytes aligned.
 * The l mode(aka, batch size) for each group must be 1.
 * The majorness for A, B and C must be the same across all groups.
+
+--------------------------------------------------------------------------------
+TensorMap (TMA Descriptor) Lifecycle per Warp — GMEM Update Mode
+--------------------------------------------------------------------------------
+A TMA descriptor (tensormap, 128B) encodes base_ptr + shape + stride for one
+tensor.  In grouped GEMM, each group has different tensors, so the descriptor
+must be updated at runtime when the group changes.
+In GMEM mode the descriptor lives in GMEM and is updated in-place.
+In SMEM mode the update is staged through an SMEM buffer to hide GMEM latency.
+
+[Epilog warps (warp 0-3)] — manage tensormap C
+    # --- kernel startup ---
+    init_tensormap_from_atom(tma_atom_c, tensormap_c_ptr)  # copy initial descriptor to GMEM
+    fence_tensormap_initialization()                        # fence.acq_rel.cta: make GMEM write visible
+
+    # --- persistent tile loop ---
+    while tile:
+        if group_changed:
+            update_tensormap(real_c, tma_atom_c,            # wait in-flight TMA, then overwrite GMEM descriptor
+                             tensormap_c_ptr, ...)
+            fence_tensormap_update(tensormap_c_ptr)         # fence_tma_desc_acquire: ensure TMA HW sees new desc
+        cute.copy(tma_atom_c, ...,
+                  tma_desc_ptr=tensormap_c_ptr)             # TMA store C using updated descriptor
+
+[TMA warp (warp 5)] — manage tensormap A and B
+    # --- kernel startup ---
+    init_tensormap_from_atom(tma_atom_a, tensormap_a_ptr)  # copy initial descriptor to GMEM
+    init_tensormap_from_atom(tma_atom_b, tensormap_b_ptr)  # copy initial descriptor to GMEM
+
+    # --- persistent tile loop ---
+    while tile:
+        if group_changed:
+            if first_group:
+                fence_tensormap_initialization()            # ensure init writes are visible before first update
+            update_tensormap(real_a, real_b, tma_atom_a,   # wait in-flight TMA, then overwrite GMEM descriptors
+                             tma_atom_b, ...)
+            fence_tensormap_update(tensormap_a_ptr)         # fence_tma_desc_acquire for A
+            fence_tensormap_update(tensormap_b_ptr)         # fence_tma_desc_acquire for B
+        cute.copy(tma_atom_a, ...,
+                  tma_desc_ptr=tensormap_a_ptr)             # TMA load A using updated descriptor
+        cute.copy(tma_atom_b, ...,
+                  tma_desc_ptr=tensormap_b_ptr)             # TMA load B using updated descriptor
+
+--------------------------------------------------------------------------------
+TensorMap (TMA Descriptor) Lifecycle per Warp — SMEM Update Mode
+--------------------------------------------------------------------------------
+In SMEM mode, descriptor updates are first written to an SMEM staging buffer,
+then flushed back to GMEM via cp.fence.proxy.tensormap (release).
+A/B descriptor initialization is delegated to the MMA warp so that the TMA
+warp can overlap waiting on ab_empty barriers with the init work.
+The TMA warp waits on a named barrier (tensormap_ab_init_bar) before proceeding
+to the first update.
+
+[Epilog warps (warp 0-3)] — manage tensormap C  (same as GMEM mode for C)
+    # --- kernel startup ---
+    init_tensormap_from_atom(tma_atom_c, tensormap_c_smem_ptr) # copy initial descriptor to SMEM
+    fence_tensormap_initialization()                            # noop in SMEM mode (SMEM visibility via barrier)
+
+    # --- persistent tile loop ---
+    while tile:
+        if group_changed:
+            update_tensormap(real_c, tma_atom_c,               # write new desc to SMEM, wait in-flight TMA,
+                             tensormap_c_ptr,                   # then cp.fence.proxy.tensormap release → GMEM
+                             tensormap_c_smem_ptr, ...)
+            fence_tensormap_update(tensormap_c_ptr)             # fence_tma_desc_acquire: ensure TMA HW sees new desc
+        cute.copy(tma_atom_c, ...,
+                  tma_desc_ptr=tensormap_c_ptr)                 # TMA store C using updated GMEM descriptor
+
+[MMA warp (warp 4)] — init tensormap A and B on behalf of TMA warp
+    # --- kernel startup (SMEM mode only, delegate_tensormap_ab_init=True) ---
+    init_tensormap_from_atom(tma_atom_a, tensormap_a_smem_ptr) # copy initial descriptor to SMEM
+    init_tensormap_from_atom(tma_atom_b, tensormap_b_smem_ptr) # copy initial descriptor to SMEM
+    barrier.arrive(tensormap_ab_init_bar)                       # signal TMA warp: init complete
+
+[TMA warp (warp 5)] — manage tensormap A and B
+    # --- kernel startup ---
+    barrier.wait(tensormap_ab_init_bar)                         # wait for MMA warp to finish init in SMEM
+
+    # --- persistent tile loop ---
+    while tile:
+        if group_changed:
+            if first_group:
+                fence_tensormap_initialization()                # noop in SMEM mode
+            update_tensormap(real_a, real_b, tma_atom_a,       # write new desc to SMEM, wait in-flight TMA,
+                             tma_atom_b, tensormap_a_ptr,       # then cp.fence.proxy.tensormap release → GMEM
+                             tensormap_b_ptr,
+                             tensormap_a_smem_ptr,
+                             tensormap_b_smem_ptr, ...)
+            fence_tensormap_update(tensormap_a_ptr)             # fence_tma_desc_acquire for A
+            fence_tensormap_update(tensormap_b_ptr)             # fence_tma_desc_acquire for B
+        cute.copy(tma_atom_a, ...,
+                  tma_desc_ptr=tensormap_a_ptr)                 # TMA load A using updated GMEM descriptor
+        cute.copy(tma_atom_b, ...,
+                  tma_desc_ptr=tensormap_b_ptr)                 # TMA load B using updated GMEM descriptor
 """
 
 
@@ -160,6 +254,7 @@ class GroupedGemmPersistentKernelSm100:
         self.epilogue_threads = 32 * len(self.epilog_warp_id)
         self.tmem_ptr_read_threads = 32 + self.epilogue_threads  # all threads in mma warp and epilogue warps can read tmem ptr from shared memory
         self.threads_per_cta = 32 + self.tmem_ptr_read_threads
+        self.tensormap_init_threads = 32 + 32 # tma producer warp + umma consumer warp for tensormap initialization when delegated to mma warp
         
         # Set barrier id for cta sync, epilog sync, tmem ptr sync and tensormap update sync
         self.cta_sync_bar_id = 0
@@ -1004,10 +1099,14 @@ class GroupedGemmPersistentKernelSm100:
             # Initialize tensormaps for A, B if not delegated to the mma warp
             if const_expr(self.delegate_tensormap_ab_init == False):
                 tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_a, tensormap_a_init_ptr, self.tma_warp_id
+                    copy_atom=tma_atom_a, 
+                    dst_ptr=tensormap_a_init_ptr, 
+                    warp_id=self.tma_warp_id
                 )
                 tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_b, tensormap_b_init_ptr, self.tma_warp_id
+                    copy_atom=tma_atom_b, 
+                    dst_ptr=tensormap_b_init_ptr, 
+                    warp_id=self.tma_warp_id
                 )
             
             # /////////////////////////////////////////////////////////////////////////////
@@ -1028,50 +1127,70 @@ class GroupedGemmPersistentKernelSm100:
                 cur_group_idx = grouped_gemm_cta_tile_info.group_idx
                 is_group_changed = cur_group_idx != last_group_idx
                 
-                # skip tensormap update if we're working on the same group
+                # Skip tensormap update if we're working on the same group
                 if is_group_changed:
+                    # Construct gmem tensor A/B based on real address, shape and stride information
                     real_tensor_a = self.make_tensor_for_tensormap_update(
                         cur_group_idx,
                         self.a_dtype,
-                        (
+                        problem_shape_mnk=(
                             grouped_gemm_cta_tile_info.problem_shape_m,
                             grouped_gemm_cta_tile_info.problem_shape_n,
                             grouped_gemm_cta_tile_info.problem_shape_k,
                         ),
-                        strides_abc,
-                        ptrs_abc,
-                        0,  # 0 for tensor A
+                        strides_abc=strides_abc,
+                        tensor_address_abc=ptrs_abc,
+                        tensor_index=0,  # 0 for tensor A
                     )
                     real_tensor_b = self.make_tensor_for_tensormap_update(
                         cur_group_idx,
                         self.b_dtype,
-                        (
+                        problem_shape_mnk=(
                             grouped_gemm_cta_tile_info.problem_shape_m,
                             grouped_gemm_cta_tile_info.problem_shape_n,
                             grouped_gemm_cta_tile_info.problem_shape_k,
                         ),
-                        strides_abc,
-                        ptrs_abc,
-                        1,  # 1 for tensor B
+                        strides_abc=strides_abc,
+                        tensor_address_abc=ptrs_abc,
+                        tensor_index=1,  # 1 for tensor B
                     )
                     
-                    # wait tensormap initialization complete before update
+                    # Wait tensormap initialization complete before update
                     if tensormap_init_done == False:
                         if const_expr(self.delegate_tensormap_ab_init):
-                            # wait for the mma warp to finish tensormap initialization
+                            # Wait for the mma warp to finish tensormap initialization
                             cute.arch.barrier(
                                 barrier_id=self.tensormap_ab_init_bar_id,
-                                number_of_threads=64,
+                                number_of_threads=self.tensormap_init_threads,
                             )
+                        
+                        # If in GMEM tensormap update mode, the TMA desc is directly written to the gmem buffer,
+                        # so we need to call `fence.acq_rel.cta` (i.e. `__threadfence_block()`) 
+                        # to ensure visibility of tensormap initialization
+                        # to all the threads in the CTA before we update the tensormap
+                        # noop for SMEM tensormap update mode
                         tensormap_manager.fence_tensormap_initialization()
                         tensormap_init_done = True
 
+                    # Update tensormap for the current group by the tma warp, varying on the mode:
+                    #   GMEM mode:
+                    #       step1. wait until all in-flight TMA finished by `cp_async_bulk_commit_group` and `cp_async_bulk_wait_group(0, read=True)`
+                    #       step2. update tma desc directly in gmem, including the base addrs, shapes and strides
+                    #       step3. call `fence.proxy.tensormap::generic.release.gpu` 
+                    #               to ensure tensormap write is visible with release order
+                    #
+                    #   SMEM mode:
+                    #       step1. update tma desc in smem w/o waiting in-flight TMA, including the base addrs, shapes and strides
+                    #       step2. wait for all in-flight TMA to finish, the same as step1 in GMEM mode
+                    #       step3. call `tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned`
+                    #               to copy updated tma desc from smem to gmem and ensure tensormap write is visible with release order
+                    # aligning with the read fence in `fence_tensormap_update` with acquire order below
                     tensormap_manager.update_tensormap(
-                        (real_tensor_a, real_tensor_b),
-                        (tma_atom_a, tma_atom_b),
-                        (tensormap_a_ptr, tensormap_b_ptr),
-                        self.tma_warp_id,
-                        (tensormap_a_smem_ptr, tensormap_b_smem_ptr),
+                        tensor_gmem=(real_tensor_a, real_tensor_b),
+                        tma_copy_atom=(tma_atom_a, tma_atom_b),
+                        tensormap_gmem_ptr=(tensormap_a_ptr, tensormap_b_ptr),
+                        warp_id=self.tma_warp_id,
+                        tensormap_smem_ptr=(tensormap_a_smem_ptr, tensormap_b_smem_ptr),
                     )
 
                 mma_tile_coord_mnl = ( # cluster coord
@@ -1124,6 +1243,9 @@ class GroupedGemmPersistentKernelSm100:
                 
                 # Ensure the update to tensormap has completed before using it
                 if is_group_changed:
+                    # Call `fence.proxy.tensormap::generic.acquire.gpu` 
+                    # to ensure tensormap read is visible with acquire order before we use it to load TMA
+                    # aligning with the write fence in `update_tensormap` with release order above
                     tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
                 
@@ -1207,17 +1329,25 @@ class GroupedGemmPersistentKernelSm100:
         #  Specialized MMA warp
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            # Initialize tensormap A, B for TMA warp
+            # Initialize tensormap A, B for TMA warp (one-time thing when kernel launches)
             if const_expr(self.delegate_tensormap_ab_init):
+                # Call the `copy_tensormap` to copy the `tma_atom` (with the initialized TMA desc inside)
+                # to the tensormap buffer pointed by `dst_ptr`, by the warp with idx `warp_id` (elected one lane and sync the warp after)
                 tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_a, tensormap_a_init_ptr, self.mma_warp_id
+                    copy_atom=tma_atom_a, 
+                    dst_ptr=tensormap_a_init_ptr,
+                    warp_id=self.mma_warp_id
                 )
                 tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_b, tensormap_b_init_ptr, self.mma_warp_id
+                    copy_atom=tma_atom_b,
+                    dst_ptr=tensormap_b_init_ptr,
+                    warp_id=self.mma_warp_id
                 )
-                # signal tensormap initialization has finished
+                
+                # Signal tensormap initialization has finished to the tma warp
                 cute.arch.barrier(
-                    barrier_id=self.tensormap_ab_init_bar_id, number_of_threads=64
+                    barrier_id=self.tensormap_ab_init_bar_id,
+                    number_of_threads=self.tensormap_init_threads
                 )
             
             # Bar sync for retrieve tmem ptr from shared mem
@@ -1391,7 +1521,7 @@ class GroupedGemmPersistentKernelSm100:
         #  Specialized epilogue warps
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.mma_warp_id:
-            # Initialize tensorap for C
+            # Initialize tensormap for C by the first epilogue warp (one-time thing when kernel launches)
             tensormap_manager.init_tensormap_from_atom(
                 tma_atom_c,
                 tensormap_c_init_ptr,
@@ -1485,7 +1615,10 @@ class GroupedGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Persistent tile scheduling loop (epilog warp)
             # /////////////////////////////////////////////////////////////////////////////
-            # wait tensormap initialization complete before update
+            # Wait tensormap initialization complete before update
+            # NOTE: if in GMEM tensormap update mode, the TMA desc is directly written to the gmem buffer and we need to 
+            # call `fence.acq_rel.cta` (i.e. `__threadfence_block()`) to ensure visibility of tensormap initialization
+            # but if in SMEM tensormap update mode, it's a noop
             tensormap_manager.fence_tensormap_initialization()
             
             total_k_tile_cnt = cutlass.Int32(0) # tile count we have searched
@@ -1502,25 +1635,32 @@ class GroupedGemmPersistentKernelSm100:
                 
                 is_group_changed = cur_group_idx != last_group_idx
                 if is_group_changed:
-                    # construct tensor C based on real address, shape and stride information
+                    # Construct gmem tensor C based on real address, shape and stride information
                     real_tensor_c = self.make_tensor_for_tensormap_update(
                         cur_group_idx,
                         self.c_dtype,
-                        (
+                        problem_shape_mnk=(
                             grouped_gemm_cta_tile_info.problem_shape_m,
                             grouped_gemm_cta_tile_info.problem_shape_n,
                             grouped_gemm_cta_tile_info.problem_shape_k,
                         ),
-                        strides_abc,
-                        ptrs_abc,
-                        2,  # 2 for tensor C
+                        strides_abc=strides_abc,
+                        tensor_address_abc=ptrs_abc,
+                        tensor_index=2,  # 2 for tensor C
                     )
+                    
+                    # Update tensormap for the current group
+                    # by the first epilogue warp since only the first warp will issue the TMA store
+                    # NOTE: it will use either `fence.proxy.tensormap::generic.release.gpu` 
+                    # or `tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned`
+                    # to ensure tensormap write is visible with release order
+                    # aligning with the read fence in `fence_tensormap_update` with acquire order below
                     tensormap_manager.update_tensormap(
-                        ((real_tensor_c),),
-                        ((tma_atom_c),),
-                        ((tensormap_c_ptr),),
-                        self.epilog_warp_id[0],
-                        (tensormap_c_smem_ptr,),
+                        tensor_gmem=((real_tensor_c),),
+                        tma_copy_atom=((tma_atom_c),),
+                        tensormap_gmem_ptr=((tensormap_c_ptr),),
+                        warp_id=self.epilog_warp_id[0],
+                        tensormap_smem_ptr=(tensormap_c_smem_ptr,),
                     )
 
                 mma_tile_coord_mnl = ( # cluster coord
@@ -1559,8 +1699,12 @@ class GroupedGemmPersistentKernelSm100:
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
                 
                 # Ensure the update to tensormap has completed before using it
+                # by the first epilogue warp since only the first warp will issue the TMA store
                 if is_group_changed:
                     if warp_idx == self.epilog_warp_id[0]:
+                        # Call `fence.proxy.tensormap::generic.acquire.gpu` 
+                        # to ensure tensormap read is visible with acquire order before we use it to load TMA
+                        # aligning with the write fence in `update_tensormap` with release order above
                         tensormap_manager.fence_tensormap_update(tensormap_c_ptr)
                 
                 # /////////////////////////////////////////////////////////////////////////////
