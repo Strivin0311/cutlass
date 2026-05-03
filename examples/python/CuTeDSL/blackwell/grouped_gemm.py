@@ -90,7 +90,8 @@ there are also the following constrains:
 """
 
 
-DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 
 class GroupedGemmPersistentKernelSm100:
@@ -127,9 +128,9 @@ class GroupedGemmPersistentKernelSm100:
         """
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
-        self.cluster_shape_mn = cluster_shape_mn
+        self.cluster_shape_mn = cluster_shape_mn # (CM2, CN1)
         # K dimension is deferred in _setup_attributes
-        self.mma_tiler = (*mma_tiler_mn, 1)
+        self.mma_tiler_mnk = (*mma_tiler_mn, 1) # (tileM256, tileN128, tileK1)
         self.cta_group = (
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -140,32 +141,34 @@ class GroupedGemmPersistentKernelSm100:
             tensormap_update_mode == utils.TensorMapUpdateMode.SMEM
         )
 
+        # TODO(REVIEW): why no support to multicast ?
         self.num_mcast_ctas_a = 1
         self.num_mcast_ctas_b = 1
         self.is_a_mcast = False
         self.is_b_mcast = False
+        self.num_tma_load_bytes = 0
 
-        self.occupancy = 1
+        self.occupancy = 1 # we only want one CTA to reside on one SM
+        
+        self.buffer_align_bytes = 1024
+        
         # Set specialized warp ids
-        self.epilog_warp_id = (
-            0,
-            1,
-            2,
-            3,
-        )
-        self.mma_warp_id = 4
-        self.tma_warp_id = 5
-        self.threads_per_cta = 32 * len(
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
-        )
+        self.epilog_warp_id = (0, 1, 2, 3) # the first warp group forms the epilogue consumer warps
+        self.mma_warp_id = 4 # a single warp for umma consumer / acc producer
+        self.tma_warp_id = 5 # a single warp for tma producer
+        
+        self.epilogue_threads = 32 * len(self.epilog_warp_id)
+        self.tmem_ptr_read_threads = 32 + self.epilogue_threads  # all threads in mma warp and epilogue warps can read tmem ptr from shared memory
+        self.threads_per_cta = 32 + self.tmem_ptr_read_threads
+        
         # Set barrier id for cta sync, epilog sync, tmem ptr sync and tensormap update sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         # Barrier ID used by MMA/TMA warps to signal A/B tensormap initialization completion
         self.tensormap_ab_init_bar_id = 4
+        
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tma_load_bytes = 0
 
         self.debug_print = debug_print
 
@@ -174,15 +177,23 @@ class GroupedGemmPersistentKernelSm100:
             print(f"Initialized GroupedGemmPersistentKernelSm100 with configurations:")
             print(f"  acc_dtype: {self.acc_dtype=}")
             print(f"  use_2cta_instrs: {self.use_2cta_instrs=}")
-            print(f"  mma_tiler: {self.mma_tiler=}")
+            print(f"  mma_tiler: {self.mma_tiler_mnk=}")
             print(f"  cluster_shape_mn: {self.cluster_shape_mn=}")
             print(f"  CTA group for MMA: {self.cta_group=}")
             print(f"  tensormap_update_mode: {self.tensormap_update_mode=}")
             print(f"  delegate_tensormap_ab_init: {self.delegate_tensormap_ab_init=}")
+            print(f"  epilogue_threads: {self.epilogue_threads=}")
+            print(f"  tmem_ptr_read_threads: {self.tmem_ptr_read_threads=}")
             print(f"  threads_per_cta: {self.threads_per_cta=}")
             print(f"  warp ids: {self.epilog_warp_id=}, {self.mma_warp_id=}, {self.tma_warp_id=}")
             print(f"  barrier ids: {self.cta_sync_bar_id=}, {self.epilog_sync_bar_id=}, {self.tmem_ptr_sync_bar_id=}, {self.tensormap_ab_init_bar_id=}")
             print(f"  smem_capacity: {self.smem_capacity=} bytes")
+            print(f"  Occupancy: {self.occupancy=}")
+            print(f"  Buffer alignment: {self.buffer_align_bytes=} bytes")
+            print(f"  Bytes per tensormap: {self.bytes_per_tensormap=}")
+            print(f"  Reserved smem for mbar: {self.reserved_smem_bytes} bytes")
+            print(f"  Reserved smem for tensormap management: {self.tensor_memory_management_bytes} bytes")
+            print()
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -198,40 +209,45 @@ class GroupedGemmPersistentKernelSm100:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            self.mma_tiler_mnk[:2],
         )
+        
+        self.tiled_mma = tiled_mma
+        self.atom_thr_id = tiled_mma.thr_id # 1:0
+        self.atom_thr_shape = self.atom_thr_id.shape
+        self.atom_thr_size = cute.size(self.atom_thr_shape)
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
-        self.mma_tiler = (
-            self.mma_tiler[0],
-            self.mma_tiler[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+        self.mma_tiler_mnk = ( # (tileM256, tileN128, tileK64)
+            self.mma_tiler_mnk[0],
+            self.mma_tiler_mnk[1],
+            mma_inst_shape_k * mma_inst_tile_k, # 16 x 4 = 64
         )
-        self.cta_tile_shape_mnk = (
-            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
-            self.mma_tiler[1],
-            self.mma_tiler[2],
+        self.cta_tile_shape_mnk = ( # (CTA_tileM128, CTA_tileN128, CTA_tileK64)
+            self.mma_tiler_mnk[0] // self.atom_thr_size,
+            self.mma_tiler_mnk[1],
+            self.mma_tiler_mnk[2],
         )
-        self.cluster_tile_shape_mnk = tuple(
+        self.cluster_tile_shape_mnk = tuple( # (CGA_tileM256, CGA_tileN128, CGA_tileK64)
             x * y for x, y in zip(self.cta_tile_shape_mnk, (*self.cluster_shape_mn, 1))
         )
 
         # Compute cluster layout
-        self.cluster_layout_vmnk = cute.tiled_divide(
+        self.cluster_layout_vmnk = cute.tiled_divide( # ((2),1,1,1):((1),0,0,0)
             cute.make_layout((*self.cluster_shape_mn, 1)),
-            (tiled_mma.thr_id.shape,),
+            (self.atom_thr_shape,),
         )
 
         # Compute number of multicast CTAs for A/B
-        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
-        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2]) # 1, along N dim
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1]) # 1, along M dim
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        self.epi_tile = utils.compute_epilogue_tile_shape(
+        self.epi_tile = utils.compute_epilogue_tile_shape( # (epi_tileM128:1, epi_tileN32:1)
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
             self.c_layout,
@@ -245,7 +261,7 @@ class GroupedGemmPersistentKernelSm100:
             self.num_epi_stage,
         ) = self._compute_stages(
             tiled_mma,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             self.a_dtype,
             self.b_dtype,
             self.epi_tile,
@@ -256,15 +272,19 @@ class GroupedGemmPersistentKernelSm100:
             debug_print=self.debug_print,
         )
 
+        # Compute A/B/C shared memory layout
+        # sA: S<3,4,3> o 0 o (MMA=(128,16),MMA_M=1,MMA_K=4,MMA_STAGES=8):((64,1),0,16,8192)
+        # sB: S<3,4,3> o 0 o (MMA=(64,16),MMA_N=1,MMA_K=4,MMA_STAGES=8):((64,1),0,16,4096)
+        # sC: S<2,4,3> o 0 o (epi_tileM=(8,16), epi_tileN=(32,1), epi_stages=(1,4)):((32,256),(1,0),(0,4096))
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             self.a_dtype,
             self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             self.b_dtype,
             self.num_ab_stage,
         )
@@ -303,14 +323,14 @@ class GroupedGemmPersistentKernelSm100:
             )
 
         # Compute the number of tensor memory allocation columns
-        self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
-            tiled_mma, self.mma_tiler, self.num_acc_stage
+        self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols( # tileN128 x num_acc_stages2 = 256 cols
+            tiled_mma, self.mma_tiler_mnk, self.num_acc_stage
         )
 
         if const_expr(self.debug_print):
             print()
             print(f"Setup attributes dependent on GEMM inputs:")
-            print(f"  MMA tiler (M, N, K): {self.mma_tiler=}")
+            print(f"  MMA tiler (M, N, K): {self.mma_tiler_mnk=}")
             print(f"  CTA tile shape (M, N, K): {self.cta_tile_shape_mnk=}")
             print(f"  Cluster tile shape (M, N, K): {self.cluster_tile_shape_mnk=}")
             print(f"  Cluster layout: {self.cluster_layout_vmnk=}")
@@ -321,6 +341,9 @@ class GroupedGemmPersistentKernelSm100:
             print(f"  Number of A/B stages: {self.num_ab_stage=}")
             print(f"  Number of epi stages: {self.num_epi_stage=}")
             print(f"  Number of tmem alloc cols: {self.num_tmem_alloc_cols=}")
+            print(f"  Tensor memory smem bytes: {tensor_smem_bytes=}")
+            print(f"  Mbar smem bytes: {mbar_smem_bytes=}")
+            print(f"  Tensormap smem bytes: {tensormap_smem_bytes=}")
             print()
 
             print()
@@ -330,7 +353,7 @@ class GroupedGemmPersistentKernelSm100:
             print()
 
             print()
-            print("tiled_mma: ", tiled_mma, f"\n\nshape_mnk: {tiled_mma.shape_mnk}", f"thr_id.shape: {tiled_mma.thr_id.shape}")
+            print("tiled_mma: ", tiled_mma, f"\n\nshape_mnk: {tiled_mma.shape_mnk}", f"thr_id.shape: {self.atom_thr_shape}")
             print()
 
     @cute.jit
@@ -401,22 +424,22 @@ class GroupedGemmPersistentKernelSm100:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            self.mma_tiler_mnk[:2],
         )
-        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+        atom_thr_size = self.atom_thr_size
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup TMA load for A
         # /////////////////////////////////////////////////////////////////////////////
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-            self.cluster_shape_mn, tiled_mma.thr_id
+            self.cluster_shape_mn, self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
             initial_a,
             a_smem_layout,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
@@ -425,14 +448,14 @@ class GroupedGemmPersistentKernelSm100:
         #  Setup TMA load for B
         # /////////////////////////////////////////////////////////////////////////////
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mn, tiled_mma.thr_id
+            self.cluster_shape_mn, self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             initial_b,
             b_smem_layout,
-            self.mma_tiler,
+            self.mma_tiler_mnk,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
@@ -464,7 +487,6 @@ class GroupedGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Define shared storage for kernel
         # /////////////////////////////////////////////////////////////////////////////
-        self.buffer_align_bytes = 1024
         self.size_tensormap_in_i64 = (
             0
             if self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
@@ -600,14 +622,14 @@ class GroupedGemmPersistentKernelSm100:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_c)
 
-        use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
+        use_2cta_instrs = self.atom_thr_size == 2
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup cta/thread coordinates
         # /////////////////////////////////////////////////////////////////////////////
         # Coord inside cluster
         bid = cute.arch.block_idx()
-        mma_tile_coord_v = bid[0] % cute.size(tiled_mma.thr_id.shape)
+        mma_tile_coord_v = bid[0] % self.atom_thr_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
@@ -758,15 +780,15 @@ class GroupedGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            mA_mkl, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
         )
         # (bN, bK, RestN, RestK, RestL)
         gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            mB_nkl, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None)
         )
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
-            mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            mC_mnl, cute.slice_(self.mma_tiler_mnk, (None, None, 0)), (None, None, None)
         )
 
         if const_expr(self.debug_print):
@@ -840,7 +862,7 @@ class GroupedGemmPersistentKernelSm100:
         # (MMA, MMA_N, MMA_K, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
         tCtAcc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, self.num_acc_stage)
@@ -981,7 +1003,7 @@ class GroupedGemmPersistentKernelSm100:
 
                 mma_tile_coord_mnl = (
                     grouped_gemm_cta_tile_info.cta_tile_idx_m
-                    // cute.size(tiled_mma.thr_id.shape),
+                    // self.atom_thr_size,
                     grouped_gemm_cta_tile_info.cta_tile_idx_n,
                     0,
                 )
@@ -1394,7 +1416,7 @@ class GroupedGemmPersistentKernelSm100:
 
                 mma_tile_coord_mnl = (
                     grouped_gemm_cta_tile_info.cta_tile_idx_m
-                    // cute.size(tiled_mma.thr_id.shape),
+                    // self.atom_thr_size,
                     grouped_gemm_cta_tile_info.cta_tile_idx_n,
                     0,
                 )
@@ -1800,6 +1822,9 @@ class GroupedGemmPersistentKernelSm100:
         num_epi_stage = 2
 
         # Calculate smem layout and size for one stage of A, B, and Epilogue
+        # sA_stage_one: S<3,4,3> o 0 o (MMA=(128,16),MMA_M=1,MMA_K=4,MMA_STAGE=1):((64,1),0,16,0)
+        # sB_stage_one: S<3,4,3> o 0 o (MMA=(64,16),MMA_N=1,MMA_K=4,MMA_STAGE=1):((64,1),0,16,0)
+        # sC_stage_one: S<2,4,3> o 0 o (epi_tileM=(8,16),epi_tileN=(32,1),epi_stages=(1,1)):((32,256),(1,0),(0,0))
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
             tiled_mma,
             mma_tiler_mnk,
@@ -1912,8 +1937,8 @@ class GroupedGemmPersistentKernelSm100:
         :return: Total shared memory bytes required for all memory barriers.
         :rtype: int
         """
-        num_barriers_per_stage = 2
-        num_bytes_per_barrier = 8
+        num_barriers_per_stage = 2 # full/empty mbar pair
+        num_bytes_per_barrier = 8 # int64, 8B
         mbar_smem_consumption = sum(
             [
                 num_barriers_per_stage * num_bytes_per_barrier * stage
@@ -2250,12 +2275,14 @@ def run(
     ]
 
     hardware_info = utils.HardwareInfo()
-    sm_count = hardware_info.get_max_active_clusters(1)
+    max_sms = hardware_info.get_device_multiprocessor_count()
     max_active_clusters = hardware_info.get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    print(f"Max active clusters: {max_active_clusters} for cluster shape {cluster_shape_mn} on device with {max_sms} SMs")
+
     # Prepare tensormap buffer for each SM
-    num_tensormap_buffers = sm_count
+    num_tensormap_buffers = max_sms
     tensormap_shape = (
         num_tensormap_buffers,
         GroupedGemmPersistentKernelSm100.num_tensormaps,
@@ -2473,8 +2500,8 @@ def run(
         iterations=iterations,
     )
 
-    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
-    if profile_mode:
+    # Profiling
+    if PROFILE_MODE:
         import sys
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event

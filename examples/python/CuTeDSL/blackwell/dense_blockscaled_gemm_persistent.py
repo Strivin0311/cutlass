@@ -117,7 +117,8 @@ Constraints:
   i.e, number of elements is a multiple of 16 and 32 for Float8 and Float4, respectively.
 """
 
-DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 
 class BlockScaledDenseGemmPersistentKernelSm100:
@@ -2693,8 +2694,7 @@ def run(
     )
 
     # Profiling
-    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
-    if profile_mode:
+    if PROFILE_MODE:
         import sys
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event

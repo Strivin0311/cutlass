@@ -18,15 +18,18 @@ if [[ $DEBUG_MODE -eq 1 ]]; then
     M=2048
     K=4096
     N=1024
+    GROUPED_MNKL='"(384,4096,1024,1),(896,4096,1024,1),(640,4096,1024,1),(128,4096,1024,1)"'
     PROFILE_MODE=0 # disable profiling when in debug mode to avoid conflicts with verbose logging
 elif [[ $PROFILE_MODE -eq 1 ]]; then
     M=6144
     K=2048
     N=8192
+    GROUPED_MNKL='"(1024,8192,2048,1),(2048,8192,2048,1),(512,8192,2048,1),(2560,8192,2048,1)"'
 else
     M=8192
     K=8192
     N=8192
+    GROUPED_MNKL='"(8192,1280,32,1),(16,384,1536,1),(640,1280,16,1),(640,160,16,1)"'
 fi
 
 
@@ -67,12 +70,14 @@ elif [[ $TEST_SCRIPT == "dense_blockscaled_gemm_persistent" ]]; then
     --mnkl $M,$K,$N,1
     "
 elif [[ $TEST_SCRIPT == "grouped_gemm" ]]; then
+    # PFLOPS: 1.515 for fp16
     SCRIPT_CMD="
     python grouped_gemm.py                                                 \
     --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32                                \
-    --mma_tiler_mn 128,64 --cluster_shape_mn 1,1                                            \
-    --problem_sizes_mnkl \"(8192,1280,32,1),(16,384,1536,1),(640,1280,16,1),(640,160,16,1)\"  \
-    --num_groups 4  --tensormap_update_mode SMEM
+    --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                                           \
+    --problem_sizes_mnkl ${GROUPED_MNKL}  \
+    --num_groups 4  --tensormap_update_mode SMEM \
+    --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "fmha" ]]; then
     SCRIPT_CMD="

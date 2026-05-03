@@ -106,7 +106,8 @@ Constraints:
 """
 
 
-DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 
 # /////////////////////////////////////////////////////////////////////////////
@@ -2151,8 +2152,7 @@ def run(
     )
     
     # Profiling
-    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
-    if profile_mode:
+    if PROFILE_MODE:
         import sys
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event

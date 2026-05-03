@@ -111,7 +111,8 @@ Constraints:
 * OOB tiles are not allowed when TMA store is disabled
 """
 
-DEBUG_MODE = int(os.environ.get("DEBUG_MODE", "0")) == 1
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 
 class PipelinedDenseGemmKernelSm100:
@@ -688,7 +689,7 @@ class PipelinedDenseGemmKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         # Coords inside cluster
         mma_tile_coord_v = bidx % self.atom_thr_size # CTA idx in the CTA-pair
-        is_leader_cta = mma_tile_coord_v == 0 c
+        is_leader_cta = mma_tile_coord_v == 0 # the CTA0 is the leader
         cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
@@ -2136,8 +2137,7 @@ def run_dense_gemm(
         )
 
     # Profiling
-    profile_mode = os.environ.get("PROFILE_MODE", "0") == "1"
-    if profile_mode:
+    if PROFILE_MODE:
         import sys
         sys.path.insert(0, "..")
         from nvtx import switch_profile, add_nvtx_event
