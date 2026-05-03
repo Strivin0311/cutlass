@@ -181,6 +181,60 @@ to the first update.
                   tma_desc_ptr=tensormap_a_ptr)                 # TMA load A using updated GMEM descriptor
         cute.copy(tma_atom_b, ...,
                   tma_desc_ptr=tensormap_b_ptr)                 # TMA load B using updated GMEM descriptor
+
+--------------------------------------------------------------------------------
+Why SMEM Mode Hides Latency: delegate_tensormap_ab_init Timeline
+--------------------------------------------------------------------------------
+The key difference is WHERE the A/B init work is placed relative to the TMA
+warp's tile-scheduling work, and whether init writes go to SMEM or GMEM.
+
+GMEM mode  (delegate=False, init written to GMEM by TMA warp itself):
+
+  TMA warp:  [init_A→GMEM][init_B→GMEM] | [delinearize_z][fence_init][update_AB][fence_upd][TMA load]...
+  MMA warp:  [idle (nothing to do yet) ] | [tmem_ptr_sync][mma work]...
+              ^^^^^^^^^^^^^^^^^^^^^^^^
+              TMA warp is blocked here writing 2×128B to slow GMEM before it can
+              even start scheduling work.  The init cost is fully exposed.
+
+SMEM mode  (delegate=True, init written to SMEM by MMA warp):
+
+  TMA warp:  [delinearize_z ...]  (barrier_wait — usually no stall) [fence_init(noop)][update_AB][fence_upd][TMA load]...
+  MMA warp:  [init_A→SMEM][init_B→SMEM][barrier_arrive] | [tmem_ptr_sync][mma work]...
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+              MMA warp does the init concurrently while TMA warp runs
+              delinearize_z (linear scan over group list = ALU work).
+              By the time TMA warp reaches the barrier, init is already done.
+
+Two compounding benefits:
+  1. Overlap:  init latency is hidden behind TMA warp's scheduler ALU work.
+  2. Faster write:  SMEM write (128B) is much faster than GMEM write (128B),
+     so even if TMA warp does stall at the barrier, the wait is shorter.
+
+--------------------------------------------------------------------------------
+Why GMEM Mode Does NOT Delegate init to the MMA Warp
+--------------------------------------------------------------------------------
+One might ask: why not also delegate A/B init to the MMA warp in GMEM mode,
+to get the same overlap benefit?
+
+If we did delegate in GMEM mode:
+
+  TMA warp:  [delinearize_z...] → [barrier_wait] ← still blocked on slow GMEM write
+  MMA warp:  [init_A→GMEM (slow)] [init_B→GMEM (slow)] [barrier_arrive] | tmem work...
+
+The GMEM write latency is unchanged regardless of which warp issues it.
+Delegating only moves the work to a different warp — it does NOT create any
+new overlap because:
+
+  - The TMA warp's delinearize_z ALU time ≈ or < GMEM write latency,
+    so TMA warp would still stall at the barrier waiting for the MMA warp
+    to finish writing GMEM.
+  - An extra named barrier synchronization point is introduced, adding overhead
+    with no latency benefit.
+
+The SMEM delegate trick works only because SMEM writes are so fast (a few
+cycles for 128B) that they complete well within the time TMA warp spends on
+its ALU-bound scheduler work — creating genuine overlap.
+In GMEM mode, the slow GMEM write destroys this overlap opportunity entirely.
 """
 
 
