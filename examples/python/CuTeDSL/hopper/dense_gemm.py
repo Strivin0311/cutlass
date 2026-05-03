@@ -1459,7 +1459,7 @@ class WgmmaDenseGemmKernelSm90:
                 # to commit the current group of TMA store insts
                 c_pipeline.producer_commit()
                 
-                # `producer_acquire` for TMAStoreFence will issue `cp.async.bulk.wait_group(num_stages-1)` 
+                # `producer_acquire` for TMAStoreFence will issue `cp.async.bulk.wait_group(num_stages-1).read` 
                 # to wait for the earliest committed TMA store group to complete, 
                 # to allow only `num_stages-1` committed but unfinished TMA store groups in the pipeline,
                 # to avoid the next stage buffer's data being overwritten before it is consumed by the TMA store in the next iteration

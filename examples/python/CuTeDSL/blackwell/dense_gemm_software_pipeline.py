@@ -1258,7 +1258,7 @@ class PipelinedDenseGemmKernelSm100:
                     )
                     
                     c_pipeline.producer_commit() # `cp.async.bulk.commit_group`
-                    c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1)` 
+                    c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1).read` 
                 
                 cute.arch.barrier() # wait warp0 before next iteration
             else:

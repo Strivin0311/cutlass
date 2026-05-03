@@ -672,7 +672,7 @@ class DenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         # Coords inside cluster
         mma_tile_coord_v = bidx % self.atom_thr_size  # CTA idx in the CTA-pair
-        is_leader_cta = mma_tile_coord_v == 0  # CTA idx in the CTA-pair
+        is_leader_cta = mma_tile_coord_v == 0  # leader CTA in the CTA-pair
         cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
@@ -1010,6 +1010,8 @@ class DenseGemmPersistentKernelSm100:
                 # /////////////////////////////////////////////////////////////////////////////
                 for k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     # Wait for current ab empty mbar to be arrived by the consumer
+                    # and then arrive the ab full mbar to notify the consumer the data is ready after the TMA load
+                    # NOTE: it is only arrived by the leader CTA (inside logics), since only leader CTA waits it
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
@@ -1086,23 +1088,19 @@ class DenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
-                # Get tile coord from tile scheduler
-                cur_tile_coord = work_tile.tile_idx # block coord
-                mma_tile_coord_mnl = ( # cluster coord
-                    cur_tile_coord[0] // self.atom_thr_size,
-                    cur_tile_coord[1],
-                    cur_tile_coord[2],
-                )
-
+                # MMA warp is only interested in number of tiles along K dimension
+                # cur_tile_coord = work_tile.tile_idx # block coord
+                
                 # Set tensor memory buffer for current tile
                 # (MMA=(128,128), MMA_M=1, MMA_N=1):((65536,1),0,0)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)] # slice the current acc stage tmem buffer
 
                 if const_expr(self.debug_print):
+                    # Get tile coord from tile scheduler
+                    cur_tile_coord = work_tile.tile_idx # block coord
                     is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
                     if (tidx == 32 * self.mma_warp_id) and is_print_block and is_first_work_tile:
                         cute.printf("")
-                        cute.printf("[MMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
                         cute.printf("[MMA warp] tCtAcc: {}", tCtAcc)
                         cute.printf("")
 
@@ -1154,6 +1152,7 @@ class DenseGemmPersistentKernelSm100:
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         # Arrive the ab empty mbar with `tcgen05.commit.mbarrier::arrive::one`
+                        # only by the leader CTA
                         ab_pipeline.consumer_release(ab_consumer_state)
 
                     # Peek for the next ab full mbar to be arrived by the tma producer w/o blocking only by the leader CTA
@@ -1219,13 +1218,13 @@ class DenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Partition for epilogue
             # /////////////////////////////////////////////////////////////////////////////
+            epi_tidx = tidx
             
             # tiled_copy_t2r: 
             #   layout_src_tv: (32,1024):(0,1) | layout_src_tv_tiled: ((32,4),((32,32),1)):((0,1),((128,4),0))
             #   layout_dst_tv: (32,32):(32,1) | layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))
             # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, EPI_STAGES=2):(((1,65536),0),0,0,0,32,128)
             # tTR_rAcc: ((32,1),1,1):((1,0),0,0)
-            epi_tidx = tidx
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
@@ -1328,26 +1327,10 @@ class DenseGemmPersistentKernelSm100:
                 if const_expr(self.use_tma_store):
                     # ((ATOM_V, REST_V), EPI_M, EPI_N)
                     # (TMA=((32,128),1),EPI_M=1, EPI_N=4)
-                    bSG_gC = bSG_gC_partitioned[
-                        (
-                            None,
-                            None,
-                            None,
-                            *mma_tile_coord_mnl, # slice RestM8 and RestN32 and RestL1 idx
-                        )
-                    ]
+                    bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)] # slice RestM8 and RestN32 and RestL1 idx
                 else:
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
-                    tTR_gC = tTR_gC_partitioned[
-                        (
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            *mma_tile_coord_mnl, # slice RestM8 and RestN32 and RestL1 idx
-                        )
-                    ]
+                    tTR_gC = tTR_gC_partitioned[(None, None, None, None, None, *mma_tile_coord_mnl)] # slice RestM8 and RestN32 and RestL1 idx
 
                 # Set tensor memory buffer for current tile
                 # (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4)
@@ -1430,7 +1413,9 @@ class DenseGemmPersistentKernelSm100:
                             )
                             
                             c_pipeline.producer_commit() # `cp.async.bulk.commit_group`
-                            c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1)` 
+                            # NOTE: with `read=True`, it only waits for the source smem buffer completely read
+                            # then it can be reused, no need to wait for the gmem store to be completed
+                            c_pipeline.producer_acquire() # `cp.async.bulk.wait_group(num_stages-1).read` 
                         
                         cute.arch.barrier( # wait warp0 before next iteration
                             barrier_id=self.epilog_sync_bar_id,
@@ -1492,7 +1477,7 @@ class DenseGemmPersistentKernelSm100:
             #  Wait for C store complete
             # /////////////////////////////////////////////////////////////////////////////
             if const_expr(self.use_tma_store):
-                c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0)`
+                c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0).read`
 
     def epilog_tmem_copy_and_partition(
         self,
