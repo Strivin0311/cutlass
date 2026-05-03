@@ -1103,10 +1103,19 @@ class GroupedGemmPersistentKernelSm100:
                 num_prev_k_blk = total_k_tile_cnt
                 total_k_tile_cnt += cur_k_tile_cnt
 
-                # Peek for the first ab empty mbar to be arrived by the consumer w/o blocking
+                # Init the first stage idx and the mbar phase
                 tma_wr_k_tile = cutlass.Int32(0)
                 smem_wr_stage_idx = (num_prev_k_blk + tma_wr_k_tile) % self.num_ab_stage
-                tma_wr_ab_empty_phase = (num_prev_k_blk + tma_wr_k_tile) // self.num_ab_stage % 2 ^ 1
+                tma_wr_ab_empty_phase = (
+                    # NOTE:
+                    #   1. each new round across a whole smem stages, we need to toggle the phase
+                    #       since the mbar's parity will automatically toggle when one mbar.wait is done
+                    #   2. since the mbar's parity is initialized to 0, thus the producer needs to initialize its phase to 1 (i.e. ^1)
+                    #       to make the first wait directly succeed  (mbar.wait when parity == phase until the expected count is arrived)
+                    (num_prev_k_blk + tma_wr_k_tile) // self.num_ab_stage % 2 ^ 1
+                )
+                
+                # Peek for the first ab empty mbar to be arrived by the consumer w/o blocking
                 peek_ab_empty_status = cute.arch.mbarrier_conditional_try_wait(
                     tma_wr_k_tile < cur_k_tile_cnt,
                     ab_empty_mbar_ptr + smem_wr_stage_idx,
@@ -1265,14 +1274,17 @@ class GroupedGemmPersistentKernelSm100:
                 num_prev_k_blk = total_k_tile_cnt
                 total_k_tile_cnt += cur_k_tile_cnt
 
-                # Peek for the first ab full mbar to be arrived by the producer w/o blocking only by the leader CTA
+                # Init the first stage idx and the mbar phase
                 mma_rd_k_tile = cutlass.Int32(0)
                 smem_rd_stage_idx = (num_prev_k_blk + mma_rd_k_tile) % self.num_ab_stage
+                mma_rd_ab_full_phase = (
+                    # NOTE: different from the producer, the consumer does not need to toggle the phase for the first wait
+                    (num_prev_k_blk + mma_rd_k_tile) // self.num_ab_stage % 2
+                )
+                
+                # Peek for the first ab full mbar to be arrived by the producer w/o blocking only by the leader CTA
                 need_check_rd_buffer_full = (
                     mma_rd_k_tile < cur_k_tile_cnt and is_leader_cta
-                )
-                mma_rd_ab_full_phase = (
-                    (num_prev_k_blk + mma_rd_k_tile) // self.num_ab_stage % 2
                 )
                 peek_ab_full_status = cute.arch.mbarrier_conditional_try_wait(
                     need_check_rd_buffer_full,
@@ -1283,6 +1295,7 @@ class GroupedGemmPersistentKernelSm100:
                 # Wait for the first acc empty mbar to be arrived by the epilogue consumer only by the leader CTA
                 if is_leader_cta:
                     acc_empty_phase = (
+                        # NOTE: as the acc producer, we need to toggle the phase for the first wait to directly pass
                         tile_sched.num_tiles_executed // self.num_acc_stage % 2 ^ 1
                     )
                     cute.arch.mbarrier_wait(
@@ -1533,7 +1546,10 @@ class GroupedGemmPersistentKernelSm100:
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_buf_stage_idx)]
 
                 # Wait for the first acc full mbar to be arrived by the epilogue producer only by the leader CTA
-                acc_full_phase = tile_sched.num_tiles_executed // self.num_acc_stage % 2
+                acc_full_phase = (
+                    # NOTE: as the acc consumer, we do not need to toggle the phase for the first wait
+                    tile_sched.num_tiles_executed // self.num_acc_stage % 2
+                )
                 cute.arch.mbarrier_wait(acc_full_mbar_ptr + acc_buf_stage_idx, acc_full_phase)
 
                 # Group the EPI_M and EPI_N modes together
