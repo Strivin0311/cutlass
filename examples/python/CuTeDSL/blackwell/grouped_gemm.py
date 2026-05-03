@@ -193,7 +193,7 @@ GMEM mode  (delegate=False, init written to GMEM by TMA warp itself):
   TMA warp:  [init_A→GMEM][init_B→GMEM] | [delinearize_z][fence_init][update_AB][fence_upd][TMA load]...
   MMA warp:  [idle (nothing to do yet) ] | [tmem_ptr_sync][mma work]...
               ^^^^^^^^^^^^^^^^^^^^^^^^
-              TMA warp is blocked here writing 2×128B to slow GMEM before it can
+              TMA warp is blocked here writing 2x128B to slow GMEM before it can
               even start scheduling work.  The init cost is fully exposed.
 
 SMEM mode  (delegate=True, init written to SMEM by MMA warp):
@@ -1135,6 +1135,8 @@ class GroupedGemmPersistentKernelSm100:
         )
         
         # Setup tensormap initialization pointer based on the mode
+        # GMEM mode: directly write to the gmem tensormap buffer
+        # SMEM mode: write to the smem buffer first and then copy to gmem
         if const_expr(
             self.tensormap_update_mode == utils.TensorMapUpdateMode.SMEM
         ):
@@ -1151,6 +1153,9 @@ class GroupedGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.tma_warp_id:
             # Initialize tensormaps for A, B if not delegated to the mma warp
+            # which will call `copy_tensormap` to copy all the TMA desc information to the `dst_ptr`
+            # including the (1) base address, shape and stride, (2) dtype, (3) swizzle, (4) LBO SBO, etc,
+            # in which (1) will be updated whenever a new group first enters the mainloop by `update_tensormap`
             if const_expr(self.delegate_tensormap_ab_init == False):
                 tensormap_manager.init_tensormap_from_atom(
                     copy_atom=tma_atom_a, 
