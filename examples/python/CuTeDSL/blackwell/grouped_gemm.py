@@ -866,7 +866,7 @@ class GroupedGemmPersistentKernelSm100:
         if warp_idx == self.mma_warp_id:
             for acc_stage in range(self.num_acc_stage):
                 num_acc_producer = 1
-                num_acc_consumer = self.epilogue_threads * (2 if use_2cta_instrs else 1) // 32
+                num_acc_consumer = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
                 with cute.arch.elect_one():
                     # NOTE: only the umma consumer/acc producer of the leader CTA will arrive the acc full mbar,
                     # which uses the `tcgen05.commit`'s mcast_mask mechanism to multicast to the epilogue warps in both CTAs
@@ -892,8 +892,8 @@ class GroupedGemmPersistentKernelSm100:
         # Fence all the mbars initialized above before any thread (in the CTA) can access them
         cute.arch.mbarrier_init_fence()
 
-        # Cluster arrive after barrier init 
-        # to wait all CTAs in the cluster to finish all the mbars
+        # Cluster arrive after barrier init
+        # for later waiting all CTAs in the cluster to finish all the mbars
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
@@ -1103,6 +1103,7 @@ class GroupedGemmPersistentKernelSm100:
         #  Cluster wait before tensor memory alloc
         # /////////////////////////////////////////////////////////////////////////////
         if cute.size(self.cluster_shape_mn) > 1:
+            # wait all CTAs in the cluster to finish all the mbars
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier(

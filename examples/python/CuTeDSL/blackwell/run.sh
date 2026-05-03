@@ -10,8 +10,8 @@ export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_M
 # TEST_SCRIPT="dense_gemm"
 # TEST_SCRIPT="dense_gemm_software_pipeline"
 # TEST_SCRIPT="dense_gemm_persistent"
-# TEST_SCRIPT="dense_blockscaled_gemm_persistent"
-TEST_SCRIPT="grouped_gemm"
+TEST_SCRIPT="dense_blockscaled_gemm_persistent"
+# TEST_SCRIPT="grouped_gemm"
 # TEST_SCRIPT="fmha"
 
 if [[ $DEBUG_MODE -eq 1 ]]; then

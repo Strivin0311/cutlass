@@ -375,6 +375,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         # sB: S<3,4,3> o 0 o (MMA=(64,64),MMA_N=1,MMA_K=4,MMA_STAGES=7):((256,1),0,64,16384)
         # sSFA: ((Atom_M=((32,4),1), Atom_K=(16,4)),MMA_M=1,MMA_K=4,MMA_STAGES=7):((((16,4),0),(0,1)),0,512,2048)
         # sSFB: (Atom_N=(((32,4),1), Atom_K=(16,4)),MMA_M=1,MMA_K=4,MMA_STAGES=7):((((16,4),0),(0,1)),0,512,2048)
+        #   NOTE: sSFB has a double size of the sharded sB, i.e. it is replicated within the CTA-pair, to allow TMA multicasting
         # sC: S<2,4,3> o 0 o (epi_tileM=(8,16), epi_tileN=(32,1), epi_stages=(1,3)):((32,256),(1,0),(0,4096))
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -492,13 +493,24 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         self._setup_attributes()
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-        # ((Atom_M, Rest_M)=((32,4),16),(Atom_K, Rest_K)=((16,4),16),RestL=(1,1))
+        # ((Atom_M,Rest_M)=((32,4),16),(Atom_K,Rest_K)=((16,4),16),RestL=(1,1)):(((16,4),8192),((0,1),512),(0,131072))
+        # 
+        # NOTE: from the layout above, we can figure out that:
+        #   1. the mimimum block is a (M4,K4):(4,1) row-major block, 
+        #       where the K4 will expand 16 times to (SFV16,K4):(0,1), 
+        #       and the M4 will repeat 32 times to (Row32,M4):(16,4)
+        #       to form a large expanded SF tile atom as (Atom_M(32,4), Atom_K(16,4)):((16,4), (0,1))
+        #   2. then the mimimum M/N size for tiled MMA should be 32x4 = 128,
+        #       while the mimimum K size for tiled MMA should be 16x4 = 64
+        #       and that's probably why our chosen CTA tiled shape for a single mma is (M128, N128, K64)
+        #   3. see https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-1x
+        #       for more details abouot how scale factors are laid out in memory and accessed by tcgen05.mma instructions
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             a_tensor.shape, self.sf_vec_size
         )
         sfa_tensor = cute.make_tensor(sfa_tensor.iterator, sfa_layout)
 
-        # ((Atom_N, Rest_N)=((32,4),32),(Atom_K, Rest_K)=((16,4),16),RestL=(1,1))
+        # ((Atom_N,Rest_N)=((32,4),32),(Atom_K,Rest_K)=((16,4),16),RestL=(1,1)):(((16,4),8192),((0,1),512),(0,262144))
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
             b_tensor.shape, self.sf_vec_size
         )
@@ -556,7 +568,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             self.sfa_smem_layout_staged, (None, None, None, 0)
         )
         
-        # tma_atom_sfa: Src: (2,2048):(2048,1) | Dst: (2,2048):(2048,1)
+        # tma_atom_sfa: Src: (2,2048):(2048,1) | Dst: (2,2048):(2048,1), where CTA_tileM128 x tileK256 / SFV16 = 2k
         # tma_tensor_sfa: ((Atom_M, Rest_M)=((32,4),16),(Atom_K, Rest_K)=((16,4),16),RestL=(1,1)):(((8@0,2@0),1@2),((0,1/2@0),1@1),(0,1@3))
         tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
             sfa_op,
@@ -565,6 +577,8 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             self.mma_tiler_mnk,
             tiled_mma,
             self.cluster_layout_vmnk.shape,
+            # NOTE: we use int16 to access the SF factors, 
+            # so if it's fp8e8m0, we will have a factorial stride of 1/2
             internal_type=cutlass.Int16,
         )
 
@@ -587,6 +601,8 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             self.mma_tiler_sfb,
             tiled_mma_sfb,
             self.cluster_layout_sfb_vmnk.shape,
+            # NOTE: we use int16 to access the SF factors, 
+            # so if it's fp8e8m0, we will have a factorial stride of 1/2
             internal_type=cutlass.Int16,
         )
 
@@ -615,7 +631,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
         
-        self.tile_sched_params, grid = self._compute_grid(
+        self.tile_sched_params, grid = self._compute_grid( # (CGA_M2, 1, num_persist_clusters=74)
             c_tensor,
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
@@ -679,7 +695,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
 
         self.shared_storage = SharedStorage
 
-        if cutlass.const_expr(self.debug_print):
+        if const_expr(self.debug_print):
             print()
             print(f"{self.a_dtype=}, {self.b_dtype=}, {self.sf_dtype=}, {self.c_dtype=}, {self.a_major_mode=}, {self.b_major_mode=}, {self.c_layout=}")
             print(f"{a_copy_size=}, {b_copy_size=}, {sfa_copy_size=}, {sfb_copy_size=}, {self.num_tma_load_bytes=}")
@@ -778,8 +794,15 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        use_2cta_instrs = self.use_2cta_instrs
+        
+        # used only for debug print
+        is_print_block = (bidx == 0) and (bidy == 0) and (bidz == 0)  # pick a leader CTA
+        is_print_thread = (tidx == 127) and is_print_block
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Prefetch tma descriptor
@@ -791,31 +814,22 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
 
-        use_2cta_instrs = self.atom_thr_size == 2
-
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup cta/thread coordinates
         # /////////////////////////////////////////////////////////////////////////////
         # Coords inside cluster
-        bidx, bidy, bidz = cute.arch.block_idx()
-        mma_tile_coord_v = bidx % self.atom_thr_size
-        is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+        
+        mma_tile_coord_v = bidx % self.atom_thr_size # CTA idx in the CTA-pair
+        is_leader_cta = mma_tile_coord_v == 0 # leader CTA in the CTA-pair
+        cta_rank_in_cluster = cute.arch.make_warp_uniform( # CTA idx in the cluster, which might be different from mma_tile_coord_v if cluster size > 2
             cute.arch.block_idx_in_cluster()
         )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord( # CTA (CGA_V2, CGA_M1, CGA_N1, CGA_K1) coord in the cluster
             cta_rank_in_cluster
         )
-        block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
+        block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord( # CTA (CGA_V1, CGA_M2, CGA_N1, CGA_K1) coord in the cluster for SFB multicast
             cta_rank_in_cluster
-        )
-        # Coord inside cta
-        tidx, _, _ = cute.arch.thread_idx()
-
-        # used only for debug print
-        is_print_block = False # DE-BUG
-        # is_print_block = (bidx == 0) and (bidy == 0) and (bidz == 0)  # pick a leader CTA
-        is_print_thread = (tidx == 127) and is_print_block
+        )        
 
         if const_expr(self.debug_print):
             if is_print_thread:
@@ -837,27 +851,42 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         acc_full_empty_mbar_ptr = storage.acc_full_empty_mbar_ptr.data_ptr()
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        num_tma_producer = 1
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(
+            # full mbar of this CTA will be arrived by this CTA's TMA producer warp once
+            # if this CTA is the leader CTA, otherwise no need to arrive since only the mma warp on the leader CTA will wait for it
+            pipeline.Agent.Thread, size=num_tma_producer
+        )
+        num_tma_consumer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_tma_producer
+            # empty mbar of this CTA will be arrived by all the multicasted CTAs' UMMA consumer warps
+            pipeline.Agent.Thread, size=num_tma_consumer
         )
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=ab_full_empty_mbar_ptr,
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
             consumer_group=ab_pipeline_consumer_group,
+            # Total sA/sB/sSFA/sSFB size per stage x atom_thr_size,
+            # Although only TMA producer warp from the leader CTA will arrive the full mbar and set this tx_count
+            # TMA hardware will handle the CTA-pair thing and reduce the transaction count correctly on leader CTA's waiting for the full mbar
             tx_count=self.num_tma_load_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
         # Initialize acc_pipeline (barrier) and states
-        acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
+        num_acc_producer = 1
+        acc_pipeline_producer_group = pipeline.CooperativeGroup(
+            # only the mma warp in the leader CTA will arrive the acc full mbar
+            # using `tcgen05.commit.mbarrier::arrive::one` to auto-multicast to each CTA's epilogue warps
+            pipeline.Agent.Thread, size=num_acc_producer
         )
+        # all the epilogue warps in the CTA-pair are the acc consumers
+        num_acc_consumer = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, num_acc_consumer_threads
+            # empty mbar of this CTA will be arrived by all epilogue warps in the CTA-pair if this is a leader CTA,
+            # where the epilogue warps in non-leader CTA will mapa the acc empty mbar of the corr. leader CTA and arrive it remotely
+            pipeline.Agent.Thread, size=num_acc_consumer
         )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=acc_full_empty_mbar_ptr,
@@ -870,45 +899,54 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
             if warp_idx == self.tma_warp_id:
+                # NOTE: all the threads in the first epilogue warp of the peer CTA-pair
+                # will arrive at self's mbar to tell remote tmem is ready to deallocate
+                # and this CTA will do the same to arrive at peer's mbar and then wait for self's mbar to be arrived
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_init(
                         tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
                     )
+                    
+        # Fence all the mbars initialized above before any thread (in the CTA) can access them
         cute.arch.mbarrier_init_fence()
 
         # Cluster arrive after barrier init
+        # for later waiting all CTAs in the cluster to finish all the mbars
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Setup smem tensor A/B/SFA/SFB/C
         # /////////////////////////////////////////////////////////////////////////////
-        # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sC = storage.sC.get_tensor(
-            c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
-        )
-        # (MMA, MMA_M, MMA_K, STAGE)
+        
+        # (MMA=(128,64), MMA_M=1, MMA_K=4, STAGE=7) => M-sliced within CTA-pair
         sA = storage.sA.get_tensor(
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
         )
-        # (MMA, MMA_N, MMA_K, STAGE)
+        # (MMA=(64,64), MMA_N=1, MMA_K=4, STAGE=7) => N-shared within CTA-pair
         sB = storage.sB.get_tensor(
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
-        # (MMA, MMA_M, MMA_K, STAGE)
+        # (MMA=((32,4),1),(16,4)), MMA_M=1, MMA_K=4, STAGE=7) => M-sliced within CTA-pair
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
-        # (MMA, MMA_N, MMA_K, STAGE)
+        # (MMA=((32,4),1),(16,4)), MMA_N=1, MMA_K=4, STAGE=7) => N-replicated within CTA-pair
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        # (EPI_M=(8,16), EPI_N=(32,1), EPI_STAGE=(1,3))
+        sC = storage.sC.get_tensor(
+            c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
+        )
 
         if const_expr(self.debug_print):
             if is_print_thread:
+                # FIXME: when printing tensor for this block-scaled script, 
+                # it will stuck at the compiling, but fine with other scripts, need to investigate later
                 cute.printf("")
-                cute.printf("sA: {}", sA)
-                cute.printf("sB: {}", sB)
-                cute.printf("sSFA: {}", sSFA)
-                cute.printf("sSFB: {}", sSFB)
-                cute.printf("sC: {}", sC)
+                cute.printf("sA.layout: {}", sA.layout)
+                cute.printf("sB.layout: {}", sB.layout)
+                cute.printf("sSFA.layout: {}", sSFA.layout)
+                cute.printf("sSFB.layout: {}", sSFB.layout)
+                cute.printf("sC.layout: {}", sC.layout)
                 cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -919,17 +957,25 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
         if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(01), only for itself
+                cluster_layout_vmnk, 
+                block_in_cluster_coord_vmnk, 
+                mcast_mode=2
             )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(01), only for itself
+                cluster_layout_vmnk, 
+                block_in_cluster_coord_vmnk,
+                mcast_mode=1
             )
-            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
+            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(01), only for itself
+                cluster_layout_vmnk, 
+                block_in_cluster_coord_vmnk, 
+                mcast_mode=2
             )
-            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1
+            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask( # 0b(11), multicast to self and peer CTAs
+                cluster_layout_sfb_vmnk,
+                block_in_cluster_coord_sfb_vmnk, 
+                mcast_mode=1
             )
 
         if const_expr(self.debug_print):
@@ -942,80 +988,84 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Local_tile partition global tensors
         # /////////////////////////////////////////////////////////////////////////////
-        # (bM, bK, RestM, RestK, RestL)
+        
+        # (tileM=256, tileK=256, restM=8, restK=4, restL=1)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, RestN, RestK, RestL)
+        # (tileN=128, tileK=256, restN=32, restK=4, restL=1)
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None)
         )
-        # (bM, bK, RestM, RestK, RestL)
+        # ((SF_atomM,SF_restM)=(32,4,2),(SF_atomK,SF_restK)=(16,4,4), restM=8, restK=4, restL=1)
         gSFA_mkl = cute.local_tile(
             mSFA_mkl, cute.slice_(self.mma_tiler_mnk, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, RestN, RestK, RestL)
+        # ((SF_atomN,SF_restN)=(32,4,1),(SF_atomK,SF_restK)=(16,4,4), restN=32, restK=4, restL=1)
         gSFB_nkl = cute.local_tile(
             mSFB_nkl, cute.slice_(self.mma_tiler_mnk, (0, None, None)), (None, None, None)
         )
-        # (bM, bN, RestM, RestN, RestL)
+        # (tileM=256, tileN=128, restM=8, restN=32, restL=1)
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler_mnk, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cute.size(gA_mkl, mode=[3]) # restK=4 dim for the iterations in the mainloop
 
         if const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
                 cute.printf("k_tile_cnt: {}", k_tile_cnt)
-                cute.printf("mA_mkl: {}", mA_mkl)
-                cute.printf("mB_nkl: {}", mB_nkl)
-                cute.printf("mSFA_mkl: {}", mSFA_mkl)
-                cute.printf("mSFB_nkl: {}", mSFB_nkl)
-                cute.printf("mC_mnl: {}", mC_mnl)
+                cute.printf("mA_mkl.layout: {}", mA_mkl.layout)
+                cute.printf("mB_nkl.layout: {}", mB_nkl.layout)
+                cute.printf("mSFA_mkl.layout: {}", mSFA_mkl.layout)
+                cute.printf("mSFB_nkl.layout: {}", mSFB_nkl.layout)
+                cute.printf("mC_mnl.layout: {}", mC_mnl.layout)
                 cute.printf("")
-                cute.printf("gA_mkl: {}", gA_mkl)
-                cute.printf("gB_nkl: {}", gB_nkl)
-                cute.printf("gSFA_mkl: {}", gSFA_mkl)
-                cute.printf("gSFB_nkl: {}", gSFB_nkl)
-                cute.printf("gC_mnl: {}", gC_mnl)
+                cute.printf("gA_mkl.layout: {}", gA_mkl.layout)
+                cute.printf("gB_nkl.layout: {}", gB_nkl.layout)
+                cute.printf("gSFA_mkl.layout: {}", gSFA_mkl.layout)
+                cute.printf("gSFB_nkl.layout: {}", gSFB_nkl.layout)
+                cute.printf("gC_mnl.layout: {}", gC_mnl.layout)
                 cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v) # slice with CTA-pair idx
+        thr_mma_sfb = tiled_mma_sfb.get_slice(mma_tile_coord_v) # slice with CTA-pair idx
+        
+        # (MMA=(128,64), MMA_M=1, MMA_K=4, RestM=8, RestK=4, RestL=1)
         tCgA = thr_mma.partition_A(gA_mkl)
-        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
+        # (MMA=(64,64), MMA_N=1, MMA_K=4, RestN=32, RestK=4, RestL=1)
         tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
+        # (SF_atom=((32,4),(16,4)), SF_restM=1, SF_restK=4, RestM=8, RestK=4, RestL=(1,1))
         tCgSFA = thr_mma.partition_A(gSFA_mkl)
-        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
+        # (SF_atom=((32,4),(16,4)), SF_restN=1, SF_restK=4, RestN=32, RestK=4, RestL=(1,1))
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
-        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+        # (MMA=(128,128), MMA_M=1, MMA_N=1, RestM=8, RestN=32, RestL=1)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         if const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
-                cute.printf("tCgA: {}", tCgA)
-                cute.printf("tCgB: {}", tCgB)
-                cute.printf("tCgSFA: {}", tCgSFA)
-                cute.printf("tCgSFB: {}", tCgSFB)
-                cute.printf("tCgC: {}", tCgC)
+                cute.printf("tCgA.layout: {}", tCgA.layout)
+                cute.printf("tCgB.layout: {}", tCgB.layout)
+                cute.printf("tCgSFA.layout: {}", tCgSFA.layout)
+                cute.printf("tCgSFB.layout: {}", tCgSFB.layout)
+                cute.printf("tCgC.layout: {}", tCgC.layout)
                 cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition global/shared tensor for TMA load A/B/SFA/SFB
         # /////////////////////////////////////////////////////////////////////////////
+        
         # TMA load A partition_S/D
-        a_cta_layout = cute.make_layout(
+        a_cta_layout = cute.make_layout( # (1):(0)
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestM, RestK, RestL)
+        
+        # tAsA: ((TMA_atom_v, rest_v)=(32768,1), PIPE=7)
+        # tAgA: ((TMA_atom_v, rest_v)=((256,128),1), RestM=8, RestK=4, RestL=1)
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
@@ -1023,12 +1073,14 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
+        
         # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(
+        b_cta_layout = cute.make_layout( # (1):(0)
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestN, RestK, RestL)
+        
+        # tBsB: ((TMA_atom_v, rest_v)=(16384,1), PIPE=7)
+        # tBgB: ((TMA_atom_v, rest_v)=(((256,64),1), RestN=32, RestK=4, RestL=1)
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
@@ -1038,53 +1090,65 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         )
 
         #  TMA load SFA partition_S/D
-        sfa_cta_layout = a_cta_layout
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestM, RestK, RestL)
-        tAsSFA, tAgSFA = cute.nvgpu.cpasync.tma_partition(
+        sfa_cta_layout = a_cta_layout # (1):(0)
+        
+        # tAsSFA: ((TMA_atom_v, rest_v)=(2048, SFV=1), PIPE=7)
+        # tAgSFA: ((TMA_atom_v, rest_v)=((512,4), SFV=1), RestM=8, RestK=4, RestL=1):(((1/2@0,1@1),0),2@2,4@1,(0,1@3))
+        #   where 512 = 32rows x M4 x K4, with SF_atomK4
+        #   NOTE: the first mode0 has a stride of 1/2, since we use int16 (internal dtype) to access the SF factors
+        #   so each 1/2 step we have a fp8e8m0 SF factor embedded in an int16
+        tAsSFA_, tAgSFA_ = cute.nvgpu.cpasync.tma_partition(
             tma_atom_sfa,
             block_in_cluster_coord_vmnk[2],
             sfa_cta_layout,
             cute.group_modes(sSFA, 0, 3),
             cute.group_modes(tCgSFA, 0, 3),
         )
-        tAsSFA = cute.filter_zeros(tAsSFA)
-        tAgSFA = cute.filter_zeros(tAgSFA)
+        tAsSFA = cute.filter_zeros(tAsSFA_) # filter out the zero-strided dims like SFV dim 16
+        tAgSFA = cute.filter_zeros(tAgSFA_) # filter out the zero-strided dims like SFV dim 16
 
         # TMA load SFB partition_S/D
-        sfb_cta_layout = cute.make_layout(
+        sfb_cta_layout = cute.make_layout( # (2):(1) => SFB needs to be multicast to 2 CTAs in the CTA-pair
             cute.slice_(cluster_layout_sfb_vmnk, (0, None, 0, 0)).shape
         )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), RestN, RestK, RestL)
-        tBsSFB, tBgSFB = cute.nvgpu.cpasync.tma_partition(
+        
+        # tAsSFB: ((TMA_atom_v, rest_v)=(2048, SFV=1), PIPE=7)
+        # tAgSFB: ((TMA_atom_v, rest_v)=((512,4), SFV=1), RestN=32, RestK=4, RestL=1):(((1/2@0,1@1),0),1@2,4@1,(0,1@3))
+        #   where 512 = 32rows x M4 x K4, with SF_atomK4
+        #   NOTE: the first mode0 has a stride of 1/2, since we use int16 (internal dtype) to access the SF factors
+        #   so each 1/2 step we have a fp8e8m0 SF factor embedded in an int16
+        tBsSFB_, tBgSFB_ = cute.nvgpu.cpasync.tma_partition(
             tma_atom_sfb,
             block_in_cluster_coord_sfb_vmnk[1],
             sfb_cta_layout,
             cute.group_modes(sSFB, 0, 3),
             cute.group_modes(tCgSFB, 0, 3),
         )
-        tBsSFB = cute.filter_zeros(tBsSFB)
-        tBgSFB = cute.filter_zeros(tBgSFB)
+        tBsSFB = cute.filter_zeros(tBsSFB_) # filter out the zero-strided dims like SFV dim 16
+        tBgSFB = cute.filter_zeros(tBgSFB_) # filter out the zero-strided dims like SFV dim 16
 
         if const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
                 cute.printf("a_cta_layout: {}", a_cta_layout)
-                cute.printf("tAsA: {}", tAsA)
-                cute.printf("tAgA: {}", tAgA)
+                cute.printf("tAsA.layout: {}", tAsA.layout)
+                cute.printf("tAgA.layout: {}", tAgA.layout)
                 cute.printf("")
                 cute.printf("b_cta_layout: {}", b_cta_layout)
-                cute.printf("tBsB: {}", tBsB)
-                cute.printf("tBgB: {}", tBgB)
+                cute.printf("tBsB.layout: {}", tBsB.layout)
+                cute.printf("tBgB.layout: {}", tBgB.layout)
                 cute.printf("")
                 cute.printf("sfa_cta_layout: {}", sfa_cta_layout)
-                cute.printf("tAsSFA: {}", tAsSFA)
-                cute.printf("tAgSFA: {}", tAgSFA)
+                cute.printf("tAsSFA_.layout: {}", tAsSFA_.layout)
+                cute.printf("tAsSFA.layout: {}", tAsSFA.layout)
+                cute.printf("tAgSFA_.layout: {}", tAgSFA_.layout)
+                cute.printf("tAgSFA.layout: {}", tAgSFA.layout)
                 cute.printf("")
                 cute.printf("sfb_cta_layout: {}", sfb_cta_layout)
-                cute.printf("tBsSFB: {}", tBsSFB)
-                cute.printf("tBgSFB: {}", tBgSFB)
+                cute.printf("tBsSFB_.layout: {}", tBsSFB_.layout)
+                cute.printf("tBsSFB.layout: {}", tBsSFB.layout)
+                cute.printf("tBgSFB_.layout: {}", tBgSFB_.layout)
+                cute.printf("tBgSFB.layout: {}", tBgSFB.layout)
                 cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -1101,18 +1165,19 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        if const_expr(self.debug_print):
-            if is_print_thread:
-                cute.printf("")
-                cute.printf("tCrA.layout: {}", tCrA.layout)
-                cute.printf("tCrB.layout: {}", tCrB.layout)
-                cute.printf("tCtAcc_fake.layout: {}", tCtAcc_fake.layout)
-                cute.printf("")
+        # if const_expr(self.debug_print):
+        #     if is_print_thread:
+        #         cute.printf("")
+        #         cute.printf("tCrA.layout: {}", tCrA.layout)
+        #         cute.printf("tCrB.layout: {}", tCrB.layout)
+        #         cute.printf("tCtAcc_fake.layout: {}", tCtAcc_fake.layout)
+        #         cute.printf("")
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Cluster wait before tensor memory alloc
         # /////////////////////////////////////////////////////////////////////////////
         if cute.size(self.cluster_shape_mn) > 1:
+            # wait all CTAs in the cluster to finish all the mbars
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier(
@@ -1169,16 +1234,16 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                if const_expr(self.debug_print):
-                    is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
-                    if (tidx == 32 * self.tma_warp_id) and is_print_block and is_first_work_tile:
-                        cute.printf("")
-                        cute.printf("[TMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
-                        cute.printf("[TMA warp] tAgA_slice: {}", tAgA_slice)
-                        cute.printf("[TMA warp] tBgB_slice: {}", tBgB_slice)
-                        cute.printf("[TMA warp] tAgSFA_slice: {}", tAgSFA_slice)
-                        cute.printf("[TMA warp] tBgSFB_slice: {}", tBgSFB_slice)
-                        cute.printf("")
+                # if const_expr(self.debug_print):
+                #     is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
+                #     if (tidx == 32 * self.tma_warp_id) and is_print_block and is_first_work_tile:
+                #         cute.printf("")
+                #         cute.printf("[TMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                #         cute.printf("[TMA warp] tAgA_slice: {}", tAgA_slice)
+                #         cute.printf("[TMA warp] tBgB_slice: {}", tBgB_slice)
+                #         cute.printf("[TMA warp] tAgSFA_slice: {}", tAgSFA_slice)
+                #         cute.printf("[TMA warp] tBgSFB_slice: {}", tBgSFB_slice)
+                #         cute.printf("")
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
@@ -1300,13 +1365,13 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             )
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
 
-            if const_expr(self.debug_print):
-                if (tidx == 32 * self.mma_warp_id) and is_print_block:
-                    cute.printf("")
-                    cute.printf("[MMA warp] tCtAcc_base: {}", tCtAcc_base)
-                    cute.printf("[MMA warp] tCtSFA: {}", tCtSFA)
-                    cute.printf("[MMA warp] tCtSFB: {}", tCtSFB)
-                    cute.printf("")
+            # if const_expr(self.debug_print):
+            #     if (tidx == 32 * self.mma_warp_id) and is_print_block:
+            #         cute.printf("")
+            #         cute.printf("[MMA warp] tCtAcc_base: {}", tCtAcc_base)
+            #         cute.printf("[MMA warp] tCtSFA: {}", tCtSFA)
+            #         cute.printf("[MMA warp] tCtSFB: {}", tCtSFB)
+            #         cute.printf("")
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Partition for S2T copy of SFA/SFB
@@ -1346,13 +1411,13 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
-                if const_expr(self.debug_print):
-                    is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
-                    if (tidx == 32 * self.mma_warp_id) and is_print_block and is_first_work_tile:
-                        cute.printf("")
-                        cute.printf("[MMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
-                        cute.printf("[MMA warp] tCtAcc: {}", tCtAcc)
-                        cute.printf("")
+                # if const_expr(self.debug_print):
+                #     is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
+                #     if (tidx == 32 * self.mma_warp_id) and is_print_block and is_first_work_tile:
+                #         cute.printf("")
+                #         cute.printf("[MMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                #         cute.printf("[MMA warp] tCtAcc: {}", tCtAcc)
+                #         cute.printf("")
 
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
@@ -1499,11 +1564,11 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
-            if const_expr(self.debug_print):
-                if (tidx == 0) and is_print_block:
-                    cute.printf("")
-                    cute.printf("[Epilog warp] tCtAcc_base: {}", tCtAcc_base)
-                    cute.printf("")
+            # if const_expr(self.debug_print):
+            #     if (tidx == 0) and is_print_block:
+            #         cute.printf("")
+            #         cute.printf("[Epilog warp] tCtAcc_base: {}", tCtAcc_base)
+            #         cute.printf("")
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Partition for epilogue
@@ -1525,19 +1590,19 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 )
             )
 
-            if const_expr(self.debug_print):
-                if (tidx == 0) and is_print_block:
-                    cute.printf("")
-                    cute.printf("[Epilog warp] tiled_copy_t2r: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_t2r.layout_src_tv, tiled_copy_t2r.layout_src_tv_tiled, tiled_copy_t2r.layout_dst_tv, tiled_copy_t2r.layout_dst_tv_tiled)
-                    cute.printf("[Epilog warp] tTR_tAcc_base: {}", tTR_tAcc_base)
-                    cute.printf("[Epilog warp] tTR_rAcc: {}", tTR_rAcc)
-                    cute.printf("[Epilog warp] tiled_copy_r2s: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_r2s.layout_src_tv, tiled_copy_r2s.layout_src_tv_tiled, tiled_copy_r2s.layout_dst_tv, tiled_copy_r2s.layout_dst_tv_tiled)
-                    cute.printf("[Epilog warp] tTR_rC: {}", tTR_rC)
-                    cute.printf("[Epilog warp] tRS_rC: {}", tRS_rC)
-                    cute.printf("[Epilog warp] tRS_sC: {}", tRS_sC)
-                    cute.printf("[Epilog warp] bSG_sC: {}", bSG_sC)
-                    cute.printf("[Epilog warp] bSG_gC_partitioned: {}", bSG_gC_partitioned)
-                    cute.printf("")
+            # if const_expr(self.debug_print):
+            #     if (tidx == 0) and is_print_block:
+            #         cute.printf("")
+            #         cute.printf("[Epilog warp] tiled_copy_t2r: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_t2r.layout_src_tv, tiled_copy_t2r.layout_src_tv_tiled, tiled_copy_t2r.layout_dst_tv, tiled_copy_t2r.layout_dst_tv_tiled)
+            #         cute.printf("[Epilog warp] tTR_tAcc_base: {}", tTR_tAcc_base)
+            #         cute.printf("[Epilog warp] tTR_rAcc: {}", tTR_rAcc)
+            #         cute.printf("[Epilog warp] tiled_copy_r2s: layout_src_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv: {} | layout_dst_tv_tiled: {}", tiled_copy_r2s.layout_src_tv, tiled_copy_r2s.layout_src_tv_tiled, tiled_copy_r2s.layout_dst_tv, tiled_copy_r2s.layout_dst_tv_tiled)
+            #         cute.printf("[Epilog warp] tTR_rC: {}", tTR_rC)
+            #         cute.printf("[Epilog warp] tRS_rC: {}", tRS_rC)
+            #         cute.printf("[Epilog warp] tRS_sC: {}", tRS_sC)
+            #         cute.printf("[Epilog warp] bSG_sC: {}", bSG_sC)
+            #         cute.printf("[Epilog warp] bSG_gC_partitioned: {}", bSG_gC_partitioned)
+            #         cute.printf("")
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Persistent tile scheduling loop
@@ -1604,16 +1669,16 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
-                if const_expr(self.debug_print):
-                    is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
-                    if (tidx == 0) and is_print_block and is_first_work_tile:
-                        cute.printf("")
-                        cute.printf("[Epilog warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
-                        cute.printf("[Epilog warp] tTR_tAcc (post-group): {}", tTR_tAcc)
-                        cute.printf("[Epilog warp] subtile_cnt: {}", subtile_cnt)
-                        cute.printf("[Epilog warp] num_prev_subtiles: {}", num_prev_subtiles)
-                        cute.printf("[Epilog warp] bSG_gC (post-group): {}", bSG_gC)
-                        cute.printf("")
+                # if const_expr(self.debug_print):
+                #     is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
+                #     if (tidx == 0) and is_print_block and is_first_work_tile:
+                #         cute.printf("")
+                #         cute.printf("[Epilog warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                #         cute.printf("[Epilog warp] tTR_tAcc (post-group): {}", tTR_tAcc)
+                #         cute.printf("[Epilog warp] subtile_cnt: {}", subtile_cnt)
+                #         cute.printf("[Epilog warp] num_prev_subtiles: {}", num_prev_subtiles)
+                #         cute.printf("[Epilog warp] bSG_gC (post-group): {}", bSG_gC)
+                #         cute.printf("")
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     # Load accumulator from tensor memory buffer to register
