@@ -524,7 +524,7 @@ class DenseGemmPersistentKernelSm100:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
         
-        self.tile_sched_params, grid = self._compute_grid(
+        self.tile_sched_params, grid = self._compute_grid( # (CGA_M2, 1, num_persist_clusters=74)
             c, 
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,

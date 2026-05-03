@@ -203,6 +203,11 @@ class GroupedGemmPersistentKernelSm100:
         buffer needed for tensormap updates.
         """
         # Configure tiled mma
+        # Thr Layout VMNK: (2,1,1,1):(1,0,0,0)
+        # Shape MNK:       (256,128,16)
+        # TV Layout A:     (2,(128,16)):(128,(1,256)) => sliced along M
+        # TV Layout B:     (2,(64,16)):(64,(1,128)) => distributed along N
+        # TV Layout C:     (2,(128,128)):(128,(1,256)) => sliced along M
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
@@ -418,14 +423,7 @@ class GroupedGemmPersistentKernelSm100:
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.a_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_tiler_mnk[:2],
-        )
+        tiled_mma = self.tiled_mma
         atom_thr_size = self.atom_thr_size
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -435,6 +433,9 @@ class GroupedGemmPersistentKernelSm100:
             self.cluster_shape_mn, self.atom_thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
+        
+        # tma_atom_a: Src: (2,8192):(8192,1) | Dst: (2,8192):(8192,1), where CTA_tileM128 x tileK64 = 8192
+        # tma_tensor_a: (pM_min=128,pK=1024,1):(1@1,1@0,1@2)
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
             initial_a,
@@ -451,6 +452,9 @@ class GroupedGemmPersistentKernelSm100:
             self.cluster_shape_mn, self.atom_thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
+        
+        # tma_atom_b: Src: (2,4096):(4096,1) | Dst: (2,4096):(4096,1), where CTA_tileN64 x tileK64 = 4096
+        # tma_tensor_b: (pN=4096, pK=1024,1):(1@1,1@0,1@2)
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             initial_b,
@@ -473,6 +477,9 @@ class GroupedGemmPersistentKernelSm100:
             cute.make_identity_layout(initial_c.shape), self.epi_tile
         )
         epi_smem_layout = cute.slice_(self.epi_smem_layout_staged, (None, None, 0))
+        
+        # tma_atom_c: Src: (1,4096):(0,1) | Dst: (1,4096):(0,1), where epi_tileM128 x epi_tileN32 = 4096
+        # tma_tensor_c: (pM_min=128, pN4096,1):(1@1,1@0,1@2)
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             initial_c,
@@ -480,7 +487,7 @@ class GroupedGemmPersistentKernelSm100:
             c_cta_v_layout,
         )
 
-        self.tile_sched_params, grid = self._compute_grid(
+        self.tile_sched_params, grid = self._compute_grid( # (CGA_M2, 1, num_persist_clusters=74)
             total_num_clusters, self.cluster_shape_mn, max_active_clusters
         )
 
@@ -490,30 +497,32 @@ class GroupedGemmPersistentKernelSm100:
         self.size_tensormap_in_i64 = (
             0
             if self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
-            else GroupedGemmPersistentKernelSm100.num_tensormaps
-            * GroupedGemmPersistentKernelSm100.bytes_per_tensormap
+            else self.num_tensormaps
+            * self.bytes_per_tensormap
             // 8
         )
 
         @cute.struct
         class SharedStorage:
+            # the smem buffer to hold tensormap when tensormap update performed on SMEM
             tensormap_buffer: cute.struct.MemRange[
                 cutlass.Int64, self.size_tensormap_in_i64
             ]
+            
+            # mainloop full/empty mbar array ptrs for each ab stage
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+            
+            # tmem accumulation full/empty mbar for each acc stage
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+            
+            # the mbar ptr to synchronize all threads in two CTAs before issuing tmem deallocation
             tmem_dealloc_mbar_ptr: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-            # (EPI_TILE_M, EPI_TILE_N, STAGE)
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype,
-                    cute.cosize(self.epi_smem_layout_staged.outer),
-                ],
-                self.buffer_align_bytes,
-            ]
+            
+            # the smem buffer to hold the allocated tmem address
+            tmem_holding_smem_buf: cutlass.Int32
+            
             # (MMA, MMA_M, MMA_K, STAGE)
             sA: cute.struct.Align[
                 cute.struct.MemRange[
@@ -528,6 +537,15 @@ class GroupedGemmPersistentKernelSm100:
                 ],
                 self.buffer_align_bytes,
             ]
+            # (EPI_TILE_M, EPI_TILE_N, STAGE)
+            sC: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.c_dtype,
+                    cute.cosize(self.epi_smem_layout_staged.outer),
+                ],
+                self.buffer_align_bytes,
+            ]
+            
 
         self.shared_storage = SharedStorage
 
@@ -536,6 +554,7 @@ class GroupedGemmPersistentKernelSm100:
             print(f"{self.a_dtype=}, {self.b_dtype=}, {self.c_dtype=}, {self.a_major_mode=}, {self.b_major_mode=}, {self.c_layout=}")
             print(f"{a_copy_size=}, {b_copy_size=}, {self.num_tma_load_bytes=}")
             print(f"{self.tile_sched_params=}")
+            print(f"{self.size_tensormap_in_i64=}")
             print()
 
             print()
@@ -553,6 +572,7 @@ class GroupedGemmPersistentKernelSm100:
             cute.printf("")
             cute.printf("tma_tensor_c: {}", tma_tensor_c)
             cute.printf("")
+            cute.printf("total_num_clusters: {}", total_num_clusters)
             cute.printf("grid: {}", grid)
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -583,7 +603,6 @@ class GroupedGemmPersistentKernelSm100:
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
         )
-        return
 
     # GPU device kernel
     @cute.kernel
@@ -676,7 +695,7 @@ class GroupedGemmPersistentKernelSm100:
         acc_full_mbar_ptr = storage.acc_full_mbar_ptr.data_ptr()
         acc_empty_mbar_ptr = storage.acc_empty_mbar_ptr.data_ptr()
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_holding_smem_buf = storage.tmem_holding_smem_buf
 
         #  init barrier for loading A, B with TMA
         if warp_idx == self.epilog_warp_id[0]:
@@ -1146,7 +1165,7 @@ class GroupedGemmPersistentKernelSm100:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
+                ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -1306,7 +1325,7 @@ class GroupedGemmPersistentKernelSm100:
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.alloc_tmem(
                     self.num_tmem_alloc_cols,
-                    tmem_holding_buf,
+                    tmem_holding_smem_buf,
                     is_two_cta=use_2cta_instrs,
                 )
 
@@ -1325,7 +1344,7 @@ class GroupedGemmPersistentKernelSm100:
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
-                ptr_to_buffer_holding_addr=tmem_holding_buf,
+                ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
@@ -2013,7 +2032,7 @@ class GroupedGemmPersistentKernelSm100:
     # Size of smem we reserved for mbarrier, tensor memory management and tensormap update
     reserved_smem_bytes = 1024
     bytes_per_tensormap = 128
-    num_tensormaps = 3
+    num_tensormaps = 3 # A/B/C
     # size of smem used for tensor memory management
     tensor_memory_management_bytes = 12
 
