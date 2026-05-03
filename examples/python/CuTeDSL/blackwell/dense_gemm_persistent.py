@@ -966,7 +966,7 @@ class DenseGemmPersistentKernelSm100:
             )
 
             # /////////////////////////////////////////////////////////////////////////////
-            #  Persistent tile loop
+            #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -978,7 +978,10 @@ class DenseGemmPersistentKernelSm100:
                     cur_tile_coord[2],
                 )
 
-                # Slice to per mma tile index
+                # /////////////////////////////////////////////////////////////////////////////
+                #  Slice to per mma tile index
+                # /////////////////////////////////////////////////////////////////////////////
+                
                 # ((atom_v, rest_v)=((64,128),1), RestK16):(((1@0,1@1),0),64@0)
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]) # slice RestM8 and RestL1 idx
@@ -1011,7 +1014,8 @@ class DenseGemmPersistentKernelSm100:
                 for k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     # Wait for current ab empty mbar to be arrived by the consumer
                     # and then arrive the ab full mbar to notify the consumer the data is ready after the TMA load
-                    # NOTE: it is only arrived by the leader CTA (inside logics), since only leader CTA waits it
+                    # NOTE: it is only arrived by the leader CTA (inside logics), since only leader CTA waits the ab empty mbar,
+                    # and accordingly, only the leader CTA's TMA producer warp needs to arrive the ab full mbar as well
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
@@ -1049,7 +1053,7 @@ class DenseGemmPersistentKernelSm100:
             ab_pipeline.producer_tail(ab_producer_state)
 
         # /////////////////////////////////////////////////////////////////////////////
-        #  Specialized MMA consumer
+        #  Specialized MMA consumer / ACC producer
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id: # umma consumer warp / epilogue acc producer warp, if on the leader CTA
             # Bar sync for retrieve tensor memory ptr from shared mem
@@ -1084,7 +1088,7 @@ class DenseGemmPersistentKernelSm100:
             )
 
             # /////////////////////////////////////////////////////////////////////////////
-            #  Persistent tile loop
+            #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1180,7 +1184,7 @@ class DenseGemmPersistentKernelSm100:
             acc_pipeline.producer_tail(acc_producer_state)
         
         # /////////////////////////////////////////////////////////////////////////////
-        #  Specialized epilogue warps
+        #  Specialized epilogue consumer
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.mma_warp_id: # epilogue acc consumer warps
             # Alloc tensor memory buffer
@@ -1307,7 +1311,7 @@ class DenseGemmPersistentKernelSm100:
             )
 
             # /////////////////////////////////////////////////////////////////////////////
-            #  Persistent tile loop
+            #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:

@@ -1154,24 +1154,34 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         # /////////////////////////////////////////////////////////////////////////////
         #  Partition shared/tensor memory tensor for TiledMMA_A/B/C
         # /////////////////////////////////////////////////////////////////////////////
-        # (MMA, MMA_M, MMA_K, STAGE)
+        
+        # (MMA=1, MMA_M=1, MMA_K=4, STAGE=7):(0,0,2,1024)
         tCrA = tiled_mma.make_fragment_A(sA)
-        # (MMA, MMA_N, MMA_K, STAGE)
+        # (MMA=1, MMA_N=1, MMA_K=4, STAGE=7):(0,0,2,512)
         tCrB = tiled_mma.make_fragment_B(sB)
-        # (MMA, MMA_M, MMA_N)
+        # (MMA=(128,128), MMA_M=1, MMA_N=1, ACC_STAGE=2):((65536,1),0,0,128)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
-        # (MMA, MMA_M, MMA_N, STAGE)
         tCtAcc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        # if const_expr(self.debug_print):
-        #     if is_print_thread:
-        #         cute.printf("")
-        #         cute.printf("tCrA.layout: {}", tCrA.layout)
-        #         cute.printf("tCrB.layout: {}", tCrB.layout)
-        #         cute.printf("tCtAcc_fake.layout: {}", tCtAcc_fake.layout)
-        #         cute.printf("")
+        if const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("tCrA.layout: {}", tCrA.layout)
+                cute.printf("tCrB.layout: {}", tCrB.layout)
+                cute.printf("tCtAcc_fake.layout: {}", tCtAcc_fake.layout)
+                cute.printf("")
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Create static persistent tile scheduler
+        # /////////////////////////////////////////////////////////////////////////////
+        
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            params=tile_sched_params,
+            block_idx=cute.arch.block_idx(),
+            grid_dim=cute.arch.grid_dim()
+        )
 
         # /////////////////////////////////////////////////////////////////////////////
         #  Cluster wait before tensor memory alloc
@@ -1185,17 +1195,9 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             )
 
         # /////////////////////////////////////////////////////////////////////////////
-        #  Specialized TMA load warp
+        #  Specialized TMA load producer
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.tma_warp_id:
-            # /////////////////////////////////////////////////////////////////////////////
-            #  Create persistent tile scheduler
-            # /////////////////////////////////////////////////////////////////////////////
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1203,11 +1205,11 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
+            work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
-                cur_tile_coord = work_tile.tile_idx
-                mma_tile_coord_mnl = (
+                cur_tile_coord = work_tile.tile_idx # block coord
+                mma_tile_coord_mnl = ( # cluster coord
                     cur_tile_coord[0] // self.atom_thr_size,
                     cur_tile_coord[1],
                     cur_tile_coord[2],
@@ -1216,47 +1218,51 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Slice to per mma tile index
                 # /////////////////////////////////////////////////////////////////////////////
-                # ((atom_v, rest_v), RestK)
+                
+                # ((atom_v, rest_v)=((256,128),1), RestK4)
                 tAgA_slice = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]) # slice RestM8 and RestL1 idx
                 ]
-                # ((atom_v, rest_v), RestK)
+                # ((atom_v, rest_v)=((256,64),1), RestK4)
                 tBgB_slice = tBgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]) # slice RestN32 and RestL1 idx
                 ]
-
-                # ((atom_v, rest_v), RestK)
+                # ((atom_v, rest_v)=((512,4),1), Rest4)
                 tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2]) # slice RestM8 and RestL1 idx
                 ]
-                # ((atom_v, rest_v), RestK)
+                # ((atom_v, rest_v)=((512,4),1), RestK4)
                 tBgSFB_slice = tBgSFB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
+                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2]) # slice RestN32 and RestL1 idx
                 ]
 
-                # if const_expr(self.debug_print):
-                #     is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
-                #     if (tidx == 32 * self.tma_warp_id) and is_print_block and is_first_work_tile:
-                #         cute.printf("")
-                #         cute.printf("[TMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
-                #         cute.printf("[TMA warp] tAgA_slice: {}", tAgA_slice)
-                #         cute.printf("[TMA warp] tBgB_slice: {}", tBgB_slice)
-                #         cute.printf("[TMA warp] tAgSFA_slice: {}", tAgSFA_slice)
-                #         cute.printf("[TMA warp] tBgSFB_slice: {}", tBgSFB_slice)
-                #         cute.printf("")
+                if const_expr(self.debug_print):
+                    is_first_work_tile = (cur_tile_coord[0] == 0) and (cur_tile_coord[1] == 0) and (cur_tile_coord[2] == 0)
+                    if (tidx == 32 * self.tma_warp_id) and is_print_block and is_first_work_tile:
+                        cute.printf("")
+                        cute.printf("[TMA warp] mma_tile_coord_mnl: ({}, {}, {})", mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                        cute.printf("[TMA warp] tAgA_slice.layout: {}", tAgA_slice.layout)
+                        cute.printf("[TMA warp] tBgB_slice.layout: {}", tBgB_slice.layout)
+                        cute.printf("[TMA warp] tAgSFA_slice.layout: {}", tAgSFA_slice.layout)
+                        cute.printf("[TMA warp] tBgSFB_slice.layout: {}", tBgSFB_slice.layout)
+                        cute.printf("")
 
-                # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
-                ab_producer_state.reset_count()
+                # Peek for the first ab empty mbar to be arrived by the consumer w/o blocking
+                ab_producer_state.reset_count() # NOTE: persistent kernel needs to reset count for each tile
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                         ab_producer_state
                     )
+                
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Tma load loop
                 # /////////////////////////////////////////////////////////////////////////////
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Conditionally wait for AB buffer empty
+                for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                    # Wait for current ab empty mbar to be arrived by the consumer
+                    # and then arrive the ab full mbar to notify the consumer the data is ready after the TMA load
+                    # NOTE: it is only arrived by the leader CTA (inside logics), since only leader CTA waits the ab empty mbar,
+                    # and accordingly, only the leader CTA's TMA producer warp needs to arrive the ab full mbar as well
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
@@ -1291,7 +1297,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                         mcast_mask=sfb_full_mcast_mask,
                     )
 
-                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
+                    # Peek for the next ab empty mbar to be arrived by the consumer w/o blocking
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -1299,48 +1305,47 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                             ab_producer_state
                         )
 
-                # /////////////////////////////////////////////////////////////////////////////
-                #  Advance to next tile
-                # /////////////////////////////////////////////////////////////////////////////
+                # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-            # /////////////////////////////////////////////////////////////////////////////
-            #  Wait A/B buffer empty
-            # /////////////////////////////////////////////////////////////////////////////
+            # Wait for the last ab empty mbar to avoid dangling signals
             ab_pipeline.producer_tail(ab_producer_state)
 
         # /////////////////////////////////////////////////////////////////////////////
-        #  Specialized MMA warp
+        #  Specialized MMA consumer / ACC producer
         # /////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.mma_warp_id:
-            # /////////////////////////////////////////////////////////////////////////////
-            #  Bar sync for retrieve tensor memory ptr from shared mem
-            # /////////////////////////////////////////////////////////////////////////////
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
+        if warp_idx == self.mma_warp_id: # umma consumer warp / epilogue acc producer warp, if on the leader CTA
+            # Bar sync for retrieve tensor memory ptr from shared mem
+            # NOTE: both umma consumer warp and epilogue warps need to sync here before retriving the tmem ptr,
+            # to ensure its visibility, allocated by the first epilogue warp and stored in shared mem
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
-                number_of_threads=tmem_ptr_read_threads,
+                number_of_threads=self.tmem_ptr_read_threads,
             )
 
             # /////////////////////////////////////////////////////////////////////////////
-            #  Retrieving tensor memory ptr and make accumulator/SFA/SFB tensor
+            #  Retrieving tensor memory ptr and make tensor for ACC/SFA/SFB
             # /////////////////////////////////////////////////////////////////////////////
+
             # Make accumulator tmem tensor
             acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 self.acc_dtype,
                 alignment=16,
                 ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
-            # (MMA, MMA_M, MMA_N, STAGE)
+            # (MMA=(128,128), MMA_M=1, MMA_N=1, ACC_STAGE=2):((65536,1),0,0,128)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
             # Make SFA tmem tensor
             sfa_tmem_ptr = cute.recast_ptr(
-                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base), # offset tmem after the accumulator tensor
                 dtype=self.sf_dtype,
             )
-            # (MMA, MMA_M, MMA_K)
+            # ((((TMEM_lanes32, M4), RestK4),(SFV16, K4)), RestM1, MK4):((((262144,4),8388608),(0,1)),0,16)
+            #   where MK4 means 4 (M4,K4) blocks share the same tmem col,
+            #   and 262144 = 65536 x 4B/sizeof(fp8) = 65536 x 4, is the tmem row stride for fp8 elems
+            #   and 8388608 = 262144 X TMEM_lanes32, is the stride for next k tile in the main loop along the RestK4 dim
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma,
                 self.mma_tiler_mnk,
@@ -1353,10 +1358,13 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             sfb_tmem_ptr = cute.recast_ptr(
                 acc_tmem_ptr
                 + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
+                + tcgen05.find_tmem_tensor_col_offset(tCtSFA), # offset tmem after the SFA tensor
                 dtype=self.sf_dtype,
             )
-            # (MMA, MMA_N, MMA_K)
+            # ((((TMEM_lanes32, M4), RestK4),(SFV16, K4)), RestM1, MK4):((((262144,4),8388608),(0,1)),0,16)
+            #   where MK4 means 4 (M4,K4) blocks share the same tmem col,
+            #   and 262144 = 65536 x 4B/sizeof(fp8) = 65536 x 4, is the tmem row stride for fp8 elems
+            #   and 8388608 = 262144 X TMEM_lanes32, is the stride for next k tile in the main loop along the RestK4 dim
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma,
                 self.mma_tiler_mnk,
@@ -1365,13 +1373,13 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             )
             tCtSFB = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
 
-            # if const_expr(self.debug_print):
-            #     if (tidx == 32 * self.mma_warp_id) and is_print_block:
-            #         cute.printf("")
-            #         cute.printf("[MMA warp] tCtAcc_base: {}", tCtAcc_base)
-            #         cute.printf("[MMA warp] tCtSFA: {}", tCtSFA)
-            #         cute.printf("[MMA warp] tCtSFB: {}", tCtSFB)
-            #         cute.printf("")
+            if const_expr(self.debug_print):
+                if (tidx == 32 * self.mma_warp_id) and is_print_block:
+                    cute.printf("")
+                    cute.printf("[MMA warp] tCtAcc_base.layout: {}", tCtAcc_base.layout)
+                    cute.printf("[MMA warp] tCtSFA.layout: {}", tCtSFA.layout)
+                    cute.printf("[MMA warp] tCtSFB.layout: {}", tCtSFB.layout)
+                    cute.printf("")
 
             # /////////////////////////////////////////////////////////////////////////////
             #  Partition for S2T copy of SFA/SFB
@@ -1386,9 +1394,6 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_consumer_state = pipeline.make_pipeline_state(
@@ -1530,8 +1535,9 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             #  Wait for accumulator buffer empty
             # /////////////////////////////////////////////////////////////////////////////
             acc_pipeline.producer_tail(acc_producer_state)
+        
         # /////////////////////////////////////////////////////////////////////////////
-        #  Specialized epilogue warps
+        #  Specialized epilogue consumer
         # /////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.mma_warp_id:
             # /////////////////////////////////////////////////////////////////////////////
@@ -1607,9 +1613,6 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             #  Persistent tile scheduling loop
             # /////////////////////////////////////////////////////////////////////////////
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             work_tile = tile_sched.initial_work_tile_info()
 
             acc_consumer_state = pipeline.make_pipeline_state(
