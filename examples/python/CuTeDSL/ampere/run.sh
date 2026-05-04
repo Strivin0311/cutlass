@@ -43,20 +43,23 @@ fi
 
 
 if [[ $TEST_SCRIPT == "elementwise_add" ]]; then
+    # Bandwidth: 2.6TB/s for fp32
     SCRIPT_CMD="
     python elementwise_add.py                                             \
-    --M $M --N $N                                                         
+    --M $M --N $N    \
+    --benchmark                                                     
     "
 elif [[ $TEST_SCRIPT == "elementwise_apply" ]]; then
     SCRIPT_CMD="
     python elementwise_apply.py                                           \
-    --M $M --N $N                                                         
+    --M $M --N $N   \
+    --benchmark                                                                
     "
 elif [[ $TEST_SCRIPT == "sgemm" ]]; then
     SCRIPT_CMD="
     python sgemm.py                                                       \
     --mnk $M,$K,$N                                                        \
-    --a_major m --b_major n --c_major n
+    --a_major k --b_major k --c_major n
     "
 elif [[ $TEST_SCRIPT == "tensorop_gemm" ]]; then
     SCRIPT_CMD="
@@ -64,7 +67,7 @@ elif [[ $TEST_SCRIPT == "tensorop_gemm" ]]; then
     --mnkl $M,$K,$N,1 --atom_layout_mnk 2,2,1                            \
     --ab_dtype Float16                                                    \
     --c_dtype Float16 --acc_dtype Float32                                 \
-    --a_major m --b_major n --c_major n
+    --a_major k --b_major k --c_major n
     "
 elif [[ $TEST_SCRIPT == "flash_attention_v2" ]]; then
     SCRIPT_CMD="

@@ -433,7 +433,7 @@ def run_elementwise_add(
     warmup_iterations=2,
     iterations=200,
 ):
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print(f"\nRunning Elementwise Add test with:")
         print(f"Tensor dimensions: [{M}, {N}]")
         print(f"Input and Output Data type: {dtype}")
@@ -448,7 +448,7 @@ def run_elementwise_add(
 
     c = torch.zeros_like(a)
 
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print(f"Input tensor shapes:")
         print(f"a: {a.shape}, dtype: {a.dtype}")
         print(f"b: {b.shape}, dtype: {b.dtype}")
@@ -469,15 +469,15 @@ def run_elementwise_add(
     else:
         c_tensor = c
 
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print("Compiling kernel with cute.compile ...")
     start_time = time.time()
     compiled_func = cute.compile(elementwise_add, a_tensor, b_tensor, c_tensor)
     compilation_time = time.time() - start_time
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print(f"Compilation time: {compilation_time:.4f} seconds")
 
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print("Executing vector add kernel...")
 
     # Get current CUstream from torch
@@ -485,10 +485,10 @@ def run_elementwise_add(
 
     if not skip_ref_check:
         compiled_func(a_tensor, b_tensor, c_tensor)
-        if const_expr(DEBUG_MODE):
+        if DEBUG_MODE:
             print("Verifying results...")
         torch.testing.assert_close(a + b, c)
-        if const_expr(DEBUG_MODE):
+        if DEBUG_MODE:
             print("Results verified successfully!")
 
     if not benchmark:
@@ -538,7 +538,7 @@ def run_elementwise_add(
     print(
         f"Achieved memory throughput: {(3 * a.numel() * dtype.width // 8) / (avg_time_us / 1e6) / 1e9:.2f} GB/s"
     )
-    if const_expr(DEBUG_MODE):
+    if DEBUG_MODE:
         print(f"First few elements of result: \n{c[:3, :3]}")
 
     # Profiling
@@ -566,8 +566,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--M", default=1024, type=int)
     parser.add_argument("--N", default=1024, type=int)
-    parser.add_argument("--warmup_iterations", default=2, type=int)
-    parser.add_argument("--iterations", default=100, type=int)
+    parser.add_argument("--warmup_iterations", default=0, type=int)
+    parser.add_argument("--iterations", default=1, type=int)
     parser.add_argument("--skip_ref_check", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
 
