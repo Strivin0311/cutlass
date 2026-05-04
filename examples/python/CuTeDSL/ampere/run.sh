@@ -57,6 +57,7 @@ elif [[ $TEST_SCRIPT == "elementwise_apply" ]]; then
     --benchmark                                                                
     "
 elif [[ $TEST_SCRIPT == "sgemm" ]]; then
+    # TFLOPS: 14 for fp32
     SCRIPT_CMD="
     python sgemm.py                                                       \
     --mnk $M,$K,$N                                                        \

@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import os
 import time
 from typing import Tuple
 
@@ -38,6 +39,7 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
+from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
 """
@@ -85,6 +87,9 @@ Constraints:
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned
 """
 
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
+
 
 class SGemm:
     def __init__(
@@ -92,10 +97,12 @@ class SGemm:
         cta_tiler: Tuple[int, int, int] = (128, 128, 8),
         num_stages: int = 3,
         num_threads: int = 256,
+        debug_print: bool = False,
     ):
         self._cta_tiler = cta_tiler
         self._num_stages = num_stages
         self._num_threads = num_threads
+        self.debug_print = debug_print
         assert num_threads > 0, "needs at least one thread"
         assert num_threads % 16 == 0, "multiples of 16 required for MMA thread layout"
 
@@ -241,6 +248,16 @@ class SGemm:
         # grid_dim: ((m + BLK_M - 1) // BLK_M, (n + BLK_N - 1) // BLK_N, 1)
         grid_dim = *cute.ceil_div(mC.shape, (self._bM, self._bN)), 1
 
+        if const_expr(self.debug_print):
+            print(f"sA_layout: {sA_layout}")
+            print(f"sB_layout: {sB_layout}")
+            print(f"tiled_copy_A: {tiled_copy_A}")
+            print(f"tiled_copy_B: {tiled_copy_B}")
+            print(f"atoms_layout: {atoms_layout}")
+            print(f"tiled_mma: {tiled_mma}")
+            print(f"grid_dim: {grid_dim}")
+            print(f"block=[{cute.size(atoms_layout)}, 1, 1]")
+
         self.kernel(
             mA,
             mB,
@@ -273,6 +290,7 @@ class SGemm:
         # Thread and block indices
         tidx, tidy, tidz = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+        is_thread0 = (tidx == 0) & (bidx == 0) & (bidy == 0) & (bidz == 0)
         tiler_coord = (bidx, bidy, None)
         thr_mma = tiled_mma.get_slice(tidx)
 
@@ -298,6 +316,14 @@ class SGemm:
         gA = cute.domain_offset((0, residue_k, 0), gA)
         gB = cute.domain_offset((0, residue_k, 0), gB)
 
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("gA: {}", gA)
+                cute.printf("gB: {}", gB)
+                cute.printf("gC: {}", gC)
+                cute.printf("")
+
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread.
         # sA:   (BLK_M, BLK_K, PIPE)       , sB:   (BLK_N, BLK_K, PIPE)
@@ -314,6 +340,15 @@ class SGemm:
         tAsA = thr_copy_A.partition_D(sA)
         tBgB = thr_copy_B.partition_S(gB)
         tBsB = thr_copy_B.partition_D(sB)
+
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tAgA: {}", tAgA)
+                cute.printf("tBgB: {}", tBgB)
+                cute.printf("tAsA: {}", tAsA)
+                cute.printf("tBsB: {}", tBsB)
+                cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Predicate: Mark indices that need to copy when the problem shape
@@ -423,6 +458,15 @@ class SGemm:
                         (coord_B[0], cutlass.Int32(-1)), (mB.shape[0], coord_B[1])
                     )
 
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tApA: {}", tApA)
+                cute.printf("tBpB: {}", tBpB)
+                cute.printf("tApA_residue_k: {}", tApA_residue_k)
+                cute.printf("tBpB_residue_k: {}", tBpB_residue_k)
+                cute.printf("")
+
         # ///////////////////////////////////////////////////////////////////////////////
         # Prefetch Prologue
         # ///////////////////////////////////////////////////////////////////////////////
@@ -492,6 +536,15 @@ class SGemm:
         tCrC = tiled_mma.make_fragment_C(tCgC)
         # Clear the accumulator
         tCrC.fill(0.0)
+
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tCrA: {}", tCrA)
+                cute.printf("tCrB: {}", tCrB)
+                cute.printf("tCrC: {}", tCrC)
+                cute.printf("tCgC: {}", tCgC)
+                cute.printf("")
 
         # Current pipe index in smem to read from / write to
         smem_pipe_read = cutlass.Int32(0)
@@ -612,6 +665,14 @@ class SGemm:
         # ///////////////////////////////////////////////////////////////////////////////
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
+
+        if const_expr(self.debug_print):
+            if is_thread0:
+                cute.printf("")
+                cute.printf("tCrC (accumulator, pre-epilogue): {}", tCrC)
+                cute.printf("tCgC (gmem C partition): {}", tCgC)
+                cute.printf("")
+
         tCrC.store(epilogue_op(tCrC.load()))
 
         # predicate
@@ -664,14 +725,15 @@ def run(
     :return: Execution time of the GEMM kernel in microseconds
     :rtype: float
     """
-    print(f"Running Ampere SIMT GEMM example:")
-    print(f"mnk: {mnk}")
-    print(f"A major: {a_major}, B major: {b_major}, C major: {c_major}")
-    print(f"Static shape: {static_shape}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {use_cold_l2}")
+    if DEBUG_MODE:
+        print(f"Running Ampere SIMT GEMM example:")
+        print(f"mnk: {mnk}")
+        print(f"A major: {a_major}, B major: {b_major}, C major: {c_major}")
+        print(f"Static shape: {static_shape}")
+        print(f"Warmup iterations: {warmup_iterations}")
+        print(f"Iterations: {iterations}")
+        print(f"Skip reference checking: {skip_ref_check}")
+        print(f"Use cold L2: {use_cold_l2}")
     M, N, K = mnk
 
     # Create and permute tensor A/B/C
@@ -724,14 +786,15 @@ def run(
         )
     )
 
-    sgemm = SGemm()
+    sgemm = SGemm(debug_print=DEBUG_MODE)
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    print("Compiling kernel with cute.compile ...")
+    if DEBUG_MODE:
+        print("Compiling kernel with cute.compile ...")
     start_time = time.time()
     compiled_fn = cute.compile(
         sgemm,
@@ -741,17 +804,21 @@ def run(
         stream=current_stream,
     )
     compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
+    if DEBUG_MODE:
+        print(f"Compilation time: {compilation_time:.4f} seconds")
 
-    print("Executing GEMM kernel...")
+    if DEBUG_MODE:
+        print("Executing GEMM kernel...")
 
     if not skip_ref_check:
         compiled_fn(a_tensor, b_tensor, c_tensor)
         torch.cuda.synchronize()
-        print("Verifying results...")
+        if DEBUG_MODE:
+            print("Verifying results...")
         ref = torch.einsum("mk,nk->mn", a, b)
         torch.testing.assert_close(c.cpu(), ref.cpu(), atol=1e-03, rtol=1e-05)
-        print("Results verified successfully!")
+        if DEBUG_MODE:
+            print("Results verified successfully!")
 
     def generate_tensors():
         # Create new tensors for each workspace to ensure cold L2 cache
@@ -813,8 +880,25 @@ def run(
         iterations=iterations,
     )
 
-    # Print execution results
-    print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
+    if DEBUG_MODE:
+        print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
+
+    if PROFILE_MODE:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+
+        flops = 2 * M * N * K
+        event_str = f"sgemm (mnk={mnk}, {flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            with add_nvtx_event(event_str):
+                compiled_fn(a_tensor, b_tensor, c_tensor, current_stream)
 
     return avg_time_us  # Return execution time in microseconds
 
