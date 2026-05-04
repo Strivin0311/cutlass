@@ -28,6 +28,7 @@
 
 import argparse
 import math
+import os
 import time
 from typing import Tuple, Type
 
@@ -39,6 +40,7 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
+from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
 """
@@ -99,6 +101,9 @@ Constraints:
   i.e, number of elements is a multiple of 8
 """
 
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
+
 
 class TensorOpGemm:
     def __init__(
@@ -107,6 +112,7 @@ class TensorOpGemm:
         c_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         atom_layout_mnk: Tuple[int, int, int],
+        debug_print: bool = False,
     ):
         self.ab_dtype = ab_dtype
         self.c_dtype = c_dtype
@@ -114,6 +120,7 @@ class TensorOpGemm:
         self.cta_tiler = (128, 128, 32)
         self.num_stages = 3
         self.atom_layout_mnk = atom_layout_mnk
+        self.debug_print = debug_print
         atom_lay_M, atom_lay_N, atom_lay_K = self.atom_layout_mnk
         self.num_threads = atom_lay_M * atom_lay_N * atom_lay_K * 32
 
@@ -271,6 +278,19 @@ class TensorOpGemm:
             cute.size(grid_dim[2]),
         )
 
+        if const_expr(self.debug_print):
+            print(f"sA_layout: {sA_layout}")
+            print(f"sB_layout: {sB_layout}")
+            print(f"sC_layout: {sC_layout}")
+            print(f"smem_size bytes: {smem_size}")
+            print(f"tiled_copy_A: {tiled_copy_A}")
+            print(f"tiled_copy_B: {tiled_copy_B}")
+            print(f"tiled_copy_C: {tiled_copy_C}")
+            print(f"tiled_mma: {tiled_mma}")
+            print(f"grid_dim: {grid_dim}")
+            print(f"raster_factor: {raster_factor}")
+            print(f"block=[{self.num_threads}, 1, 1]")
+
         self.kernel(
             mA,
             mB,
@@ -309,6 +329,7 @@ class TensorOpGemm:
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+        is_thread0 = (tidx == 0) & (bidx == 0) & (bidy == 0) & (bidz == 0)
         grid_dim = cute.ceil_div(mC.shape, (self.bM, self.bN, 1))
         offset_tile_x, offset_tile_y = self.raster_tile(
             bidx, bidy, rasterization_factor
@@ -361,6 +382,14 @@ class TensorOpGemm:
             gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
             gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
 
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("gA: {}", gA)
+                    cute.printf("gB: {}", gB)
+                    cute.printf("gC: {}", gC)
+                    cute.printf("")
+
             # Construct identity layout for sA and sB (mirrors global tensors,
             # used for predication only)
             mcA = cute.make_identity_tensor(mA.layout.shape)
@@ -409,6 +438,17 @@ class TensorOpGemm:
             # Repeat the partitioning with identity layouts
             tAcA = thr_copy_A.partition_S(cA)
             tBcB = thr_copy_B.partition_S(cB)
+
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("tAgA: {}", tAgA)
+                    cute.printf("tBgB: {}", tBgB)
+                    cute.printf("tAsA: {}", tAsA)
+                    cute.printf("tBsB: {}", tBsB)
+                    cute.printf("tCsC_epilogue: {}", tCsC_epilogue)
+                    cute.printf("tCgC_epilogue: {}", tCgC_epilogue)
+                    cute.printf("")
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
@@ -461,6 +501,13 @@ class TensorOpGemm:
                     tBpB[rest_v, n, 0] = cute.elem_less(
                         tBcB[(0, rest_v), n, 0, 0][0], mB.shape[0]
                     )
+
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("tApA: {}", tApA)
+                    cute.printf("tBpB: {}", tBpB)
+                    cute.printf("")
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Prefetch Prologue
@@ -529,6 +576,14 @@ class TensorOpGemm:
             tCrC = tiled_mma.make_fragment_C(tCgC)
             # Clear the accumulator
             tCrC.fill(0.0)
+
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("tCrA: {}", tCrA)
+                    cute.printf("tCrB: {}", tCrB)
+                    cute.printf("tCrC: {}", tCrC)
+                    cute.printf("")
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Copy Atom A/B retiling
@@ -679,6 +734,16 @@ class TensorOpGemm:
             # ///////////////////////////////////////////////////////////////////////////////
             tCrD = cute.make_fragment_like(tCrC, self.c_dtype)
             tCrD[None] = epilogue_op(tCrC.load()).to(self.c_dtype)
+
+            if const_expr(self.debug_print):
+                if is_thread0:
+                    cute.printf("")
+                    cute.printf("tCrC (accumulator): {}", tCrC)
+                    cute.printf("tCrD (output fragment): {}", tCrD)
+                    cute.printf("tCsC (smem C, mma view): {}", tCsC)
+                    cute.printf("tCsC_epilogue (smem C, copy view): {}", tCsC_epilogue)
+                    cute.printf("tCgC_epilogue (gmem C, copy view): {}", tCgC_epilogue)
+                    cute.printf("")
 
             # Copy results of D back to shared memory
             cute.autovec_copy(tCrD, tCsC)
@@ -851,17 +916,18 @@ def run(
     use_cold_l2: bool = False,
     **kwargs,
 ):
-    print(f"Running Ampere tensor core GEMM example:")
-    print(f"mnkl: {mnkl}")
-    print(
-        f"A dtype: {ab_dtype}, B dtype: {ab_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}"
-    )
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
-    print(f"Atoms layout: {atom_layout_mnk}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {use_cold_l2}")
+    if DEBUG_MODE:
+        print(f"Running Ampere tensor core GEMM example:")
+        print(f"mnkl: {mnkl}")
+        print(
+            f"A dtype: {ab_dtype}, B dtype: {ab_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}"
+        )
+        print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
+        print(f"Atoms layout: {atom_layout_mnk}")
+        print(f"Warmup iterations: {warmup_iterations}")
+        print(f"Iterations: {iterations}")
+        print(f"Skip reference checking: {skip_ref_check}")
+        print(f"Use cold L2: {use_cold_l2}")
     M, N, K, L = mnkl
 
     # Create and permute tensor A/B/C
@@ -898,12 +964,19 @@ def run(
         c_dtype,
         acc_dtype,
         atom_layout_mnk,
+        debug_print=DEBUG_MODE,
     )
 
-    print("Compiling kernel with cute.compile ...")
+    if DEBUG_MODE:
+        print("Compiling kernel with cute.compile ...")
+    compile_start = time.perf_counter()
     compiled_gemm = cute.compile(tensor_op_gemm, mA, mB, mC)
+    compile_time = time.perf_counter() - compile_start
+    if DEBUG_MODE:
+        print(f"Compilation done in {compile_time:.3f}s")
 
-    print("Executing GEMM kernel...")
+    if DEBUG_MODE:
+        print("Executing GEMM kernel...")
 
     if not skip_ref_check:
         ref = torch.einsum(
@@ -912,9 +985,11 @@ def run(
             b_torch.to(dtype=torch.float32),
         ).to(cutlass_torch.dtype(c_dtype))
         compiled_gemm(mA, mB, mC)
-        print("Verifying results...")
+        if DEBUG_MODE:
+            print("Verifying results...")
         torch.testing.assert_close(c_torch.cpu(), ref.cpu(), atol=1e-03, rtol=1e-05)
-        print("Results verified successfully!")
+        if DEBUG_MODE:
+            print("Results verified successfully!")
 
     def generate_tensors():
         a_workspace, _ = create_and_permute_tensor(L, M, K, a_major == "m", ab_dtype)
@@ -941,6 +1016,23 @@ def run(
         iterations=iterations,
         use_cuda_graphs=False,
     )
+
+    if PROFILE_MODE:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+
+        flops = 2 * M * N * K * L
+        event_str = f"tensorop_gemm (mnkl={mnkl}, {flops=})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            with add_nvtx_event(event_str):
+                compiled_gemm(mA, mB, mC)
 
     return avg_time_us  # Return execution time in microseconds
 
@@ -984,8 +1076,8 @@ if __name__ == "__main__":
     parser.add_argument("--a_major", choices=["k", "m"], default="m")
     parser.add_argument("--b_major", choices=["k", "n"], default="n")
     parser.add_argument("--c_major", choices=["n", "m"], default="n")
-    parser.add_argument("--warmup_iterations", default=2, type=int)
-    parser.add_argument("--iterations", default=100, type=int)
+    parser.add_argument("--warmup_iterations", default=0, type=int)
+    parser.add_argument("--iterations", default=1, type=int)
     parser.add_argument("--skip_ref_check", action="store_true")
     parser.add_argument(
         "--use_cold_l2",

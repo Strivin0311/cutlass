@@ -8,9 +8,9 @@ export PROFILE_MODE=0 # set to 1 to enable profiling with either Nsight Systems 
 export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_MODE
 
 # TEST_SCRIPT="elementwise_add"
-TEST_SCRIPT="elementwise_apply"
+# TEST_SCRIPT="elementwise_apply"
 # TEST_SCRIPT="sgemm"
-# TEST_SCRIPT="tensorop_gemm"
+TEST_SCRIPT="tensorop_gemm"
 # TEST_SCRIPT="flash_attention_v2"
 # TEST_SCRIPT="smem_allocator"
 # TEST_SCRIPT="dynamic_smem_size"
@@ -63,11 +63,11 @@ elif [[ $TEST_SCRIPT == "sgemm" ]]; then
     --a_major k --b_major k --c_major n
     "
 elif [[ $TEST_SCRIPT == "tensorop_gemm" ]]; then
+    # TFLOPS: 353 for fp16
     SCRIPT_CMD="
     python tensorop_gemm.py                                               \
     --mnkl $M,$K,$N,1 --atom_layout_mnk 2,2,1                            \
-    --ab_dtype Float16                                                    \
-    --c_dtype Float16 --acc_dtype Float32                                 \
+    --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32          \
     --a_major k --b_major k --c_major n
     "
 elif [[ $TEST_SCRIPT == "flash_attention_v2" ]]; then
