@@ -29,6 +29,7 @@
 
 import argparse
 import operator
+import os
 import time
 from typing import Type, List
 
@@ -40,6 +41,10 @@ import cutlass.cute as cute
 import cutlass.cute.testing as testing
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
+from cutlass import const_expr
+
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 """
 An Elementwise Apply Example using CuTe DSL.
@@ -96,19 +101,23 @@ def elementwise_apply_kernel(
     ctaC = gC[cta_coord]  # (TileM, TileN)
     ctaCrd = cC[cta_coord]  # (TileM, TileN)
 
-    print(f"[DSL INFO] Sliced Tensors per thread block:")
-    for i in cutlass.range_constexpr(len(ctaInputs)):
-        print(f"[DSL INFO]   ctaInputs{i} = {ctaInputs[i].type}")
-    print(f"[DSL INFO]   ctaC = {ctaC.type}")
-    print(f"[DSL INFO]   ctaCrd = {ctaCrd.type}")
+    if const_expr(DEBUG_MODE):
+        if tidx == 0 and bidx == 0:
+            cute.printf("grid_dim = {}", cute.arch.grid_dim())
+            cute.printf("block_dim = {}", cute.arch.block_dim())
+            cute.printf("shape = {}", shape)
+            cute.printf("[DSL INFO] Sliced Tensors per thread block (tid=0, bid=0):\n")
+        print(f"[DSL INFO] Sliced Tensors per thread block:")
+        for i in cutlass.range_constexpr(len(ctaInputs)):
+            print(f"[DSL INFO]   ctaInputs{i} = {ctaInputs[i].type}")
+        print(f"[DSL INFO]   ctaC = {ctaC.type}")
+        print(f"[DSL INFO]   ctaCrd = {ctaCrd.type}")
 
     # compose with CTA TV layout
     # (tid, vid) -> address
     tidfrgInputs = [cute.composition(t, tv_layout) for t in ctaInputs]
     tidfrgC = cute.composition(ctaC, tv_layout)
     tidfrgCrd = cute.composition(ctaCrd, tv_layout)
-    # print(f"{tv_layout = }")
-    # print(f"{tidfrgAB[0] = }")
 
     thr_coord = (tidx, (None, None))
 
@@ -118,11 +127,12 @@ def elementwise_apply_kernel(
     thrC = tidfrgC[thr_coord]  # (V)
     thrCrd = tidfrgCrd[thr_coord]
 
-    print(f"[DSL INFO] Sliced Tensors per thread:")
-    for i in cutlass.range_constexpr(len(thrInputs)):
-        print(f"[DSL INFO]   thrInputs{i} = {thrInputs[i].type}")
-    print(f"[DSL INFO]   thrC = {thrC.type}")
-    print(f"[DSL INFO]   thrCrd = {thrCrd.type}")
+    if const_expr(DEBUG_MODE):
+        print(f"[DSL INFO] Sliced Tensors per thread:")
+        for i in cutlass.range_constexpr(len(thrInputs)):
+            print(f"[DSL INFO]   thrInputs{i} = {thrInputs[i].type}")
+        print(f"[DSL INFO]   thrC = {thrC.type}")
+        print(f"[DSL INFO]   thrCrd = {thrCrd.type}")
 
     # allocate fragments for gmem->rmem
     frgInputs = [cute.make_fragment_like(t, t.element_type) for t in thrInputs]
@@ -132,8 +142,11 @@ def elementwise_apply_kernel(
     for i in cutlass.range(cute.size(frgPred), unroll=1):
         frgPred[i] = cute.elem_less(thrCrd[i], shape)
 
-    # if tidx == 0 and bidx == 0:
-    #     cute.print_tensor(frgPred)
+    if const_expr(DEBUG_MODE):
+        if tidx == 0 and bidx == 0:
+            cute.printf("")
+            cute.printf("frgPred:")
+            cute.print_tensor(frgPred)
 
     ##########################################################
     # Move data to reg address space
@@ -156,6 +169,13 @@ def elementwise_apply_kernel(
 
     for thrInput, frgInput in zip(thrInputs, frgInputs):
         cute.copy(copy_atom_load, thrInput, frgInput, pred=frgPred)
+
+    if const_expr(DEBUG_MODE):
+        if tidx == 0 and bidx == 0:
+            cute.printf("")
+            for i in cutlass.range_constexpr(len(frgInputs)):
+                cute.printf("frgInputs{}:", i)
+                cute.print_tensor(frgInputs[i])
 
     # Load data before use. The compiler will optimize the copy and load
     # operations to convert some memory ld/st into register uses.
@@ -238,27 +258,37 @@ def elementwise_apply(
     val_layout = cute.make_layout((4, 4), stride=(4, 1))
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
-    print(f"[DSL INFO] Input Tensors:")
-    print(f"[DSL INFO]   a = {a.type}")
-    print(f"[DSL INFO]   b = {b.type}")
-    print(f"[DSL INFO]   result = {result.type}")
+    if const_expr(DEBUG_MODE):
+        cute.printf("")
+        cute.printf("[DSL INFO] thr_layout: {}", thr_layout)
+        cute.printf("[DSL INFO] val_layout: {}", val_layout)
+        cute.printf("[DSL INFO]   tiler_mn = {}", tiler_mn)
+        cute.printf("[DSL INFO]   tv_layout = {}", tv_layout)
 
-    print(f"[DSL INFO] Tiling Parameters:")
-    print(f"[DSL INFO]   tiler_mn = {tiler_mn} per thread block")
-    print(f"[DSL INFO]   tv_layout = {tv_layout}")
+        cute.printf("")
+        cute.printf("[DSL INFO] Input Tensors:")
+        cute.printf("[DSL INFO]   a = {}", a.layout)
+        cute.printf("[DSL INFO]   b = {}", b.layout)
+        cute.printf("[DSL INFO]   result = {}", result.layout)
 
     gA = cute.zipped_divide(a, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
     gB = cute.zipped_divide(b, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
     gC = cute.zipped_divide(result, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
 
-    print(f"[DSL INFO] Tiled Tensors:")
-    print(f"[DSL INFO]   gA = {gA.type}")
-    print(f"[DSL INFO]   gB = {gB.type}")
-    print(f"[DSL INFO]   gC = {gC.type}")
+    if const_expr(DEBUG_MODE):
+        cute.printf("")
+        cute.printf("[DSL INFO] Tiled Tensors:")
+        cute.printf("[DSL INFO]   gA.layout={}", gA.layout)
+        cute.printf("[DSL INFO]   gB.layout={}", gB.layout)
+        cute.printf("[DSL INFO]   gC.layout={}", gC.layout)
 
     idC = cute.make_identity_tensor(result.shape)
     cC = cute.zipped_divide(idC, tiler=tiler_mn)
-    print(f"[DSL INFO]   coord tensor = {cC.type}")
+
+    if const_expr(DEBUG_MODE):
+        cute.printf("")
+        cute.printf("[DSL INFO]   coord tensor")
+        cute.print_tensor(cC)
 
     # Launch the kernel asynchronously
     # Async token(s) can also be specified as dependencies
@@ -294,11 +324,10 @@ def run_elementwise_apply_and_verify(
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    print(f"\nRunning Elementwise Apply test with:")
-    print(f"Tensor dimensions: [{M}, {N}]")
-    print(f"Input and Output Data type: {dtype}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Measurement iterations: {iterations}\n")
+    if DEBUG_MODE:
+        print(f"\nRunning Elementwise Apply test with:")
+        print(f"Tensor dimensions: [{M}, {N}]")
+        print(f"Input and Output Data type: {dtype}")
 
     torch_dtype = cutlass_torch.dtype(dtype)
 
@@ -307,32 +336,19 @@ def run_elementwise_apply_and_verify(
     b = torch.randn(M, N, device=torch.device("cuda"), dtype=torch_dtype)
     c = torch.zeros_like(a)
 
-    print(f"Input tensor shapes:")
-    print(f"a: {a.shape}, dtype: {a.dtype}")
-    print(f"b: {b.shape}, dtype: {b.dtype}")
-    print(f"c: {c.shape}, dtype: {c.dtype}\n")
+    if DEBUG_MODE:
+        print(f"Input tensor shapes:")
+        print(f"a: {a.shape}, dtype: {a.dtype}")
+        print(f"b: {b.shape}, dtype: {b.dtype}")
+        print(f"c: {c.shape}, dtype: {c.dtype}\n")
 
     epsilon = 1.2
     if op in (operator.truediv, operator.floordiv):
         b = torch.where(b == 0, torch.tensor(epsilon), b)
 
-    print("Executing elementwise apply kernel...")
-
-    if not skip_ref_check:
-        elementwise_apply(
-            op,
-            from_dlpack(a),
-            from_dlpack(b),
-            from_dlpack(c).mark_layout_dynamic(),
-            current_stream,
-        )
-        print("Verifying results...")
-        torch.testing.assert_close(op(a, b), c)
-        print("Results verified successfully!")
-
-    if not benchmark:
-        return
-
+    if DEBUG_MODE:
+        print("Compiling kernel with cute.compile ...")
+    start_time = time.time()
     compiled_func = cute.compile(
         elementwise_apply,
         op,
@@ -341,8 +357,28 @@ def run_elementwise_apply_and_verify(
         from_dlpack(c).mark_layout_dynamic(),
         current_stream,
     )
+    compilation_time = time.time() - start_time
+    if DEBUG_MODE:
+        print(f"Compilation time: {compilation_time:.4f} seconds")
 
-    # When compiled we inlined op in the kernel, so we do not pass it when benchmarking
+    if DEBUG_MODE:
+        print("Executing elementwise apply kernel...")
+
+    if not skip_ref_check:
+        compiled_func(
+            from_dlpack(a),
+            from_dlpack(b),
+            from_dlpack(c).mark_layout_dynamic(),
+            current_stream,
+        )
+        if DEBUG_MODE:
+            print("Verifying results...")
+        torch.testing.assert_close(op(a, b), c)
+        if DEBUG_MODE:
+            print("Results verified successfully!")
+
+    if not benchmark:
+        return
 
     avg_time_us = testing.benchmark(
         compiled_func,
@@ -358,22 +394,44 @@ def run_elementwise_apply_and_verify(
         stream=current_stream,
     )
 
-    avg_time = avg_time_us / 1e3
-
     # Print execution results
-    print(f"Kernel execution time: {avg_time:.4f} ms")
+    print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
     print(
-        f"Achieved memory throughput: {(3 * a.numel() * dtype.width // 8) / (avg_time / 1000) / 1e9:.2f} GB/s"
+        f"Achieved memory throughput: {(3 * a.numel() * dtype.width // 8) / (avg_time_us / 1e6) / 1e9:.2f} GB/s"
     )
-    print(f"First few elements of result: \n{c[:3, :3]}")
+    if DEBUG_MODE:
+        print(f"First few elements of result: \n{c[:3, :3]}")
+
+    # Profiling
+    if PROFILE_MODE:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+
+        bytes_moved = 3 * M * N * (dtype.width // 8)
+        event_str = f"elementwise_apply (M={M}, N={N}, bytes_moved={bytes_moved})"
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(
+                iter_id=i,
+                start=start,
+                end=end,
+            )
+            with add_nvtx_event(event_str):
+                compiled_func(
+                    from_dlpack(a),
+                    from_dlpack(b),
+                    from_dlpack(c).mark_layout_dynamic(),
+                    current_stream,
+                )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="example of elementwise apply to demonstrate building elementwise kernels"
     )
-    parser.add_argument("--M", default=128, type=int)
-    parser.add_argument("--N", default=128, type=int)
+    parser.add_argument("--M", default=1024, type=int)
+    parser.add_argument("--N", default=1024, type=int)
     parser.add_argument("--op", default="add", type=str)
     parser.add_argument("--warmup_iterations", default=0, type=int)
     parser.add_argument("--iterations", default=1, type=int)

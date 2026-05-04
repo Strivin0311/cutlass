@@ -7,8 +7,8 @@ export DEBUG_MODE=1
 export PROFILE_MODE=0 # set to 1 to enable profiling with either Nsight Systems (nsys) or Nsight Compute (ncu)
 export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_MODE
 
-TEST_SCRIPT="elementwise_add"
-# TEST_SCRIPT="elementwise_apply"
+# TEST_SCRIPT="elementwise_add"
+TEST_SCRIPT="elementwise_apply"
 # TEST_SCRIPT="sgemm"
 # TEST_SCRIPT="tensorop_gemm"
 # TEST_SCRIPT="flash_attention_v2"
@@ -53,6 +53,7 @@ elif [[ $TEST_SCRIPT == "elementwise_apply" ]]; then
     SCRIPT_CMD="
     python elementwise_apply.py                                           \
     --M $M --N $N   \
+    --op mul \
     --benchmark                                                                
     "
 elif [[ $TEST_SCRIPT == "sgemm" ]]; then
