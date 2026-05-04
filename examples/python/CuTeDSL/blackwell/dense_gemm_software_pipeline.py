@@ -1152,7 +1152,7 @@ class PipelinedDenseGemmKernelSm100:
                     # Wait for current full mbar to be arrived by the producer
                     ab_pipeline.consumer_wait(ab_consumer_state)
 
-                    # tCtAcc += tCrA * tCrB
+                    # tCtAcc += tCrA @ tCrB
                     num_kblocks = cute.size(tCrA, mode=[2])
                     for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)

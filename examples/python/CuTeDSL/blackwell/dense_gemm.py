@@ -1224,7 +1224,7 @@ class DenseGemmKernelSm100:
                     )
 
                     # Issuing UMMA for `num_kblocks` times looping over MMA_K dim
-                    # tCtAcc += tCrA * tCrB
+                    # tCtAcc += tCrA @ tCrB
                     num_kblocks = cute.size(tCrA, mode=[2])
                     for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)

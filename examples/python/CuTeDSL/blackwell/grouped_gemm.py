@@ -1515,7 +1515,7 @@ class GroupedGemmPersistentKernelSm100:
                                 ab_full_mbar_ptr + smem_rd_stage_idx, mma_rd_ab_full_phase
                             )
 
-                        # tCtAcc += tCrA * tCrB
+                        # tCtAcc += tCrA @ tCrB
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (None, None, kblock_idx, smem_rd_stage_idx)
@@ -1623,10 +1623,11 @@ class GroupedGemmPersistentKernelSm100:
             # /////////////////////////////////////////////////////////////////////////////
             epi_tidx = tidx
             
+            # Make T2R tiled copy
             # tiled_copy_t2r: 
             #   layout_src_tv: (32,1024):(0,1) | layout_src_tv_tiled: ((32,4),((32,32),1)):((0,1),((128,4),0))
             #   layout_dst_tv: (32,32):(32,1) | layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))
-            # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, EPI_STAGES=2):(((1,65536),0),0,0,0,32,128)
+            # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, ACC_STAGES=2):(((1,65536),0),0,0,0,32,128)
             # tTR_rAcc: ((32,1),1,1):((1,0),0,0)
             (
                 tiled_copy_t2r,

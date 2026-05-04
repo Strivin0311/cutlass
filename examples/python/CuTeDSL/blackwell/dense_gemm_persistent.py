@@ -1126,7 +1126,7 @@ class DenseGemmPersistentKernelSm100:
                 # /////////////////////////////////////////////////////////////////////////////
                 #  Mma mainloop
                 # /////////////////////////////////////////////////////////////////////////////
-                for k_tile in range(k_tile_cnt):
+                for k_tile in cutlass.range(k_tile_cnt):
                     if is_leader_cta: # only by the leader CTA
                         # Wait for current ab full mbar to be arrived by the tma producer
                         ab_pipeline.consumer_wait(
@@ -1134,7 +1134,7 @@ class DenseGemmPersistentKernelSm100:
                         )
 
                         # Issuing UMMA for `num_kblocks` times looping over MMA_K dim
-                        # tCtAcc += tCrA * tCrB
+                        # tCtAcc += tCrA @ tCrB
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (
@@ -1156,7 +1156,7 @@ class DenseGemmPersistentKernelSm100:
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         # Arrive the ab empty mbar with `tcgen05.commit.mbarrier::arrive::one`
-                        # only by the leader CTA
+                        # only by the leader CTA and multicast to each CTA in the CTA-pair
                         ab_pipeline.consumer_release(ab_consumer_state)
 
                     # Peek for the next ab full mbar to be arrived by the tma producer w/o blocking only by the leader CTA
@@ -1169,7 +1169,7 @@ class DenseGemmPersistentKernelSm100:
                             )
 
                 # Arrive the acc full mbar with `tcgen05.commit.mbarrier::arrive::one` 
-                # only by the leader CTA (UMMA consumer => T2R producer)
+                # only by the leader CTA and multicast to each CTA in the CTA-pair
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
                 # NOTE: we don't need to reset acc producer's count, since we only use its index
@@ -1227,7 +1227,7 @@ class DenseGemmPersistentKernelSm100:
             # tiled_copy_t2r: 
             #   layout_src_tv: (32,1024):(0,1) | layout_src_tv_tiled: ((32,4),((32,32),1)):((0,1),((128,4),0))
             #   layout_dst_tv: (32,32):(32,1) | layout_dst_tv_tiled: ((32,4),(32,1)):((4,1),(128,0))
-            # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, EPI_STAGES=2):(((1,65536),0),0,0,0,32,128)
+            # tTR_tAcc_base: (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4, ACC_STAGES=2):(((1,65536),0),0,0,0,32,128)
             # tTR_rAcc: ((32,1),1,1):((1,0),0,0)
             (
                 tiled_copy_t2r,
@@ -1329,20 +1329,19 @@ class DenseGemmPersistentKernelSm100:
                 bSG_gC = None
                 tTR_gC = None
                 if const_expr(self.use_tma_store):
-                    # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                    # (TMA=((32,128),1),EPI_M=1, EPI_N=4)
+                    # ((ATOM_V, REST_V)=((32,128),1), EPI_M=1, EPI_N=4)
                     bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)] # slice RestM8 and RestN32 and RestL1 idx
                 else:
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
                     tTR_gC = tTR_gC_partitioned[(None, None, None, None, None, *mma_tile_coord_mnl)] # slice RestM8 and RestN32 and RestL1 idx
 
                 # Set tensor memory buffer for current tile
-                # (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1,EPI_N=4)
+                # (T2R=((T2R_COLS=32,T2R_ROWS=32),1), T2R_M=1,T2R_N=1, EPI_M=1, EPI_N=4)
                 tTR_tAcc = tTR_tAcc_base[
                     (None, None, None, None, None, acc_consumer_state.index)
                 ]
 
-                # Wait for the first acc full mbar to be arrived by the epilogue producer only by the leader CTA
+                # Wait for the first acc full mbar to be arrived by the epilogue producer of the leader CTA
                 # NOTE: we don't need to reset the count
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
@@ -1436,12 +1435,13 @@ class DenseGemmPersistentKernelSm100:
                             simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)]
                         )
 
-                # Arrive the acc empty mbar
+                # Arrive the acc empty mbar of the leader CTA
                 # NOTE: acc_pipeline is an instance of `PipelineUmmaAsync`, 
                 # whose `consumer_release` is inherited from simple `PipelineAsync`,
                 # which does not elect the issuing thread automatically like `PipelineTmaAsync`,
                 # and whose empty sync object's type is just a simple `AsyncThread`, not the specific `TCGen05Mma` like ab_pipeline,
                 # all in all, we have to manually elect one thread to arrive the mbarrier for acc_pipeline
+                # and internally it will handle the remote arrival if this is a non-leader CTA
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
@@ -1456,7 +1456,7 @@ class DenseGemmPersistentKernelSm100:
             if warp_idx == self.epilog_warp_id[0]: # only the first epilogue warp is responsible to deallocate tmem
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
             
-            cute.arch.barrier(
+            cute.arch.barrier( # wait for all the epilogue threads to finish before tmem deallocation
                 barrier_id=self.epilog_sync_bar_id,
                 number_of_threads=self.epilogue_threads
             )
@@ -1477,9 +1477,7 @@ class DenseGemmPersistentKernelSm100:
                     tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
                 )
             
-            # /////////////////////////////////////////////////////////////////////////////
-            #  Wait for C store complete
-            # /////////////////////////////////////////////////////////////////////////////
+            # Wait for all TMA store to finish (at least the smem read)
             if const_expr(self.use_tma_store):
                 c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0).read`
 
