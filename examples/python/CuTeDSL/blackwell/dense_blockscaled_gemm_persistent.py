@@ -221,6 +221,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         self.tmem_ptr_sync_bar_id = 2
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         
+        # Directly use all the tmem columns, to allocate tAcc, tSFA, tSFB
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -1342,10 +1343,18 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base), # offset tmem after the accumulator tensor
                 dtype=self.sf_dtype,
             )
-            # ((((TMEM_lanes32, M4), RestK4),(SFV16, K4)), RestM1, MK4):((((262144,4),8388608),(0,1)),0,16)
-            #   where MK4 means 4 (M4,K4) blocks share the same tmem col,
-            #   and 262144 = 65536 x 4B/sizeof(fp8) = 65536 x 4, is the tmem row stride for fp8 elems
-            #   and 8388608 = 262144 X TMEM_lanes32, is the stride for next k tile in the main loop along the RestK4 dim
+            # ((((TMEM_lanes32, M4), WG4),(SFV16, K4)), RestM1, RestK4):((((262144,4),8388608),(0,1)),0,16)
+            #   where:
+            #       1. stride 262144 = 65536 x 4B/sizeof(fp8) = 65536 x 4, is the tmem row stride for fp8 elems
+            #       2. stride 8388608 = 262144 X TMEM_lanes32, is the stride of 32 lanes, i.e. the stride for different warps in the WG4
+            #       3. According to https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-4x
+            #           we have (M128,K4) non-expanded SFA for one A (128, 64) MMA tile, which will split into M4 (TMEM_lanes32,K4) SFA sub-tiles,
+            #           and 4 SFA for one M will packed into a 4B into one tmem column (with the stride of 1), 
+            #           then TMEM_lanes32 will take 32 tmem rows (with the stride of 262144) and form M4 blocks along the column (with the stride of 4) within one A MMA tile
+            #           which takes 32lanes x 16columns of tmem, and next k tile will take next 16columns, and repeat RestK4 times
+            #       4. since a whole A (128, 256) tile already hold all (128, 4) SF in a 32lanes x 64columns tmem within a warp, 
+            #           so other warps can only "repeat" the same SFA along WG4 dim (with the stride of 8388608)
+            #           which will be handled by S2T copy instruction: `tcgen05.cp.cta_group::2.32x128b.warpx4` using warpx4 multicast
             tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma,
                 self.mma_tiler_mnk,
@@ -1361,10 +1370,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 + tcgen05.find_tmem_tensor_col_offset(tCtSFA), # offset tmem after the SFA tensor
                 dtype=self.sf_dtype,
             )
-            # ((((TMEM_lanes32, M4), RestK4),(SFV16, K4)), RestM1, MK4):((((262144,4),8388608),(0,1)),0,16)
-            #   where MK4 means 4 (M4,K4) blocks share the same tmem col,
-            #   and 262144 = 65536 x 4B/sizeof(fp8) = 65536 x 4, is the tmem row stride for fp8 elems
-            #   and 8388608 = 262144 X TMEM_lanes32, is the stride for next k tile in the main loop along the RestK4 dim
+            # ((((TMEM_lanes32, M4), WG4),(SFV16, K4)), RestM1, RestK4):((((262144,4),8388608),(0,1)),0,16)
             tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma,
                 self.mma_tiler_mnk,
@@ -1385,10 +1391,19 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             #  Partition for S2T copy of SFA/SFB
             # /////////////////////////////////////////////////////////////////////////////
             tiled_copy_s2t_sfa, tCsSFA_compact_s2t, tCtSFA_compact_s2t = (
-                self.mainloop_s2t_copy_and_partition(sSFA, tCtSFA)
+                self.mainloop_s2t_copy_and_partition(
+                    sSFA, tCtSFA, 
+                    debug_print=self.debug_print and is_print_block and (tidx == 32 * self.mma_warp_id),
+                    title="[MMA warp] S2T copy for SFA"
+                )
             )
+            
             tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = (
-                self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
+                self.mainloop_s2t_copy_and_partition(
+                    sSFB, tCtSFB,
+                    debug_print=self.debug_print and is_print_block and (tidx == 32 * self.mma_warp_id),
+                    title="[MMA warp] S2T copy for SFB",
+                )
             )
             
             if const_expr(self.debug_print):
@@ -1432,7 +1447,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                 # Get tile coord from tile scheduler
 
                 # Set tensor memory buffer for current tile
-                # (MMA, MMA_M, MMA_N)
+                # (MMA=(128,128), MMA_M=1, MMA_N=1)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
                 if const_expr(self.debug_print):
@@ -1469,18 +1484,21 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                             ab_consumer_state, peek_ab_full_status
                         )
 
-                        # S2T-Copy SFA/SFB from smem to tmem
+                        # S2T-Copy SFA/SFB from smem to tmem using `tcgen05.cp.cta_group::2.32x128b.warpx4`
+                        # NOTE: since tcgen05.cp => tcgen05.mma will form implicit pipeline, so no need to explicitly fence
+                        # tCsSFA_compact_s2t / tCsSFB_compact_s2t: ((ATOM_V, REST_V)=((32,1,1),4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4,STAGE=7):((((1,1,1),0),0),0,0,32,128)
+                        # tCtSFA_compact_s2t/tCtSFB_compact_s2t: ((ATOM_V, REST_V)=((32,16,4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4):(((262144,1,8388608),0),0,0,16)
                         s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
-                        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+                        tCsSFA_compact_s2t_cur_stage = tCsSFA_compact_s2t[s2t_stage_coord]
+                        tCsSFB_compact_s2t_cur_stage = tCsSFB_compact_s2t[s2t_stage_coord]
                         cute.copy(
                             atom=tiled_copy_s2t_sfa,
-                            src=tCsSFA_compact_s2t_staged,
+                            src=tCsSFA_compact_s2t_cur_stage,
                             dst=tCtSFA_compact_s2t,
                         )
                         cute.copy(
                             atom=tiled_copy_s2t_sfb,
-                            src=tCsSFB_compact_s2t_staged,
+                            src=tCsSFB_compact_s2t_cur_stage,
                             dst=tCtSFB_compact_s2t,
                         )
 
@@ -1488,14 +1506,10 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                         # tCtAcc += (tCrA * tCrSFA) @ (tCrB * tCrSFB)
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            kblock_coord = (
-                                None,
-                                None,
-                                kblock_idx,
-                                ab_consumer_state.index,
-                            )
-
-                            # Set SFA/SFB tensor to tiled_mma
+                            # Set SFA/SFB tensor ptr to tiled_mma
+                            # NOTE: tCtSFA_compact_s2t / tCtSFB_compact_s2t are only views of tCtSFA / tCtSFB for S2T copy
+                            # we need to set the fields with the expanding layouts
+                            # tCtSFA / tCtSFB: ((((TMEM_lanes32, M4), WG4),(SFV16, K4)), RestM1, RestK4):((((262144,4),8388608),(0,1)),0,16)
                             sf_kblock_coord = (None, None, kblock_idx)
                             tiled_mma.set(
                                 tcgen05.Field.SFA,
@@ -1506,6 +1520,8 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                                 tCtSFB[sf_kblock_coord].iterator,
                             )
 
+                            # Issue `tcgen05.mma` for one kblock
+                            kblock_coord = (None, None, kblock_idx, ab_consumer_state.index)
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc,
@@ -1794,10 +1810,13 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             # Wait for all TMA store to finish (at least the smem read)
             c_pipeline.producer_tail() # `cp.async.bulk.wait_group(0).read`
 
+    @cute.jit
     def mainloop_s2t_copy_and_partition(
         self,
         sSF: cute.Tensor,
         tSF: cute.Tensor,
+        debug_print: bool = False,
+        title: str = "",
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
         Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
@@ -1813,27 +1832,58 @@ class BlockScaledDenseGemmPersistentKernelSm100:
             - tSF_compact_s2t: The partitioned scale factor tensor in tmem
         :rtype: Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]
         """
-        # (MMA, MMA_MN, MMA_K, STAGE)
+        
+        # Compact the expand dim with the zero strides from SFV16 to dummy SFV1
+        
+        # (MMA=(((32,4),1),(1,4)), MMA_M=1,MMA_K=4,STAGE=7):((((16,4),0),(0,1)),0,512,2048)
         tCsSF_compact = cute.filter_zeros(sSF)
-        # (MMA, MMA_MN, MMA_K)
+        # ((((TMEM_lanes32, M4), WG4),(SFV1, K4)), RestM1, RestK4):((((262144,4),8388608),(0,1)),0,16)
         tCtSF_compact = cute.filter_zeros(tSF)
 
         # Make S2T CopyAtom and tiledCopy
+        # Cp4x32x128bOp: 32x128bit SMEM to TMEM Copy Operation, with with warpx4 broadcast enabled,
+        # i.e. each warp moves 512 fp8 (32 x 128/8) SF from smem to tmem to form 32lanes x 16columns (M4K4=16 fp8 SFs, all 128bit) 
+        # and the same smem will be broadcasted to 4 warps in the WG, 32lanes each
+        copy_op = tcgen05.Cp4x32x128bOp(self.cta_group)
         copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(self.cta_group),
-            self.sf_dtype,
+            op=copy_op,
+            copy_internal_type=self.sf_dtype, # fp8e8m0
         )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
+        
+        # tiled_copy_s2t:
+        #   layout_src_tv: (2,(4,128,4)):(0,(1,4,0)) | layout_dst_tv: (2,2048):(0,1)
+        #   layout_src_tv_tiled: (2,((512,4),1)):(0,((1,0),0)) | layout_dst_tv_tiled: (2,(2048,1)):(0,(1,0))
+        # where:
+        #   1. (4,128):(1,4) in src means the MMA atom, while 4:0 in src means to warp x4 broadcast
+        #   2. (2048) in dst means the total 512Bx4=2048B tmem data after broadcast in a (4warps x 32lanes) x (16columns x RestK4) = 128lanes x 64columns tmem
+        tiled_copy_s2t = tcgen05.make_s2t_copy(
+            atom=copy_atom_s2t, 
+            tmem_tensor=tCtSF_compact
+        )
+        thr_copy_s2t = tiled_copy_s2t.get_slice(0) # get any CTA slice
 
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+        # ((ATOM_V, REST_V)=(((32,4,4),4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4,STAGE=7):((((16,4,4),0),0),0,0,512,2048)
         tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+        # ((ATOM_V, REST_V)=((32,1,1),4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4,STAGE=7):((((1,1,1),0),0),0,0,32,128)
         tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
-            tiled_copy_s2t, tCsSF_compact_s2t_
+            atom=tiled_copy_s2t, 
+            smem_tensor=tCsSF_compact_s2t_
         )
-        # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+        
+        # ((ATOM_V, REST_V)=((32,16,4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4):(((262144,1,8388608),0),0,0,16)
         tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
+        
+        if debug_print:
+            cute.printf("")
+            cute.printf(f"{title=}")
+            cute.printf(f"{copy_op=}")
+            cute.printf("tCsSF_compact.layout: {}", tCsSF_compact.layout)
+            cute.printf("tCtSF_compact.layout: {}", tCtSF_compact.layout)
+            cute.printf("tCsSF_compact_s2t_.layout: {}", tCsSF_compact_s2t_.layout)
+            cute.printf("tCsSF_compact_s2t.layout: {}", tCsSF_compact_s2t.layout)
+            cute.printf("tCtSF_compact_s2t.layout: {}", tCtSF_compact_s2t.layout)
+            cute.printf("tiled_copy_s2t: layout_src_tv: {} | layout_dst_tv: {} | layout_src_tv_tiled: {} | layout_dst_tv_tiled: {}", tiled_copy_s2t.layout_src_tv, tiled_copy_s2t.layout_dst_tv, tiled_copy_s2t.layout_src_tv_tiled, tiled_copy_s2t.layout_dst_tv_tiled)
+            cute.printf("")
 
         return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
