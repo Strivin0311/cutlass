@@ -8,9 +8,9 @@ export PROFILE_MODE=0 # set to 1 to enable profiling with either Nsight Systems 
 export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_MODE
 
 # TEST_SCRIPT="elementwise_add"
-TEST_SCRIPT="elementwise_apply"
+# TEST_SCRIPT="elementwise_apply"
 # TEST_SCRIPT="sgemm"
-# TEST_SCRIPT="tensorop_gemm"
+TEST_SCRIPT="tensorop_gemm"
 # TEST_SCRIPT="flash_attention_v2"
 # TEST_SCRIPT="smem_allocator"
 # TEST_SCRIPT="dynamic_smem_size"

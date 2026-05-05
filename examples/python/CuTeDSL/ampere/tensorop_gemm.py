@@ -160,23 +160,25 @@ class TensorOpGemm:
 
         # Creates a layout with the size required for the provided tile
         # size and num stages (stages are used for K dimension) that is also
-        # sectioned into 64x8 or 8x32 layout atoms. The swizzle is set so that
-        # the atom for the shared memory -> register copy does not encounter
-        # bank conflicts
+        # sectioned into 64x8 or 8x32 layout atoms. 
+        # The swizzle is set so that the atom for the shared memory -> register copy does not encounter bank conflicts
 
-        # assume the input is 16B align
-        ab_copy_bits = 128
+        ab_copy_bits = 128 # assume the input is 16B align
         sA_layout = self._make_smem_layout_AB(
             mA.element_type,
             self.a_major_mode,
             ab_copy_bits,
-            (self.cta_tiler[0], self.cta_tiler[2], self.num_stages),
+            smem_tiler=(self.cta_tiler[0], self.cta_tiler[2], self.num_stages), # (tileM, tileK, STAGES)
+            debug_print=self.debug_print,
+            title="sA",
         )
         sB_layout = self._make_smem_layout_AB(
             mB.element_type,
             self.b_major_mode,
             ab_copy_bits,
-            (self.cta_tiler[1], self.cta_tiler[2], self.num_stages),
+            smem_tiler=(self.cta_tiler[1], self.cta_tiler[2], self.num_stages), # (tileN, tileK, STAGES)
+            debug_print=self.debug_print,
+            title="sB",
         )
 
         # Creates a similar layout but without num_stages or layout atoms
@@ -184,7 +186,9 @@ class TensorOpGemm:
             mC.element_type,
             self.c_major_mode,
             ab_copy_bits,
-            (self.cta_tiler[0], self.cta_tiler[1]),
+            smem_tiler=(self.cta_tiler[0], self.cta_tiler[1]), # (tileM, tileN)
+            debug_print=self.debug_print,
+            title="sC",
         )
 
         # Shared memory allocated for operations with A, B will be
@@ -803,29 +807,69 @@ class TensorOpGemm:
                         )
         return
 
-    def _make_smem_layout_AB(self, dtype, major_mode, copy_bits, smem_tiler):
+    def _make_smem_layout_AB(
+        self, dtype, major_mode, copy_bits, smem_tiler,
+        debug_print: bool = False,
+        title = "",
+    ):
         major_mode_size = (
             smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
         )
         major_mode_size = 64 if major_mode_size >= 64 else major_mode_size
 
-        swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
-        swizzle_bits = min(swizzle_bits, 3)
+        # copy_bits: 16B
+        swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits)) # log2(tileK32 * 2B // 16B) = log2(4) = 2 for tileK32
+        swizzle_bits = min(swizzle_bits, 3) # 2 for tileK32
 
-        layout_atom_outer = (
+        layout_atom_outer = ( # (ROWS8,tileK32):(32,1)
             cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
             if major_mode == utils.LayoutEnum.ROW_MAJOR
             else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
         )
-        layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 3),
-            0,
-            layout_atom_outer,
+        
+        # Make composed layout of R(inner ∘ offset ∘ outer)
+        layout_atom = cute.make_composed_layout( # S<2,3,3> o 0 o (8,32):(32,1)
+            # TODO(REVIEW): why the copy_bits is commonly 16B, but the M here is only 3 (instead of log2(16)=4) ?
+            inner=cute.make_swizzle(swizzle_bits, 3, 3),
+            offset=0,
+            outer=layout_atom_outer,
         )
-        layout = cute.tile_to_shape(layout_atom, smem_tiler, (0, 1, 2))
+        
+        layout = cute.tile_to_shape( # S<2,3,3> o 0 o ((8,16),(32,1),(1,3)):((32,256),(1,0),(0,4096))
+            atom=layout_atom,
+            trg_shape=smem_tiler, # (tileM128, tileK32, STAGES3)
+            # NOTE: this order determinies the mode order to put the tiles
+            # for example, if trg_shape=(M128, K64, S3), and atom is (tileM8, tileK32):(32,1)
+            # then it will firstly logical divide into M128=(tileM8, restM32), K64=(tileK32, restK2), S3=(tileS1, restS3)
+            # to form the basic layout: ((tileM8, restM32), (tileK32, restK2), (tileS1, restS3)):
+            # with unfinished stride: ((32, stride_restM=?) : (1, stride_restK=?), (0, M128 x K64 = 8192))
+            #
+            # then if the order is (0,1,2), then restM will be the innermost dimension to put the tiles with stride_restM=tileM8 x tileK32=256, 
+            # restK will be the middle dimension with stride_restK=stride_restM x restM32=4096
+            #
+            # but if the order is (1,0,2), then restK will be the innermost dimension to put the tiles with stride_restK=tileM8 x tileK32=256,
+            # restM will be the middle dimension with stride_restM=stride_restK x restK2=512
+            order=(0, 1, 2)
+        )
+        
+        print("layout: ", layout)
+        
+        if const_expr(debug_print):
+            cute.printf(f"{title} smem layout: ")
+            cute.printf(f"{major_mode=}, {dtype=}, {copy_bits=}, {smem_tiler=}")
+            cute.printf("major_mode_size: {}", major_mode_size)
+            cute.printf("swizzle_bits: {}", swizzle_bits)
+            cute.printf("layout_atom_outer: {}", layout_atom_outer)
+            cute.printf("layout_atom: {}", layout_atom)
+            cute.printf("final layout: {}", layout)
+        
         return layout
 
-    def _make_smem_layout_C(self, dtype, major_mode, copy_bits, smem_tiler):
+    def _make_smem_layout_C(
+        self, dtype, major_mode, copy_bits, smem_tiler,
+        debug_print: bool = False,
+        title = "",
+    ):
         major_mode_size = (
             smem_tiler[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else smem_tiler[0]
         )
@@ -839,23 +883,35 @@ class TensorOpGemm:
             else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
         )
         layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 4),
-            0,
-            layout_atom_outer,
+            inner=cute.make_swizzle(swizzle_bits, 3, 4),
+            offset=0,
+            outer=layout_atom_outer,
         )
 
         # Due to the thread layout of the mma, remove swizzle in C to
-        # prevent shared memory fragments owned by an single thread from
-        # holding swizzles
+        # prevent shared memory fragments owned by an single thread from holding swizzles
         if major_mode == utils.LayoutEnum.COL_MAJOR:
             layout_atom = cute.make_composed_layout(
-                cute.make_swizzle(0, 3, 4), 0, layout_atom_outer
+                inner=cute.make_swizzle(0, 3, 4), 
+                offset=0, 
+                outer=layout_atom_outer
             )
+        
         layout = cute.tile_to_shape(
-            layout_atom,
-            smem_tiler,
-            (0, 1),
+            atom=layout_atom,
+            trg_shape=smem_tiler,
+            order=(0, 1),
         )
+        
+        if const_expr(debug_print):
+            cute.printf(f"{title} smem layout: ")
+            cute.printf(f"{major_mode=}, {dtype=}, {copy_bits=}, {smem_tiler=}")
+            cute.printf("major_mode_size: {}", major_mode_size)
+            cute.printf("swizzle_bits: {}", swizzle_bits)
+            cute.printf("layout_atom_outer: {}", layout_atom_outer)
+            cute.printf("layout_atom: {}", layout_atom)
+            cute.printf("final layout: {}", layout)
+        
         return layout
 
     def _make_gmem_tiled_copy_AB(self, atom_copy, dtype, major_mode, copy_bits):

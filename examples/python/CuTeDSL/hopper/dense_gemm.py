@@ -1610,6 +1610,24 @@ class WgmmaDenseGemmKernelSm90:
             a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
         )
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
+        # NOTE: Swizzle has the argument of <B, M, S>, where:
+        #   B: BBits is the number of bits for the addr mask
+        #   M: MBase is the number of least-sig bits in addr to keep constant
+        #   S: SShift is the left-shift distance to look for the highest bits to form the shift mask to xor the addr mask
+        #   
+        #   With B and M, we know that the addr mask is the [M, M+B) bits in the address,
+        #   and then we use [M+S, M+S+B) bits to form the shift mask, to xor with the addr mask to achieve the swizzling effect
+        #   
+        #   Commonly, M is fixed to 4 due to 16B vectorized access instructions of `ld.shared.v4` and `st.shared.v4`,
+        #   and since we have 32banks x 4B/bank = 128B for one smem row, S is fixed to log2(128 / 16) = log2(8) = 3,
+        #   then in this way, we always use the smem row idx to swizzle the addr mask
+        #   
+        #   and the B's normal selections are in {0, 1, 2, 3}, where the longest mask width is 2^3 = 8,
+        #   which just covers a smem row of 128B (8 x 16B since M=4), i.e. the range of the addr mask won't exceed one smem row,
+        #   to put another way, the addr mask represents the col idxs
+        #
+        #   so the Swizzle<B={0,1,2,3}, M=4, S=3> is a common setting to 
+        #   use the smem row idx to swizzle the col idxs under the atom vectorized access of contiguous 16B
         a_smem_layout_atom_kind = sm90_utils.get_smem_layout_atom( # K_SW128 if k-major
             layout=a_layout,
             element_type=a_dtype,
