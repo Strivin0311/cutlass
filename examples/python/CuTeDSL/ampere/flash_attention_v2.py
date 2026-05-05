@@ -27,6 +27,9 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import math
+import os
+import time
 from types import SimpleNamespace
 from typing import Type, Union, Callable
 
@@ -39,6 +42,16 @@ from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils as utils
+
+# ---------------------------------------------------------------------------
+# Debug / profile mode switches
+#   DEBUG_MODE=1   -> prints host-side jit-compile info & device-side kernel
+#                     diagnostics via cute.printf (thread 0 / block 0 only)
+#   PROFILE_MODE=1 -> wraps a dedicated benchmark loop with NVTX range markers
+#                     so that nsys / ncu can isolate exactly the kernel launch
+# ---------------------------------------------------------------------------
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 """
 A flash attention v2 forward pass example for NVIDIA Ampere SM80 architecture using CUTE DSL.
@@ -102,6 +115,7 @@ class FlashAttentionForwardAmpere:
         n_block_size: int = 128,
         num_threads: int = 128,
         is_causal: bool = False,
+        debug_print: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -125,6 +139,7 @@ class FlashAttentionForwardAmpere:
         self._head_dim_padded = (head_dim + 31) // 32 * 32
         self._num_threads = num_threads
         self._is_causal = is_causal
+        self.debug_print = debug_print
 
     @staticmethod
     def can_implement(
@@ -311,6 +326,21 @@ class FlashAttentionForwardAmpere:
         )
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
+
+        if cutlass.const_expr(self.debug_print):
+            print()
+            print(f"dtype: {self._dtype}  is_causal: {self._is_causal}")
+            print(f"smem_k_block_size: {smem_k_block_size}  swizzle_bits: {swizzle_bits}")
+            print(f"sQ_layout:  {sQ_layout}")
+            print(f"sKV_layout: {sKV_layout}")
+            print(f"tQKV_layout (thread): {tQKV_layout}")
+            print(f"vQKV_layout (value):  {vQKV_layout}")
+            print(f"tiled_mma:  {tiled_mma}")
+            print(f"grid_dim (m_block, batch, head): {grid_dim}")
+            print(f"block_dim: [{self._num_threads}, 1, 1]")
+            print(f"softmax_scale_log2: {softmax_scale_log2}")
+            print()
+
         self.kernel(
             mQ,
             mK,
@@ -377,6 +407,9 @@ class FlashAttentionForwardAmpere:
         tidx, _, _ = cute.arch.thread_idx()
         m_block, batch_size, num_head = cute.arch.block_idx()
 
+        # is_print_thread: only thread 0 in block (0,0,0) prints to avoid log flood
+        is_print_thread = (tidx == 0) and (m_block == 0) and (batch_size == 0) and (num_head == 0)
+
         n_block_max = cute.ceil_div(mK.shape[1], self._n_block_size)
         if self._is_causal:
             n_block_max = min(
@@ -387,6 +420,12 @@ class FlashAttentionForwardAmpere:
                 n_block_max,
             )
         n_block = n_block_max - 1
+
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] n_block_max = %d\\n", n_block_max)
+                cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
@@ -409,6 +448,14 @@ class FlashAttentionForwardAmpere:
             (self._n_block_size, self._head_dim_padded),
             (None, 0),
         )
+
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] gQ shape: {}", gQ)
+                cute.printf("[kernel] gK shape (n_block dim): {}", gK)
+                cute.printf("[kernel] gV shape (n_block dim): {}", gV)
+                cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -440,6 +487,16 @@ class FlashAttentionForwardAmpere:
         tVgV = gmem_thr_copy_QKV.partition_S(gV)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
 
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] tQgQ (gmem copy src Q): {}", tQgQ)
+                cute.printf("[kernel] tKgK (gmem copy src K): {}", tKgK)
+                cute.printf("[kernel] sQ.layout: {}", sQ.layout)
+                cute.printf("[kernel] sK.layout: {}", sK.layout)
+                cute.printf("[kernel] sVt.layout (transposed V): {}", sVt.layout)
+                cute.printf("")
+
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
         # ///////////////////////////////////////////////////////////////////////////////
@@ -452,6 +509,15 @@ class FlashAttentionForwardAmpere:
         )
         acc_O = cute.make_fragment(acc_shape_O, cutlass.Float32)
         acc_O.fill(0.0)
+
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] tSrQ (MMA frag A): {}", tSrQ)
+                cute.printf("[kernel] tSrK (MMA frag B): {}", tSrK)
+                cute.printf("[kernel] tOrVt (MMA frag B Vt): {}", tOrVt)
+                cute.printf("[kernel] acc_O shape: {}", acc_O)
+                cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Smem copy atom tiling
@@ -1170,22 +1236,23 @@ def run(
             f"Unsupported testcase {dtype}, {head_dim}, {m_block_size}, {n_block_size}, {num_threads}, {is_causal}"
         )
 
-    print(f"Running Ampere SM80 FlashAttentionForward test with:")
-    print(f"  dtype: {dtype}")
-    print(f"  batch_size: {batch_size}")
-    print(f"  seqlen_q: {seqlen_q}")
-    print(f"  seqlen_k: {seqlen_k}")
-    print(f"  num_head: {num_head}")
-    print(f"  head_dim: {head_dim}")
-    print(f"  softmax_scale: {softmax_scale}")
-    print(f"  m_block_size: {m_block_size}")
-    print(f"  n_block_size: {n_block_size}")
-    print(f"  num_threads: {num_threads}")
-    print(f"  is_causal: {is_causal}")
-    print(f"  warmup_iterations: {warmup_iterations}")
-    print(f"  iterations: {iterations}")
-    print(f"  skip_ref_check: {skip_ref_check}")
-    print(f"  use_cold_l2: {use_cold_l2}")
+    if DEBUG_MODE:
+        print(f"Running Ampere SM80 FlashAttentionForward test with:")
+        print(f"  dtype: {dtype}")
+        print(f"  batch_size: {batch_size}")
+        print(f"  seqlen_q: {seqlen_q}")
+        print(f"  seqlen_k: {seqlen_k}")
+        print(f"  num_head: {num_head}")
+        print(f"  head_dim: {head_dim}")
+        print(f"  softmax_scale: {softmax_scale}")
+        print(f"  m_block_size: {m_block_size}")
+        print(f"  n_block_size: {n_block_size}")
+        print(f"  num_threads: {num_threads}")
+        print(f"  is_causal: {is_causal}")
+        print(f"  warmup_iterations: {warmup_iterations}")
+        print(f"  iterations: {iterations}")
+        print(f"  skip_ref_check: {skip_ref_check}")
+        print(f"  use_cold_l2: {use_cold_l2}")
 
     # Create tensor Q/K/V/O
     def create_tensor(
@@ -1226,6 +1293,7 @@ def run(
         n_block_size,
         num_threads,
         is_causal,
+        debug_print=DEBUG_MODE,
     )
 
     # Get current CUDA stream from PyTorch
@@ -1233,9 +1301,17 @@ def run(
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile the fa2 forward pass
+    if DEBUG_MODE:
+        print("Compiling kernel with cute.compile ...")
+    compile_start = time.perf_counter()
     compiled_fa2_fwd = cute.compile(fa2_fwd, q, k, v, o, softmax_scale, current_stream)
+    compile_time = time.perf_counter() - compile_start
+    if DEBUG_MODE:
+        print(f"Compilation done in {compile_time:.3f}s")
 
     if not skip_ref_check:
+        if DEBUG_MODE:
+            print("Executing FA2 kernel for reference check ...")
         compiled_fa2_fwd(q, k, v, o, softmax_scale, current_stream)
         torch.cuda.synchronize()
         q_ref = q_torch.permute(0, 2, 1, 3)
@@ -1245,6 +1321,8 @@ def run(
         ref_o = torch.nn.functional.scaled_dot_product_attention(
             q_ref, k_ref, v_ref, scale=softmax_scale, is_causal=is_causal
         ).permute(0, 2, 1, 3)
+        if DEBUG_MODE:
+            print("Verifying results ...")
         torch.testing.assert_close(o_torch.cpu(), ref_o.cpu(), atol=1e-02, rtol=1e-04)
         print("Results verified successfully!")
 
@@ -1283,6 +1361,24 @@ def run(
         iterations=iterations,
     )
 
+    if PROFILE_MODE:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+
+        b, sq, sk, h, d = batch_size, seqlen_q, seqlen_k, num_head, head_dim
+        flops = b * sq * sk * h * d * 4  # 4 for 2 matmul
+        flops = flops // 2 if is_causal else flops  # causal will have half flops on average
+        event_str = (
+            f"fa2_fwd ({b=},{sq=},{sk=},{h=},{d=},{is_causal=},{flops=})"
+        )
+        
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(iter_id=i, start=start, end=end)
+            with add_nvtx_event(event_str):
+                compiled_fa2_fwd(q, k, v, o, softmax_scale, current_stream)
+
     return avg_time_us  # Return execution time in microseconds
 
 if __name__ == "__main__":
@@ -1300,8 +1396,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_block_size", type=int, default=64)
     parser.add_argument("--num_threads", type=int, default=128)
     parser.add_argument("--is_causal", action="store_true", help="Enable causal mask")
-    parser.add_argument("--warmup_iterations", type=int, default=3)
-    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--warmup_iterations", type=int, default=0)
+    parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument(
         "--skip_ref_check", action="store_true", help="Skip reference check"
     )

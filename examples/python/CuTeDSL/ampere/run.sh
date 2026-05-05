@@ -10,8 +10,8 @@ export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_M
 # TEST_SCRIPT="elementwise_add"
 # TEST_SCRIPT="elementwise_apply"
 # TEST_SCRIPT="sgemm"
-TEST_SCRIPT="tensorop_gemm"
-# TEST_SCRIPT="flash_attention_v2"
+# TEST_SCRIPT="tensorop_gemm"
+TEST_SCRIPT="flash_attention_v2"
 # TEST_SCRIPT="smem_allocator"
 # TEST_SCRIPT="dynamic_smem_size"
 # TEST_SCRIPT="call_bypass_dlpack"
@@ -23,22 +23,25 @@ if [[ $DEBUG_MODE -eq 1 ]]; then
     N=1024
     SEQLEN_Q=2048
     SEQLEN_K=4096
-    BATCH_SIZE=1
+    BATCH_SIZE=2
+    NUM_HEADS=4
     PROFILE_MODE=0 # disable profiling when in debug mode to avoid conflicts with verbose logging
 elif [[ $PROFILE_MODE -eq 1 ]]; then
     M=6144
     K=2048
     N=8192
-    SEQLEN_Q=4096
-    SEQLEN_K=4096
-    BATCH_SIZE=1
+    SEQLEN_Q=8192
+    SEQLEN_K=8192
+    BATCH_SIZE=4
+    NUM_HEADS=8
 else
     M=8192
     K=8192
     N=8192
     SEQLEN_Q=1280
     SEQLEN_K=1536
-    BATCH_SIZE=1
+    BATCH_SIZE=2
+    NUM_HEADS=16
 fi
 
 
@@ -72,12 +75,13 @@ elif [[ $TEST_SCRIPT == "tensorop_gemm" ]]; then
     --a_major k --b_major k --c_major n
     "
 elif [[ $TEST_SCRIPT == "flash_attention_v2" ]]; then
+    # TFLOPS: 144 for fp16
     SCRIPT_CMD="
     python flash_attention_v2.py                                          \
     --dtype Float16 --head_dim 128 --m_block_size 128 --n_block_size 128 \
     --num_threads 128 --batch_size $BATCH_SIZE                            \
     --seqlen_q $SEQLEN_Q --seqlen_k $SEQLEN_K                            \
-    --num_head 16 --softmax_scale 1.0 --is_causal
+    --num_head $NUM_HEADS --softmax_scale 1.0 --is_causal
     "
 elif [[ $TEST_SCRIPT == "smem_allocator" ]]; then
     SCRIPT_CMD="python smem_allocator.py"
