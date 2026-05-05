@@ -10,26 +10,38 @@ export PROFILE_TYPE="nsys" # choose from "nsys" or "ncu" when enabling PROFILE_M
 # TEST_SCRIPT="dense_gemm"
 # TEST_SCRIPT="dense_gemm_software_pipeline"
 # TEST_SCRIPT="dense_gemm_persistent"
-TEST_SCRIPT="dense_blockscaled_gemm_persistent"
+# TEST_SCRIPT="dense_blockscaled_gemm_persistent"
 # TEST_SCRIPT="grouped_gemm"
-# TEST_SCRIPT="fmha"
+TEST_SCRIPT="fmha"
 
 if [[ $DEBUG_MODE -eq 1 ]]; then
     M=2048
     K=4096
     N=1024
     GROUPED_MNKL='"(384,4096,1024,1),(896,4096,1024,1),(640,4096,1024,1),(128,4096,1024,1)"'
+    SEQLEN_Q=2048
+    SEQLEN_K=4096
+    BATCH_SIZE=2
+    NUM_HEADS=4
     PROFILE_MODE=0 # disable profiling when in debug mode to avoid conflicts with verbose logging
 elif [[ $PROFILE_MODE -eq 1 ]]; then
     M=6144
     K=2048
     N=8192
     GROUPED_MNKL='"(1024,8192,2048,1),(2048,8192,2048,1),(512,8192,2048,1),(2560,8192,2048,1)"'
+    SEQLEN_Q=8192
+    SEQLEN_K=8192
+    BATCH_SIZE=4
+    NUM_HEADS=8
 else
     M=8192
     K=8192
     N=8192
     GROUPED_MNKL='"(8192,1280,32,1),(16,384,1536,1),(640,1280,16,1),(640,160,16,1)"'
+    SEQLEN_Q=1280
+    SEQLEN_K=1536
+    BATCH_SIZE=2
+    NUM_HEADS=16
 fi
 
 
@@ -80,12 +92,13 @@ elif [[ $TEST_SCRIPT == "grouped_gemm" ]]; then
     --use_2cta_instrs
     "
 elif [[ $TEST_SCRIPT == "fmha" ]]; then
+    # PFLOPS: 1.21 for fp16
     SCRIPT_CMD="
     python fmha.py                                     \
     --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
     --mma_tiler_mn 128,128                                              \
-    --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
-    --is_persistent
+    --q_shape $BATCH_SIZE,$SEQLEN_Q,$NUM_HEADS,128 --k_shape $BATCH_SIZE,$SEQLEN_K,$NUM_HEADS,128                         \
+    --is_persistent --is_causal
     "
 else
     echo "Unsupported TEST_SCRIPT: $TEST_SCRIPT"

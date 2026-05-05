@@ -29,6 +29,7 @@
 import argparse
 import enum
 import math
+import os
 import time
 from typing import Type, Tuple
 
@@ -46,6 +47,16 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32, Boolean
+
+# ---------------------------------------------------------------------------
+# Debug / profile mode switches
+#   DEBUG_MODE=1   -> prints host-side compile info; device-side kernel prints
+#                     from designated warp 0 / thread 0 in first tile only
+#   PROFILE_MODE=1 -> wraps a dedicated benchmark loop with NVTX range markers
+#                     so that nsys / ncu can isolate exactly the kernel launch
+# ---------------------------------------------------------------------------
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "0") == "1"
+PROFILE_MODE = os.environ.get("PROFILE_MODE", "0") == "1"
 
 """
 A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -255,7 +266,7 @@ class MaskType(enum.Enum):
 
 
 def make_thread_cooperative_group(size: int):
-    return pipeline.CooperativeGroup(pipeline.Agent.Thread, size, size)
+    return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -266,6 +277,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler: Tuple[int, int, int],
         is_persistent: bool,
         mask_type: MaskType,
+        debug_print: bool = False,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
 
@@ -361,6 +373,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             len((*self.softmax0_warp_ids, *self.softmax1_warp_ids))
             // num_warps_per_warpgroup
         )
+        self.debug_print = debug_print
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -641,6 +654,23 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.shared_storage = SharedStorage
 
+        if cutlass.const_expr(self.debug_print):
+            print()
+            print(f"[__call__] q_dtype={self.q_dtype}  k_dtype={self.k_dtype}  o_dtype={self.o_dtype}")
+            print(f"[__call__] qk_acc_dtype={self.qk_acc_dtype}  pv_acc_dtype={self.pv_acc_dtype}")
+            print(f"[__call__] cta_tiler: {self.cta_tiler}")
+            print(f"[__call__] qk_mma_tiler: {self.qk_mma_tiler}  pv_mma_tiler: {self.pv_mma_tiler}")
+            print(f"[__call__] mask_type: {self.mask_type}  is_persistent: {self.is_persistent}")
+            print(f"[__call__] q_smem_layout_staged: {q_smem_layout_staged}")
+            print(f"[__call__] k_smem_layout_staged: {k_smem_layout_staged}")
+            print(f"[__call__] v_smem_layout_staged: {v_smem_layout_staged}")
+            print(f"[__call__] o_smem_layout_staged: {o_smem_layout_staged}")
+            print(f"[__call__] q_stage={self.q_stage}  kv_stage={self.kv_stage}  mma_softmax_stage={self.mma_softmax_stage}")
+            print(f"[__call__] grid: {grid}  block: [{self.threads_per_cta}, 1, 1]  cluster: {self.cluster_shape_mnk}")
+            print(f"[__call__] qk_tiled_mma: {qk_tiled_mma}")
+            print(f"[__call__] pv_tiled_mma: {pv_tiled_mma}")
+            print()
+
         # Launch the kernel synchronously
         self.kernel(
             qk_tiled_mma,
@@ -750,6 +780,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
+
+        # is_print_thread: only load warp, thread 0 in block (0,0,0) prints
+        is_print_thread = (
+            (warp_idx == self.load_warp_id)
+            and (tidx % self.threads_per_warp == 0)
+            and (bidx == 0) and (bidy == 0) and (bidz == 0)
+        )
+
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] warp_ids: load=%d mma=%d epi=%d softmax0=0..3 softmax1=4..7 corr=8..11\\n",
+                            self.load_warp_id, self.mma_warp_id, self.epilogue_warp_id)
+                cute.printf("[kernel] scale_softmax_log2 = %f  scale_output = %f\\n",
+                            scale_softmax_log2, scale_output)
+                cute.printf("")
 
         #
         # Prefetch tma desc
@@ -908,6 +955,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p1_offset,
             tOrP.layout,
         )
+
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] sQ: {}\\n", sQ)
+                cute.printf("[kernel] sK: {}\\n", sK)
+                cute.printf("[kernel] sO: {}\\n", sO)
+                cute.printf("[kernel] tStS (QK acc, tmem): {}\\n", tStS)
+                cute.printf("[kernel] tOtO (PV acc, tmem): {}\\n", tOtO)
+                cute.printf("[kernel] tOrP0 (P0 tmem frag): {}\\n", tOrP0)
+                cute.printf("")
+
         cute.arch.barrier(
             barrier_id=self.cta_sync_bar_id,
             number_of_threads=self.threads_per_cta,
@@ -2447,26 +2506,27 @@ def run(
     :rtype: float
     """
 
-    print(f"Running Blackwell SM100 FMHA test with:")
-    print(f"  q_shape: {q_shape}")
-    print(f"  k_shape: {k_shape}")
-    print(f"  in_dtype: {in_dtype}")
-    print(f"  out_dtype: {out_dtype}")
-    print(f"  qk_acc_dtype: {qk_acc_dtype}")
-    print(f"  pv_acc_dtype: {pv_acc_dtype}")
-    print(f"  mma_tiler_mn: {mma_tiler_mn}")
-    print(f"  is_persistent: {is_persistent}")
-    print(f"  is_causal: {is_causal}")
-    print(f"  scale_q: {scale_q}")
-    print(f"  scale_k: {scale_k}")
-    print(f"  scale_v: {scale_v}")
-    print(f"  inv_scale_o: {inv_scale_o}")
-    print(f"  scale_softmax: {scale_softmax}")
-    print(f"  tolerance: {tolerance}")
-    print(f"  warmup_iterations: {warmup_iterations}")
-    print(f"  iterations: {iterations}")
-    print(f"  skip_ref_check: {skip_ref_check}")
-    print(f"  use_cold_l2: {use_cold_l2}")
+    if DEBUG_MODE:
+        print(f"Running Blackwell SM100 FMHA test with:")
+        print(f"  q_shape: {q_shape}")
+        print(f"  k_shape: {k_shape}")
+        print(f"  in_dtype: {in_dtype}")
+        print(f"  out_dtype: {out_dtype}")
+        print(f"  qk_acc_dtype: {qk_acc_dtype}")
+        print(f"  pv_acc_dtype: {pv_acc_dtype}")
+        print(f"  mma_tiler_mn: {mma_tiler_mn}")
+        print(f"  is_persistent: {is_persistent}")
+        print(f"  is_causal: {is_causal}")
+        print(f"  scale_q: {scale_q}")
+        print(f"  scale_k: {scale_k}")
+        print(f"  scale_v: {scale_v}")
+        print(f"  inv_scale_o: {inv_scale_o}")
+        print(f"  scale_softmax: {scale_softmax}")
+        print(f"  tolerance: {tolerance}")
+        print(f"  warmup_iterations: {warmup_iterations}")
+        print(f"  iterations: {iterations}")
+        print(f"  skip_ref_check: {skip_ref_check}")
+        print(f"  use_cold_l2: {use_cold_l2}")
 
     # Unpack parameters
     b, s_q, h_q, d = q_shape
@@ -2655,6 +2715,7 @@ def run(
         mma_tiler,
         is_persistent,
         mask_type,
+        debug_print=DEBUG_MODE,
     )
 
     # Initialize Stream
@@ -2679,7 +2740,8 @@ def run(
         d,
     )
 
-    print("Compiling kernel with cute.compile ...")
+    if DEBUG_MODE:
+        print("Compiling kernel with cute.compile ...")
     start_time = time.time()
     # compile fmha kernel
     compiled_fmha = cute.compile(
@@ -2696,7 +2758,8 @@ def run(
         current_stream,
     )
     compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
+    if DEBUG_MODE:
+        print(f"Compilation time: {compilation_time:.4f} seconds")
 
     def run_torch_fmha(q, k, v, scale_softmax=1.0, scale_output=1.0, is_causal=False):
         h_q = q.shape[2]
@@ -2753,6 +2816,8 @@ def run(
 
     if not skip_ref_check:
         # Execute kernel once for reference checking
+        if DEBUG_MODE:
+            print("Executing FMHA kernel for reference check ...")
         compiled_fmha(
             q_tensor.iterator,
             k_tensor.iterator,
@@ -2765,7 +2830,8 @@ def run(
             scale_output,
             current_stream,
         )
-        print("Verifying results...")
+        if DEBUG_MODE:
+            print("Verifying results...")
         o_ref = run_torch_fmha(
             q_ref, k_ref, v_ref, scale_softmax, scale_output, is_causal
         )
@@ -2880,6 +2946,36 @@ def run(
         warmup_iterations=warmup_iterations,
         iterations=iterations,
     )
+
+    if PROFILE_MODE:
+        import sys
+        sys.path.insert(0, "..")
+        from nvtx import switch_profile, add_nvtx_event
+
+        b, sq, hq, d = q_shape
+        _, sk, _, _ = k_shape
+        flops = b * sq * sk * hq * d * 4  # 4 for 2 matmul
+        flops = flops // 2 if is_causal else flops  # causal will have half flops on average
+        
+        event_str = (
+            f"fmha_fwd ({b=},{sq=},{sk=},{hq=},{d=},{is_causal=},{flops=})"
+        )
+        iters, start, end = 10, 6, 9
+        for i in range(iters):
+            switch_profile(iter_id=i, start=start, end=end)
+            with add_nvtx_event(event_str):
+                compiled_fmha(
+                    q_tensor.iterator,
+                    k_tensor.iterator,
+                    v_tensor.iterator,
+                    o_tensor.iterator,
+                    problem_size,
+                    cum_seqlen_q,
+                    cum_seqlen_k,
+                    scale_softmax_log2,
+                    scale_output,
+                    current_stream,
+                )
 
     return exec_time  # Return execution time in microseconds
 
