@@ -42,6 +42,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.nvgpu import cpasync, warp
 
 """
 A dense GEMM (C = A * B) example for the NVIDIA Ampere architecture using CUTE DSL.
@@ -121,11 +122,13 @@ class TensorOpGemm:
         self.num_stages = 3
         self.atom_layout_mnk = atom_layout_mnk
         self.debug_print = debug_print
-        atom_lay_M, atom_lay_N, atom_lay_K = self.atom_layout_mnk
+        atom_lay_M, atom_lay_N, atom_lay_K = self.atom_layout_mnk # warp layout
         self.num_threads = atom_lay_M * atom_lay_N * atom_lay_K * 32
+        
+        self.ab_copy_bits = 128 # assume the input is 16B align
 
         self.bM, self.bN, self.bK = self.cta_tiler
-        self.mma_inst_shape = (16, 8, 16)
+        self.mma_inst_shape = (16, 8, 16) # m16 x n8 x k16
         mmaM, mmaN, mmaK = self.mma_inst_shape
 
         assert (
@@ -137,6 +140,15 @@ class TensorOpGemm:
         assert atom_lay_K == 1, "this example does not support atom layout K > 1"
         assert self.bK % mmaK == 0, "bK must be divisible by MMA instruction"
         assert self.num_stages >= 3, "num_stages must be greater than or equal to 3"
+        
+        if const_expr(self.debug_print):
+            print(f"atom_layout_mnk: {self.atom_layout_mnk}")
+            print(f"cta_tiler: {self.cta_tiler}")
+            print(f"num_stages: {self.num_stages}")
+            print(f"num_threads: {self.num_threads}")
+            print(f"mma_inst_shape: {self.mma_inst_shape}")
+            print(f"ab_copy_bits: {self.ab_copy_bits}")
+            print(f"bM: {self.bM}, bN: {self.bN}, bK: {self.bK}")
 
     @cute.jit
     def __call__(
@@ -162,30 +174,32 @@ class TensorOpGemm:
         # size and num stages (stages are used for K dimension) that is also
         # sectioned into 64x8 or 8x32 layout atoms. 
         # The swizzle is set so that the atom for the shared memory -> register copy does not encounter bank conflicts
-
-        ab_copy_bits = 128 # assume the input is 16B align
+        
+        # sA_layout: S<2,3,3> o 0 o ((8,16),(32,1),(1,3)):((32,256),(1,0),(0,4096))
         sA_layout = self._make_smem_layout_AB(
             mA.element_type,
             self.a_major_mode,
-            ab_copy_bits,
+            self.ab_copy_bits,
             smem_tiler=(self.cta_tiler[0], self.cta_tiler[2], self.num_stages), # (tileM, tileK, STAGES)
             debug_print=self.debug_print,
             title="sA",
         )
+        # sB_layout: S<2,3,3> o 0 o ((8,16),(32,1),(1,3)):((32,256),(1,0),(0,4096))
         sB_layout = self._make_smem_layout_AB(
             mB.element_type,
             self.b_major_mode,
-            ab_copy_bits,
+            self.ab_copy_bits,
             smem_tiler=(self.cta_tiler[1], self.cta_tiler[2], self.num_stages), # (tileN, tileK, STAGES)
             debug_print=self.debug_print,
             title="sB",
         )
 
         # Creates a similar layout but without num_stages or layout atoms
+        # sC_layout: S<3,3,4> o 0 o ((8,16),(128,1)):((128,1024),(1,0))
         sC_layout = self._make_smem_layout_C(
             mC.element_type,
             self.c_major_mode,
-            ab_copy_bits,
+            self.ab_copy_bits,
             smem_tiler=(self.cta_tiler[0], self.cta_tiler[1]), # (tileM, tileN)
             debug_print=self.debug_print,
             title="sC",
@@ -209,20 +223,37 @@ class TensorOpGemm:
 
         # Create a copy atom for a global to shared memory asynchronous copy
         atom_async_copy = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(
-                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            # Non-bulk asynchronous GMEM to SMEM Copy Operation.
+            # cp.async.ca.shared{::cta}.global{.level::cache_hint}{.level::prefetch_size}
+            #                         [dst], [src], cp-size{, src-size}{, cache-policy} ;
+            # cp.async.cg.shared{::cta}.global{.level::cache_hint}{.level::prefetch_size}
+            #                         [dst], [src], 16{, src-size}{, cache-policy} ;
+            # cp.async.ca.shared{::cta}.global{.level::cache_hint}{.level::prefetch_size}
+            #                         [dst], [src], cp-size{, ignore-src}{, cache-policy} ;
+            # cp.async.cg.shared{::cta}.global{.level::cache_hint}{.level::prefetch_size}
+            #                         [dst], [src], 16{, ignore-src}{, cache-policy} ;
+            # where:
+            #   .level::cache_hint =     { .L2::cache_hint }
+            #   .level::prefetch_size =  { .L2::64B, .L2::128B, .L2::256B }
+            #   cp-size =                { 4, 8, 16 }
+            # See https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-non-bulk-copy
+            # for more details
+            cpasync.CopyG2SOp(
+                # Cache at global level (cache in L2 and below, not L1).
+                # Use ld.cg to cache loads only globally, bypassing the L1 cache, and cache only in the L2 cache.
+                cache_mode=cpasync.LoadCacheMode.GLOBAL # ld.cg
             ),
             mA.element_type,
-            num_bits_per_copy=ab_copy_bits,
+            num_bits_per_copy=self.ab_copy_bits,
         )
 
         # Create thread layouts for tiled copy from the copy atom where the
         # thread layout simply follows the leading dimension of the tensor
         tiled_copy_A = self._make_gmem_tiled_copy_AB(
-            atom_async_copy, mA.element_type, self.a_major_mode, ab_copy_bits
+            atom_async_copy, mA.element_type, self.a_major_mode, self.ab_copy_bits
         )
         tiled_copy_B = self._make_gmem_tiled_copy_AB(
-            atom_async_copy, mB.element_type, self.b_major_mode, ab_copy_bits
+            atom_async_copy, mB.element_type, self.b_major_mode, self.ab_copy_bits
         )
 
         # Creates a synchronous copy atom and thread layouts for the epilogue
@@ -241,34 +272,59 @@ class TensorOpGemm:
         # ///////////////////////////////////////////////////////////////////////////////
 
         # Creates a mma atom with 16x8x16 shape for MNK
-        op = cute.nvgpu.warp.MmaF16BF16Op(
+        op = warp.MmaF16BF16Op(
             self.ab_dtype, self.acc_dtype, self.mma_inst_shape
         )
 
         permutation_mnk = (
             self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+            # TODO(REVIRW): why N has to be 16, since the ld.matrix uses m8n8 for B ?
             # if atom layout's N-mode is 1, to leverage the largest coalesced
             # shared memory -> register copy, set the tiled mma's N mode to 16
-            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * (2 if self.atom_layout_mnk[1] == 1 else 1),
             self.atom_layout_mnk[2] * self.mma_inst_shape[2],
         )
 
         # Created a tiled mma that tiles the atom according to specified layout.
-        # For a 2x2x1 atom layout, the mma atom is duplicated 4 times, twice
-        # across M and twice across N
-        tC = cute.make_layout(self.atom_layout_mnk)
+        # For a 2x2x1 atom layout, the mma atom is duplicated 4 times, twice across M and twice across N
+        #
+        # tiled_mma: Tiled MMA
+        #   Thr Layout VMNK: (32,2,2,1):(1,32,64,0)
+        #   Permutation MNK: (32:1,16:1,16:1)
+        #   MMA Atom
+        #   ThrID:           32:1
+        #   Shape MNK:       (16,8,16)
+        #   TV Layout A:     ((4,8),(2,2,2)):((32,1),(16,8,128))
+        #   TV Layout B:     ((4,8),(2,2)):((16,1),(8,64))
+        #   TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
+        tC = cute.make_layout(self.atom_layout_mnk) # warp layout
         tiled_mma = cute.make_tiled_mma(
             op,
-            tC,
+            atom_layout_mnk=tC,
             permutation_mnk=permutation_mnk,
         )
 
         # grid_dim: ((m + BLK_M - 1) // BLK_M, (n + BLK_N - 1) // BLK_N, l)
         grid_dim = cute.ceil_div(mC.shape, (self.bM, self.bN, 1))
 
-        # Add threadblock rasterization to improve re-use of data
+        # raster_factor (r): controls how many consecutive N-tiles share the same A-row stripe.
+        #
+        # Without rasterization, the default x-major CTA dispatch advances tile_m on every
+        # step while tile_n only changes once per Gm steps.  From A's perspective this means
+        # A[row 0], A[row 1], ..., A[row Gm-1] are all loaded before tile_n ever advances —
+        # A changes too fast relative to N, so by the time the second N-tile needs A[row 0]
+        # it has already been evicted from L2.
+        #
+        # Setting r > 1 slows A down by a factor of r: each A-row stripe is held in L2
+        # while r consecutive N-tiles consume it, then the next A-row is fetched.
+        # The flip side is that B now advances r times faster (r different N-tiles per
+        # A-row), which is the intended trade-off — B columns are narrower and cheaper
+        # to keep warm than A row stripes across a large M dimension.
+        #
+        # Thresholds picked so that it doesn't cause too many no-op CTAs
         raster_factor = 1
         grid_dim_n = cute.size(grid_dim[1])
+        
         # Thresholds picked so that it doesn't cause too many no-op CTAs
         if grid_dim_n > 5:
             raster_factor = 8
@@ -276,6 +332,7 @@ class TensorOpGemm:
             raster_factor = 4
         elif grid_dim_n > 1:
             raster_factor = 2
+        
         rasterization_remap_grid_dim = (
             cute.size(grid_dim[0]) * raster_factor,
             (cute.size(grid_dim[1]) + raster_factor - 1) // raster_factor,
@@ -283,20 +340,28 @@ class TensorOpGemm:
         )
 
         if const_expr(self.debug_print):
+            print()
             print(f"{self.a_major_mode=}, {self.b_major_mode=}, {self.c_major_mode=}")
             print(f"sA_layout: {sA_layout}")
             print(f"sB_layout: {sB_layout}")
             print(f"sC_layout: {sC_layout}")
+            print()
             print(f"smem_size bytes: {smem_size}")
+            print()
             print(f"tiled_copy_A: {tiled_copy_A}")
+            print()
             print(f"tiled_copy_B: {tiled_copy_B}")
+            print()
             print(f"tiled_copy_C: {tiled_copy_C}")
+            print()
             print(f"tiled_mma: {tiled_mma}")
-            print(f"grid_dim: {grid_dim}")
-            print(f"raster_factor: {raster_factor}")
-            print(f"block=[{self.num_threads}, 1, 1]")
             
-
+            cute.printf("")
+            cute.printf("grid_dim: {}", grid_dim)
+            cute.printf("raster_factor: {}", raster_factor)
+            cute.printf("block=[{}, 1, 1]", self.num_threads)
+            cute.printf("rasterization_remap_grid_dim: {}", rasterization_remap_grid_dim)
+        
         self.kernel(
             mA,
             mB,
@@ -337,6 +402,38 @@ class TensorOpGemm:
         bidx, bidy, bidz = cute.arch.block_idx()
         is_thread0 = (tidx == 0) & (bidx == 0) & (bidy == 0) & (bidz == 0)
         grid_dim = cute.ceil_div(mC.shape, (self.bM, self.bN, 1))
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Threadblock Rasterization
+        #
+        # CUDA's hardware scheduler dispatches CTAs in x-major order: all CTAs
+        # sharing the same bidy are launched before bidy advances.  With the
+        # original (Gm, Gn) grid, consecutive CTAs scan along the M-axis while N
+        # stays fixed — A-row stripes get loaded once per N-tile and evicted from
+        # L2 long before any other N-tile can reuse them.
+        #
+        # To improve reuse we reshape the grid in __call__:
+        #
+        #   original grid  : (Gm,        Gn,           Gz)
+        #   remapped grid  : (Gm*r,  ceil(Gn/r),       Gz)   where r = rasterization_factor
+        #
+        # One bidy-slice now spans Gm*r CTAs grouped in consecutive blocks of r:
+        #
+        #   bidx  0 .. r-1   →  tile_m=0,  tile_n = 0..r-1   ← r N-tiles reuse A[row 0]
+        #   bidx  r .. 2r-1  →  tile_m=1,  tile_n = 0..r-1   ← r N-tiles reuse A[row 1]
+        #   ...
+        #
+        # Each A-row stripe is consumed r times consecutively before the next row
+        # is fetched, keeping it hot in L2 across r N-tiles instead of one.
+        #
+        # Inside the kernel we invert the reshape so that (bidx, bidy) maps back
+        # to the correct logical (tile_m, tile_n) coordinates:
+        #
+        #   tile_m  =  bidx // r                    (one M-tile per block of r bidx values)
+        #   tile_n  =  (bidx % r)  +  bidy * r      (cycles through r N-tiles, then shifts)
+        #
+        # CTAs whose tile_n falls outside [0, Gn) exit early (no-op padding
+        # introduced by the ceil rounding above).
+        # ///////////////////////////////////////////////////////////////////////////////
         offset_tile_x, offset_tile_y = self.raster_tile(
             bidx, bidy, rasterization_factor
         )
@@ -597,14 +694,16 @@ class TensorOpGemm:
 
             # Create the copy atoms for the copy from shared memory to register
             atom_copy_s2r_A = cute.make_copy_atom(
-                cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                    self.a_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                warp.LdMatrix8x8x16bOp( # ldmatrix.sync.aligned.m8n8.x4 => m32n8 per warp if row major, m8n32 if column major
+                    transpose=self.a_major_mode != utils.LayoutEnum.ROW_MAJOR, 
+                    num_matrices=4
                 ),
                 mA.element_type,
             )
             atom_copy_s2r_B = cute.make_copy_atom(
-                cute.nvgpu.warp.LdMatrix8x8x16bOp(
-                    self.b_major_mode != utils.LayoutEnum.ROW_MAJOR, 4
+                warp.LdMatrix8x8x16bOp( # ldmatrix.sync.aligned.m8n8.x4 => m32n8 per warp, if row major, m8n32 if column major
+                    transpose=self.b_major_mode != utils.LayoutEnum.ROW_MAJOR,
+                    num_matrices=4
                 ),
                 mB.element_type,
             )
@@ -829,7 +928,9 @@ class TensorOpGemm:
         
         # Make composed layout of R(inner ∘ offset ∘ outer)
         layout_atom = cute.make_composed_layout( # S<2,3,3> o 0 o (8,32):(32,1)
-            # TODO(REVIEW): why the copy_bits is commonly 16B, but the M here is only 3 (instead of log2(16)=4) ?
+            # TODO(REVIEW): why the copy_bits is commonly 16B, 
+            # but the M here is only 3 (instead of log2(16)=4) ?
+            # worse still, S is 3, which makes the shift mask less than the smem row idx, weird
             inner=cute.make_swizzle(swizzle_bits, 3, 3),
             offset=0,
             outer=layout_atom_outer,
@@ -875,7 +976,7 @@ class TensorOpGemm:
         )
 
         swizzle_bits = int(math.log2(major_mode_size * dtype.width // copy_bits))
-        swizzle_bits = min(swizzle_bits, 3)
+        swizzle_bits = min(swizzle_bits, 3) # 2
 
         layout_atom_outer = (
             cute.make_layout((8, major_mode_size), stride=(major_mode_size, 1))
@@ -883,7 +984,10 @@ class TensorOpGemm:
             else cute.make_layout((major_mode_size, 8), stride=(1, major_mode_size))
         )
         layout_atom = cute.make_composed_layout(
-            inner=cute.make_swizzle(swizzle_bits, 3, 4),
+            # TODO(REVIEW): why the copy_bits is commonly 16B, 
+            # but the M here is only 3 (instead of log2(16)=4) ?
+            # although S is 4, which still makes the shift mask as the smem row idx
+            inner=cute.make_swizzle(swizzle_bits, 3, 4), # (2, 3, 4)
             offset=0,
             outer=layout_atom_outer,
         )
@@ -892,7 +996,7 @@ class TensorOpGemm:
         # prevent shared memory fragments owned by an single thread from holding swizzles
         if major_mode == utils.LayoutEnum.COL_MAJOR:
             layout_atom = cute.make_composed_layout(
-                inner=cute.make_swizzle(0, 3, 4), 
+                inner=cute.make_swizzle(0, 3, 4), # B0 means no swizzling
                 offset=0, 
                 outer=layout_atom_outer
             )
@@ -917,41 +1021,57 @@ class TensorOpGemm:
     def _make_gmem_tiled_copy_AB(self, atom_copy, dtype, major_mode, copy_bits):
         copy_elems = copy_bits // dtype.width
         shape_dim_1 = cute.size(self.bK) // copy_elems
-        # thread layout for copy
+        
+        # Thread layout for copy
         thread_layout = cute.make_layout(
-            (self.num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+            (self.num_threads // shape_dim_1, shape_dim_1),
+            stride=(shape_dim_1, 1) # fastest changing in shape_dim_1, which is K for both A and B
         )
-        if major_mode != utils.LayoutEnum.ROW_MAJOR:
-            shape_dim_0 = cute.size(self.bM) // copy_elems
+        if major_mode != utils.LayoutEnum.ROW_MAJOR: # col-major
+            shape_dim_0 = cute.size(self.bM) // copy_elems # assume bM == bN
             thread_layout = cute.make_layout(
-                (shape_dim_0, self.num_threads // shape_dim_0), stride=(1, shape_dim_0)
+                (shape_dim_0, self.num_threads // shape_dim_0),
+                stride=(1, shape_dim_0) # fastest changing in shape_dim_0, which is M for col-major
             )
+        
         # Value layout for copy
         value_layout = (
-            cute.make_layout((1, copy_elems))
+            cute.make_layout((1, copy_elems)) # we use a vectorized copy along the mode1 (K) if row-major
             if major_mode == utils.LayoutEnum.ROW_MAJOR
-            else cute.make_layout((copy_elems, 1))
+            else cute.make_layout((copy_elems, 1)) # we use a vectorized copy along the mode0 (M/N) if col-major
         )
-        return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+        
+        # Make tiled copy using the copy atom and tv layout
+        tiled_copy_AB = cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+        
+        return tiled_copy_AB
 
     def _make_gmem_tiled_copy_C(self, atom_copy, dtype, major_mode, copy_bits):
         copy_elems = copy_bits // dtype.width
         shape_dim_1 = cute.size(self.bN) // copy_elems
-        # thread layout for copy
+        
+        # Thread layout for copy
         thread_layout = cute.make_layout(
-            (self.num_threads // shape_dim_1, shape_dim_1), stride=(shape_dim_1, 1)
+            (self.num_threads // shape_dim_1, shape_dim_1), 
+            stride=(shape_dim_1, 1) # fastest changing in shape_dim_1, which is N for row-major
         )
         if major_mode != utils.LayoutEnum.ROW_MAJOR:
             shape_dim_0 = cute.size(self.bM) // copy_elems
             thread_layout = cute.make_layout(
-                (shape_dim_0, self.num_threads // shape_dim_0), stride=(1, shape_dim_0)
+                (shape_dim_0, self.num_threads // shape_dim_0), 
+                stride=(1, shape_dim_0) # fastest changing in shape_dim_0, which is M for col-major
             )
+        
+        # Value layout for copy
         value_layout = (
-            cute.make_layout((1, copy_elems))
+            cute.make_layout((1, copy_elems)) # we use a vectorized copy along the mode1 (N) if row-major
             if major_mode == utils.LayoutEnum.ROW_MAJOR
-            else cute.make_layout((copy_elems, 1))
+            else cute.make_layout((copy_elems, 1)) # we use a vectorized copy along the mode0 (M) if col-major
         )
-        return cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+        
+        tiled_copy_C = cute.make_tiled_copy_tv(atom_copy, thread_layout, value_layout)
+        
+        return tiled_copy_C
 
     def raster_tile(self, i, j, f):
         new_i = i // f
