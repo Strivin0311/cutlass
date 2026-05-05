@@ -279,6 +279,7 @@ class TensorOpGemm:
         )
 
         if const_expr(self.debug_print):
+            print(f"{self.a_major_mode=}, {self.b_major_mode=}, {self.c_major_mode=}")
             print(f"sA_layout: {sA_layout}")
             print(f"sB_layout: {sB_layout}")
             print(f"sC_layout: {sC_layout}")
@@ -290,6 +291,7 @@ class TensorOpGemm:
             print(f"grid_dim: {grid_dim}")
             print(f"raster_factor: {raster_factor}")
             print(f"block=[{self.num_threads}, 1, 1]")
+            
 
         self.kernel(
             mA,
