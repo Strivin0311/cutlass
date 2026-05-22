@@ -132,6 +132,8 @@ class FlashAttentionForwardAmpere:
         :type num_threads: int
         :param is_causal: is causal
         """
+        
+        # (BLOCK_Q128, BLOCK_K128, BLOCK_HD128)
         self._head_dim = head_dim
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
@@ -140,6 +142,15 @@ class FlashAttentionForwardAmpere:
         self._num_threads = num_threads
         self._is_causal = is_causal
         self.debug_print = debug_print
+        
+        if self.debug_print:
+            print(
+                f"\nInitialized FlashAttentionForwardAmpere with configuration: "
+                f"{self._head_dim=}, {self._head_dim_padded=}, "
+                f"{self._m_block_size=}, {self._n_block_size=}, "
+                f"{self._num_threads=}, {self._is_causal=}"
+                f"\n"
+            )
 
     @staticmethod
     def can_implement(
@@ -237,19 +248,20 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         smem_k_block_size = 64 if self._head_dim_padded % 64 == 0 else 32
         swizzle_bits = 3 if smem_k_block_size == 64 else 2
-        sQ_layout_atom = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 3),
+        
+        sQ_layout_atom = cute.make_composed_layout( # S<3,3,3> o 0 o (8,64):(64,1)
+            cute.make_swizzle(swizzle_bits, 3, 3), # SW(B3, M3, S3), 2^(B+M) = 2^6 = smem_k_block_size = 64
             0,
-            cute.make_layout((8, smem_k_block_size), stride=(smem_k_block_size, 1)),
+            cute.make_layout((8, smem_k_block_size), stride=(smem_k_block_size, 1)), # smem atom: (8, 64):(64,1)
         )
-        sQ_layout = cute.tile_to_shape(
+        sQ_layout = cute.tile_to_shape( # S<3,3,3> o 0 o ((8,16),(64,2)):((64,512),(1,8192))
             sQ_layout_atom,
             (self._m_block_size, self._head_dim_padded),
             (0, 1),
         )
 
-        sKV_layout_atom = sQ_layout_atom
-        sKV_layout = cute.tile_to_shape(
+        sKV_layout_atom = sQ_layout_atom # S<3,3,3> o 0 o (8,64):(64,1)
+        sKV_layout = cute.tile_to_shape( # S<3,3,3> o 0 o ((8,16),(64,2)):((64,512),(1,8192))
             sKV_layout_atom,
             (self._n_block_size, self._head_dim_padded),
             (0, 1),
@@ -273,73 +285,151 @@ class FlashAttentionForwardAmpere:
         # GMEM Tiled copy:
         # ///////////////////////////////////////////////////////////////////////////////
         # Thread layouts for copies
-        universal_copy_bits = 128
-        async_copy_elems = universal_copy_bits // self._dtype.width
-        # atom_async_copy: async copy atom for QKV load
+        universal_copy_bits = 128 # 16B
+        async_copy_elems = universal_copy_bits // self._dtype.width # 8 elems for bf16
+        
+        # atom_async_copy: async copy atom for QKV load (G2S)
+        # Src: (1,8):(0,1) | Dst: (1,8):(0,1) | dtype: bf16
         atom_async_copy = cute.make_copy_atom(
+            # `cp.async.cg.shared.global [dst], [src], 16`, bypass L1 cache
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             self._dtype,
             num_bits_per_copy=universal_copy_bits,
         )
-        # atom_universal_copy: universal copy atom for O store
+        
+        # atom_universal_copy: universal copy atom for O store (R2G)
+        # Src: (1,8):(0,1) | Dst: (1,8):(0,1) | dtype: bf16
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self._dtype,
             num_bits_per_copy=universal_copy_bits,
         )
+        
         # tQKV_layout: thread layout for QKV load
-        tQKV_shape_dim_1 = sQ_layout_atom.outer.shape[1] // async_copy_elems
+        # (16,8):(8,1)
+        tQKV_shape_dim_1 = sQ_layout_atom.outer.shape[1] // async_copy_elems # 64 / 8 = 8 threads per k block
         tQKV_layout = cute.make_layout(
-            (self._num_threads // tQKV_shape_dim_1, tQKV_shape_dim_1),
+            (self._num_threads // tQKV_shape_dim_1, tQKV_shape_dim_1), # (128 / 8, 8) = (16, 8)
             stride=(tQKV_shape_dim_1, 1),
         )
+        
         # tO_layout: thread layout for O store
+        # (16,8):(8,1)
         tO_layout = tQKV_layout
 
         # Value layouts for copies
+        # (1,8):(0,1)
         vQKV_layout = cute.make_layout((1, async_copy_elems))
         vO_layout = vQKV_layout
+        
+        # TV Layout for QKV
+        # tiledMN_QKV: (16,64)
+        # tvQKV_layout: (8,16),8):((128,1),16)
+        tiledMN_QKV, tvQKV_layout = cute.make_layout_tv(
+            thr_layout=tQKV_layout,
+            val_layout=vQKV_layout,
+        )
 
         # gmem_tiled_copy_QKV: tiled copy for QKV load
+        # Tiler MN:        (16:1,64:1)
+        # TV Layout tiled: ((8,16),8):((128,1),16)
+        # Copy Atom
+        # ThrID:           1:0
+        # TV Layout Src:   (1,8):(0,1)
+        # TV Layout Dst:   (1,8):(0,1)
+        # Value type:      f16
         gmem_tiled_copy_QKV = cute.make_tiled_copy_tv(
-            atom_async_copy, tQKV_layout, vQKV_layout
+            atom=atom_async_copy,
+            thr_layout=tQKV_layout,
+            val_layout=vQKV_layout
         )
+        
         # gmem_tiled_copy_O: tiled copy for O store
+        # Tiler MN:        (16:1,64:1)
+        # TV Layout tiled: ((8,16),8):((128,1),16)
+        # Copy Atom
+        # ThrID:           1:0
+        # TV Layout Src:   (1,8):(0,1)
+        # TV Layout Dst:   (1,8):(0,1)
+        # Value type:      f16
         gmem_tiled_copy_O = cute.make_tiled_copy_tv(
-            atom_universal_copy, tO_layout, vO_layout
+            atom=atom_universal_copy, 
+            thr_layout=tO_layout, 
+            val_layout=vO_layout
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tiled mma
         # ///////////////////////////////////////////////////////////////////////////////
+        
+        # mma inst: `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+        op = warp.MmaF16BF16Op(
+            ab_dtype=self._dtype,
+            acc_dtype=cutlass.Float32,
+            shape_mnk=(16, 8, 16) # (mma_atomM16, mma_atomN8, mma_atomK16)
+        )
+        
+        # (4 warps, 1, 1) => (mmaM64, mmaN8, mmaK16)
+        atom_layout_mnk = (self._num_threads // 32, 1, 1)
+        # (mmaM64, mmaN8, mmaK16) => (mmaM'64, mmaN'16, mmaK'16)
+        permutation_mnk = (self._num_threads // 32 * 16, 16, 16)
+        
+        # Make tiled mma
+        # Thr Layout VMNK: (32,4,1,1):(1,32,0,0)
+        # Permutation MNK: (64:1,16:1,16:1)
+        # MMA Atom
+        # ThrID:           32:1
+        # Shape MNK:       (16,8,16)
+        # TV Layout A:     ((4,8),(2,2,2)):((32,1),(16,8,128))
+        # TV Layout B:     ((4,8),(2,2)):((16,1),(8,64))
+        # TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
         tiled_mma = cute.make_tiled_mma(
-            warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
-            (self._num_threads // 32, 1, 1),
-            permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
+            op_or_atom=op,
+            atom_layout_mnk=atom_layout_mnk,
+            permutation_mnk=permutation_mnk,
         )
 
-        # grid_dim: (m_block, batch_size, num_head)
+        # grid_dim: (num_m_blocks, batch_size, num_heads)
         grid_dim = (
-            cute.ceil_div(mQ.shape[1], self._m_block_size),
-            cute.size(mQ.shape[0]),
-            cute.size(mQ.shape[2]),
+            cute.ceil_div(mQ.shape[1], self._m_block_size), # num_m_blocks = 2k / 128 = 16
+            cute.size(mQ.shape[0]), # batch_size = 2
+            cute.size(mQ.shape[2]), # num_heads = 4
         )
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
 
         if cutlass.const_expr(self.debug_print):
             print()
-            print(f"dtype: {self._dtype}  is_causal: {self._is_causal}")
-            print(f"smem_k_block_size: {smem_k_block_size}  swizzle_bits: {swizzle_bits}")
+            print(f"dtype: {self._dtype}, is_causal: {self._is_causal}")
+            print(f"smem_k_block_size: {smem_k_block_size}, swizzle_bits: {swizzle_bits}")
+            print(f"{async_copy_elems=} | {tQKV_shape_dim_1=}")
+            print("atom_async_copy: ", atom_async_copy)
+            print("atom_universal_copy: ", atom_universal_copy)
+            print()
+            print(f"sQ_layout_atom: {sQ_layout_atom}")
+            print(f"sKV_layout_atom: {sKV_layout_atom}")
             print(f"sQ_layout:  {sQ_layout}")
             print(f"sKV_layout: {sKV_layout}")
+            print()
             print(f"tQKV_layout (thread): {tQKV_layout}")
             print(f"vQKV_layout (value):  {vQKV_layout}")
-            print(f"tiled_mma:  {tiled_mma}")
-            print(f"grid_dim (m_block, batch, head): {grid_dim}")
-            print(f"block_dim: [{self._num_threads}, 1, 1]")
-            print(f"softmax_scale_log2: {softmax_scale_log2}")
+            print(f"tiledMN_QKV layout: {tiledMN_QKV}")
+            print(f"tvQKV_layout (thread-value): {tvQKV_layout}")
             print()
+            print(f"tO_layout (thread): {tO_layout}")
+            print(f"vO_layout (value):  {vO_layout}")
+            print()
+            print("gmem_tiled_copy_QKV", gmem_tiled_copy_QKV)
+            print("gmem_tiled_copy_O", gmem_tiled_copy_O)
+            print()
+            print(f"tiled_mma:  {tiled_mma}")
+            print()
+            
+            cute.printf("")
+            cute.printf("mQ: {} | mK: {} | mV: {} | mO: {}", mQ.layout, mK.layout, mV.layout, mO.layout)
+            cute.printf("grid_dim (num_m_blocks, batch_size, num_heads): {} | softmax_scale_log2: {}", grid_dim, softmax_scale_log2)
+            cute.printf("")
+            
 
         self.kernel(
             mQ,
@@ -407,46 +497,47 @@ class FlashAttentionForwardAmpere:
         tidx, _, _ = cute.arch.thread_idx()
         m_block, batch_size, num_head = cute.arch.block_idx()
 
-        # is_print_thread: only thread 0 in block (0,0,0) prints to avoid log flood
-        is_print_thread = (tidx == 0) and (m_block == 0) and (batch_size == 0) and (num_head == 0)
+        # is_print_thread: only thread 0 in block (15,0,0) prints to avoid log flood
+        is_print_thread = (tidx == 0) and (m_block == 15) and (batch_size == 0) and (num_head == 0)
 
-        n_block_max = cute.ceil_div(mK.shape[1], self._n_block_size)
+        n_block_max_ = cute.ceil_div(mK.shape[1], self._n_block_size) # 4k / 128 = 32
+        n_block_max = n_block_max_
         if self._is_causal:
-            n_block_max = min(
+            n_block_max = min( # min(16, 32) = 16
                 cute.ceil_div(
                     (m_block + 1) * self._m_block_size,
                     self._n_block_size,
                 ),
-                n_block_max,
+                n_block_max_,
             )
         n_block = n_block_max - 1
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
-                cute.printf("[kernel] n_block_max = %d\\n", n_block_max)
+                cute.printf("[kernel] n_block_max_ = {}, n_block_max = {}", n_block_max_, n_block_max)
                 cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
         # ///////////////////////////////////////////////////////////////////////////////
-        # (m_block_size, head_dim)
+        # (blockM128, HD128)
         gQ = cute.local_tile(
-            mQ[batch_size, None, num_head, None],
-            (self._m_block_size, self._head_dim_padded),
-            (m_block, 0),
+            input=mQ[batch_size, None, num_head, None],
+            tiler=(self._m_block_size, self._head_dim_padded),
+            coord=(m_block, 0),
         )
-        # (n_block_size, head_dim, n_block)
+        # (blockN128, HD128, nBlocksN32)
         gK = cute.local_tile(
-            mK[batch_size, None, num_head, None],
-            (self._n_block_size, self._head_dim_padded),
-            (None, 0),
+            input=mK[batch_size, None, num_head, None],
+            tiler=(self._n_block_size, self._head_dim_padded),
+            coord=(None, 0),
         )
-        # (n_block_size, head_dim, n_block)
+        # (blockN128, HD128, nBlocksN32)
         gV = cute.local_tile(
-            mV[batch_size, None, num_head, None],
-            (self._n_block_size, self._head_dim_padded),
-            (None, 0),
+            input=mV[batch_size, None, num_head, None],
+            tiler=(self._n_block_size, self._head_dim_padded),
+            coord=(None, 0),
         )
 
         if cutlass.const_expr(self.debug_print):
@@ -467,22 +558,49 @@ class FlashAttentionForwardAmpere:
         sK = storage.sK.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sKV_layout)
 
-        # Transpose view of V to tensor with layout (head_dim, n_block_size) for tiled mma
-        sVt = cute.composition(
-            sV,
-            cute.make_layout(
-                (self._head_dim_padded, self._n_block_size),
-                stride=(self._n_block_size, 1),
-            ),
+        # Transpose view of V to Vt for tiled mma
+        # sV: S<3,3,3> o 0 o ((8,16),(64,2)):((64,512),(1,8192))
+        # trans_kn: (blockHD128, blockN128):(128,1)
+        # so that sVt: S<3,3,3> o 0 o ((64,2),(8,16)):((1,8192),(64,512))
+        # but note that (8,16):(64,512) can be compated to: (128,64)
+        # so the final sVt: S<3,3,3> o 0 o ((64,2),128):((1,8192),64)
+        # NOTE: How to quickly verify that composition(sV, trans_kn) is a transpose:
+        #   (1) trans_kn shape is the element-wise swap of sV's logical shape:
+        #         sV logical shape  = (n_block_size=128, head_dim=128)
+        #         trans_kn shape    = (head_dim=128,     n_block_size=128)  <-- swapped
+        #   (2) trans_kn stride = (sV.shape[0], 1) = (n_block_size=128, 1)
+        #         i.e. the outer stride equals the "row count" of the original layout
+        #   Together these two conditions guarantee:
+        #         trans_kn(d, k) = d * n_block_size + k
+        #     which sV decodes as:
+        #         mode-0 coord = (d * n_block_size + k) % n_block_size = k
+        #         mode-1 coord = (d * n_block_size + k) // n_block_size = d
+        #     so  sVt(d, k) = sV(k, d)  -- a true transpose.
+        trans_kn = cute.make_layout(
+            (self._head_dim_padded, self._n_block_size),
+            stride=(self._n_block_size, 1),
         )
+        sVt = cute.composition(sV, trans_kn)
 
+        # Slice to thread view of tiled copy for QKV load (G2S)
+        # Tiler MN:        (16:1,64:1)
+        # TV Layout tiled: ((8,16),8):((128,1),16)
+        # Copy Atom
+        # ThrID:           1:0
+        # TV Layout Src:   (1,8):(0,1)
+        # TV Layout Dst:   (1,8):(0,1)
+        # Value type:      f16
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
-        # (CPY_Atom, CPY_M, CPY_K)
+        
+        # (CPY_Atom=(8,1), CPY_M, CPY_K)
+        # (,8,2):((1,0),8192,64)
         tQgQ = gmem_thr_copy_QKV.partition_S(gQ)
         tQsQ = gmem_thr_copy_QKV.partition_D(sQ)
+        
         # (CPY_Atom, CPY_N, CPY_K, n_block)
         tKgK = gmem_thr_copy_QKV.partition_S(gK)
         tKsK = gmem_thr_copy_QKV.partition_D(sK)
+        
         # (CPY_Atom, CPY_N, CPY_K, n_block)
         tVgV = gmem_thr_copy_QKV.partition_S(gV)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
