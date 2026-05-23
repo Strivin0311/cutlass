@@ -521,19 +521,19 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
         # ///////////////////////////////////////////////////////////////////////////////
-        # (blockM128, HD128)
+        # (blockM128, HD128):(512,1)
         gQ = cute.local_tile(
             input=mQ[batch_size, None, num_head, None],
             tiler=(self._m_block_size, self._head_dim_padded),
             coord=(m_block, 0),
         )
-        # (blockN128, HD128, nBlocksN32)
+        # (blockN128, HD128, nBlocksN32):(512,1,65536)
         gK = cute.local_tile(
             input=mK[batch_size, None, num_head, None],
             tiler=(self._n_block_size, self._head_dim_padded),
             coord=(None, 0),
         )
-        # (blockN128, HD128, nBlocksN32)
+        # (blockN128, HD128, nBlocksN32):(512,1,65536)
         gV = cute.local_tile(
             input=mV[batch_size, None, num_head, None],
             tiler=(self._n_block_size, self._head_dim_padded),
@@ -592,48 +592,107 @@ class FlashAttentionForwardAmpere:
         # Value type:      f16
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
         
-        # (CPY_Atom=(8,1), CPY_M, CPY_K)
-        # (,8,2):((1,0),8192,64)
+        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),8192,64)
+        # since copy_atom is (atomM16, atomK64=8x8), 
+        # so CPY_M = blockM128 / atomM16 = 8, CPY_K = blockHD128 / atomK64 = 2
         tQgQ = gmem_thr_copy_QKV.partition_S(gQ)
+        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),1024,8192)
         tQsQ = gmem_thr_copy_QKV.partition_D(sQ)
         
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
+        # (CPY_Atom=(8,1), CPY_N=8, CPY_K=2, n_block=32):((1,0),8192,64,65536)
+        # since copy_atom is (atomN16, atomK64=8x8), 
+        # so CPY_N = blockN128 / atomN16 = 8, CPY_K = blockHD128 / atomK64 = 2
         tKgK = gmem_thr_copy_QKV.partition_S(gK)
+        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),1024,8192)
         tKsK = gmem_thr_copy_QKV.partition_D(sK)
         
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
+        # (CPY_Atom=(8,1), CPY_N=8, CPY_K=2, n_block=32):((1,0),8192,64,65536)
         tVgV = gmem_thr_copy_QKV.partition_S(gV)
+        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),1024,8192)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
-                cute.printf("[kernel] tQgQ (gmem copy src Q): {}", tQgQ)
-                cute.printf("[kernel] tKgK (gmem copy src K): {}", tKgK)
                 cute.printf("[kernel] sQ.layout: {}", sQ.layout)
                 cute.printf("[kernel] sK.layout: {}", sK.layout)
                 cute.printf("[kernel] sVt.layout (transposed V): {}", sVt.layout)
+                cute.printf("")
+                cute.printf("[kernel] tQgQ (gmem copy src Q): {}", tQgQ)
+                cute.printf("[kernel] tKgK (gmem copy src K): {}", tKgK)
+                cute.printf("[kernel] tVgV (gmem copy src V): {}", tVgV)
+                cute.printf("")
+                cute.printf("[kernel] tQsQ (gmem copy dst Q): {}", tQsQ)
+                cute.printf("[kernel] tKsK (gmem copy dst K): {}", tKsK)
+                cute.printf("[kernel] tVsV (gmem copy dst V): {}", tVsV)
                 cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
         # ///////////////////////////////////////////////////////////////////////////////
+        # Slice to thread view of tiled mma
         thr_mma = tiled_mma.get_slice(tidx)
-        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
-        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
-        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+        
+        # (MMA_A=(2,2,2), restM=2, restK=((2,2),2)):((1,512,8),4096,((16,32),8192))
+        # MMA_A=(2,2,2)=8  : per-thread vals from atom TV Layout A; 8 regs per atom invocation
+        # restM=2          : blockM128 / tile_M64 = 2  [tile_M = 4warps * atom_M16 = 64]
+        # restK=((2,2),2)=8: blockHD128 / atom_K16 = 8; inner (2,2) reflects swizzle-atom width of 64 cols
+        # strides are smem offsets into sQ's swizzled layout (not compact)
+        sQ_parA = thr_mma.partition_A(sQ)
+        
+        # (MMA_B=(2,2), restN=16, restK=((2,2),2)):((1,8),512,((16,32),8192))
+        # MMA_B=(2,2)=4    : per-thread vals from atom TV Layout B
+        # restN=16         : blockN128 / atom_N8 = 16  [atom_layout_mnk doesn't tile N]
+        # restK=((2,2),2)=8: blockHD128 / atom_K16 = 8; same inner grouping as sQ_parA
+        sK_parB = thr_mma.partition_B(sK)
+        
+        # S<3,3,3> o 0 o (MMA_B=(2,2), restN=(8,2), restK=8):((64,512),(8,8192),1024)
+        # MMA_B=(2,2)=4    : same as sK_parB
+        # restN=(8,2)=16   : blockN128 / atom_N8 = 16, but split (8,2) not flat 16 because
+        #   sVt's N-stride=64 (from composition) causes CuTe to group 8 tiles within one
+        #   stride-64 block and then 2 such blocks, instead of a flat 16
+        # restK=8          : blockHD128 / atom_K16 = 8  (flat, sVt K-stride is uniform 1024)
+        # returns ComposedLayout because sVt carries the swizzle
+        sVt_parB = thr_mma.partition_B(sVt)
+        
+        # (MMA_A=(2,2,2), restM=2, restK=((2,2),2)):((1,2,4),8,((32,64),16))
+        # same shape as sQ_parA; strides are compact register offsets (not smem offsets)
+        # total regs: 8 * 2 * 8 = 128 bf16 values per thread
+        tSrQ = thr_mma.make_fragment_A(sQ_parA)
+        
+        # (MMA_B=(2,2), restN=16, restK=((2,2),2)):((1,2),4,((128,256),64))
+        # same shape as sK_parB; compact register strides
+        # total regs: 4 * 16 * 8 = 512 bf16 values per thread
+        tSrK = thr_mma.make_fragment_B(sK_parB)
+        
+        # (MMA_B=(2,2), restN=(8,2), restK=8):((1,2),(4,256),32)
+        # same shape as sVt_parB; compact register strides
+        # total regs: 4 * 16 * 8 = 512 bf16 values per thread
+        tOrVt = thr_mma.make_fragment_B(sVt_parB)
+        
+        # (MMA_C=(2,2), restM=2, restN=16):((1,2),4,8)
+        # MMA_C=(2,2)=4: per-thread vals from atom TV Layout C
+        # restM=2      : blockM128 / tile_M64 = 2
+        # restN=16     : blockHD128 / atom_N8 = 16  (2nd GEMM N = head_dim)
+        # total regs: 4 * 2 * 16 = 128 f32 values per thread
         acc_shape_O = thr_mma.partition_shape_C(
             (self._m_block_size, self._head_dim_padded)
         )
-        acc_O = cute.make_fragment(acc_shape_O, cutlass.Float32)
+        # acc_O = cute.make_fragment(acc_shape_O, cutlass.Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, cutlass.Float32)
         acc_O.fill(0.0)
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
+                cute.printf("[kernel] sQ_parA: {}", sQ_parA.layout)
+                cute.printf("[kernel] sK_parB: {}", sK_parB.layout)
+                cute.printf("[kernel] sVt_parB: {}", sVt_parB.layout)
+                cute.printf("")
                 cute.printf("[kernel] tSrQ (MMA frag A): {}", tSrQ)
                 cute.printf("[kernel] tSrK (MMA frag B): {}", tSrK)
                 cute.printf("[kernel] tOrVt (MMA frag B Vt): {}", tOrVt)
+                cute.printf("")
                 cute.printf("[kernel] acc_O shape: {}", acc_O)
                 cute.printf("")
 
@@ -690,7 +749,8 @@ class FlashAttentionForwardAmpere:
         tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
         # Allocate predicate tensors for m and n, here we only allocate the tile of k, and do special process for mn.
         # This is to reduce register pressure and gets 2-3% performance gain compared with allocating the whole tile.
-        tQpQ = cute.make_fragment(
+        # tQpQ = cute.make_fragment(
+        tQpQ = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tQsQ.shape[0][1],
@@ -701,7 +761,8 @@ class FlashAttentionForwardAmpere:
             ),
             cutlass.Boolean,
         )
-        tKVpKV = cute.make_fragment(
+        # tKVpKV = cute.make_fragment(
+        tKVpKV = cute.make_rmem_tensor(
             cute.make_layout(
                 (
                     tKsK.shape[0][1],
@@ -755,11 +816,13 @@ class FlashAttentionForwardAmpere:
         # Softmax intermediate result: row_max and row_sum
         # ///////////////////////////////////////////////////////////////////////////////
         # shape: (atom_v_m * rest_m)
-        row_max = cute.make_fragment(
+        # row_max = cute.make_fragment(
+        row_max = cute.make_rmem_tensor(
             (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
         )
         # shape: (atom_v_m * rest_m)
-        row_sum = cute.make_fragment(
+        # row_sum = cute.make_fragment(
+        row_sum = cute.make_rmem_tensor(
             (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
         )
         row_max.fill(-cutlass.Float32.inf)
@@ -908,7 +971,8 @@ class FlashAttentionForwardAmpere:
             (m_block, 0),
         )
         tOcO = gmem_thr_copy_O.partition_D(cO)
-        tOpO = cute.make_fragment(
+        # tOpO = cute.make_fragment(
+        tOpO = cute.make_rmem_tensor(
             cute.make_layout(
                 (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
                 stride=(tOgO.shape[2], 0, 1),
@@ -962,7 +1026,8 @@ class FlashAttentionForwardAmpere:
         acc_shape_S = mma_params.thr_mma.partition_shape_C(
             (self._m_block_size, self._n_block_size)
         )
-        acc_S = cute.make_fragment(acc_shape_S, cutlass.Float32)
+        # acc_S = cute.make_fragment(acc_shape_S, cutlass.Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
         acc_S.fill(0.0)
 
         # wait for smem tile QK before mma calculation for S
