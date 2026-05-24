@@ -697,34 +697,107 @@ class FlashAttentionForwardAmpere:
                 cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
-        # Smem copy atom tiling
+        # Smem copy atom per warp (S2R)
         # ///////////////////////////////////////////////////////////////////////////////
+        
+        # src_tv=(T=32, V=8):(8,1)  dst_tv=(T=32, V=(2,4)):(2,(1,64))
+        # src: T threads each give 1 smem row ptr (8 half-words), layout is contiguous rows
+        # dst: each thread receives 8 regs: (2 row-pairs) × (4 sub-matrices stride-64)
         smem_copy_atom_Q = cute.make_copy_atom(
+            # ldmatrix.sync.aligned.m8n8.x4 => m32n8 per warp (row major)
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             self._dtype,
         )
+        
+        # src_tv=(T=32, V=8):(8,1)  dst_tv=(T=32, V=(2,4)):(2,(1,64))
+        # identical to smem_copy_atom_Q (same inst, K operand also row-major in smem)
         smem_copy_atom_K = cute.make_copy_atom(
+            # ldmatrix.sync.aligned.m8n8.x4 => m32n8 per warp (row major)
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             self._dtype,
         )
+        
+        # src_tv=(T=32, V=8):(8,1)  dst_tv=(T=(4,8), V=(1,2,4)):((16,1),(1,8,64))
+        # dst T is 2D: (4 sub-mat cols) × (8 rows within sub-mat), stride (16,1)
+        # dst V stride (1,8,64): within col / across sub-mat-rows / across sub-mats
+        # .trans reads 8×8 block in col-major order, giving Vt's K×N layout in regs
         smem_copy_atom_V = cute.make_copy_atom(
+            # ldmatrix.sync.aligned.m8n8.x4.trans => m8n32 per warp (col major)
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             self._dtype,
         )
-        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
-        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_K, tiled_mma)
-        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
+        
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Smem tiled copy atom all 4 warps (S2R)
+        # ///////////////////////////////////////////////////////////////////////////////
+        
+        # src_tv_tiled=(T=(thr_warp16,warpM2,warps4), V=(8,1)):((1,512,16),(64,0))
+        # T=(16,2,4): 16 threads/warp in M-row × 2 M-halves/warp × 4 warps
+        # V=(8,1):(64,0): 8 smem rows per ldmatrix call, stride=64 (swizzle period)
+        # dst_tv_tiled=(T=(4,8,4), V=((2,2,2),1)):((128,1,16),((64,8,512),0))
+        # T strides (128,1,16): warp stride / warp-row stride / M-half stride
+        # V=(2,2,2): MMA_A val decomposition; stride-0 for restM (broadcast)
+        smem_tiled_copy_Q = cute.make_tiled_copy_A(atom=smem_copy_atom_Q, tiled_mma=tiled_mma)
+        
+        # src_tv_tiled=(T=(thr_warp8,warpN2,warpN2,warps4), V=(8,1)):((1,128,8,0),(16,0))
+        # T=(8,2,2,4): 8 threads/warp in N-row × 2 N-halves × 2 K-halves × 4 warps
+        # note: 4 warps don't tile N, so warp stride=0 (all warps share same N region)
+        # dst_tv_tiled=(T=(4,8,4), V=((2,2,2),1)):((32,1,0),((16,128,8),0))
+        smem_tiled_copy_K = cute.make_tiled_copy_B(atom=smem_copy_atom_K, tiled_mma=tiled_mma)
+        
+        # src_tv_tiled=(T=(thr_warp16,warpK2,warps4), V=(8,1)):((16,8,0),(1,0))
+        # T strides (16,8,0): sVt row stride=16 (K dim) / K-half stride=8 / warp stride=0
+        # note: .trans atom, so src stride pattern reflects K×N col-major traversal in sVt
+        # dst_tv_tiled=(T=(4,8,4), V=((2,2,2),1)):((32,1,0),((16,128,8),0))
+        smem_tiled_copy_V = cute.make_tiled_copy_B(atom=smem_copy_atom_V, tiled_mma=tiled_mma)
 
         smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
         smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
         smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
 
+        # (LDM_src=(8,1), restM=2, restK=((2,2),2)):((1,0),4096,((16,32),8192))
+        # LDM_src=(8,1):(1,0) — 8 smem ptrs per ldmatrix, stride-1 contiguous; inner 1 is broadcast
+        # restM=2:4096        — skip 64 rows in sQ outer = 8×512 = 4096
+        # restK=((2,2),2):((16,32),8192) — 8 K-tiles split by swizzle-atom boundary
         tSsQ = smem_thr_copy_Q.partition_S(sQ)
+        # (LDM_dst=(8,1), restM=2, restK=(4,2)):((1,0),8,(32,16))
+        # same shape as tSsQ; strides are compact register offsets after retile
         tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+        
+        # (LDM_src=(8,1), restN=8, restK=((2,2),2)):((1,0),1024,((16,32),8192))
+        # restN=8:1024 — 8 N-tiles of atom_N16, stride per tile = 16×64 = 1024
         tSsK = smem_thr_copy_K.partition_S(sK)
+        # (LDM_dst=(8,1), restN=8, restK=(4,2)):((1,0),8,(128,64))
         tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
+        
+        # (LDM_src=(8,1), restK=((2,2),2), restN=8):((1,0),((16,32),8192),1024)
+        # note mode order flipped vs tSsK: sVt is (HD=K, n_block=N), so K comes before N
+        # restK=((2,2),2):((16,32),8192) — same K grouping as Q/K
+        # restN=8:1024 — 8 N-tiles, stride 1024 in sVt's N dimension
         tOsVt = smem_thr_copy_V.partition_S(sVt)
+        # (LDM_dst=(8,1), restK=(4,2), restN=8):((1,0),(8,256),32)
+        # restK=(4,2):(8,256) — compact register K strides after retile
         tOrVt_copy_view = smem_thr_copy_V.retile(tOrVt)
+        
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] smem_copy_atom_Q: layout_src_tv: {} | layout_dst_tv: {}", smem_copy_atom_Q.layout_src_tv, smem_copy_atom_Q.layout_dst_tv)
+                cute.printf("[kernel] smem_copy_atom_K: layout_src_tv: {} | layout_dst_tv: {}", smem_copy_atom_K.layout_src_tv, smem_copy_atom_K.layout_dst_tv)
+                cute.printf("[kernel] smem_copy_atom_V: layout_src_tv: {} | layout_dst_tv: {}", smem_copy_atom_V.layout_src_tv, smem_copy_atom_V.layout_dst_tv)
+                cute.printf("")
+                cute.printf("")
+                cute.printf("[kernel] smem_tiled_copy_Q: layout_src_tv_tiled: {} | layout_dst_tv_tiled: {}", smem_tiled_copy_Q.layout_src_tv_tiled, smem_tiled_copy_Q.layout_dst_tv_tiled)
+                cute.printf("[kernel] smem_tiled_copy_K: layout_src_tv_tiled: {} | layout_dst_tv_tiled: {}", smem_tiled_copy_K.layout_src_tv_tiled, smem_tiled_copy_K.layout_dst_tv_tiled)
+                cute.printf("[kernel] smem_tiled_copy_V: layout_src_tv_tiled: {} | layout_dst_tv_tiled: {}", smem_tiled_copy_V.layout_src_tv_tiled, smem_tiled_copy_V.layout_dst_tv_tiled)
+                cute.printf("")
+                cute.printf("[kernel] tSsQ (smem copy src Q): {}", tSsQ)
+                cute.printf("[kernel] tSrQ_copy_view (smem copy dst Q retiled to MMA frag): {}", tSrQ_copy_view)
+                cute.printf("[kernel] tSsK (smem copy src K): {}", tSsK)
+                cute.printf("[kernel] tSrK_copy_view (smem copy dst K retiled to MMA frag): {}", tSrK_copy_view)
+                cute.printf("[kernel] tOsVt (smem copy src Vt): {}", tOsVt)
+                cute.printf("[kernel] tOrVt_copy_view (smem copy dst Vt retiled to MMA frag): {}", tOrVt_copy_view)
+                cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
