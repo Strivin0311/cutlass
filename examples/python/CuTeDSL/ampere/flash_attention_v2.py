@@ -330,7 +330,7 @@ class FlashAttentionForwardAmpere:
             val_layout=vQKV_layout,
         )
 
-        # gmem_tiled_copy_QKV: tiled copy for QKV load
+        # gmem_tiled_copy_QKV: tiled copy for QKV load (G2S)
         # Tiler MN:        (16:1,64:1)
         # TV Layout tiled: ((8,16),8):((128,1),16)
         # Copy Atom
@@ -344,7 +344,7 @@ class FlashAttentionForwardAmpere:
             val_layout=vQKV_layout
         )
         
-        # gmem_tiled_copy_O: tiled copy for O store
+        # gmem_tiled_copy_O: tiled copy for O store (R2G)
         # Tiler MN:        (16:1,64:1)
         # TV Layout tiled: ((8,16),8):((128,1),16)
         # Copy Atom
@@ -539,6 +539,12 @@ class FlashAttentionForwardAmpere:
             tiler=(self._n_block_size, self._head_dim_padded),
             coord=(None, 0),
         )
+        # (blockM128, HD128):(512,1)
+        gO = cute.local_tile(
+            mO[batch_size, None, num_head, None],
+            (self._m_block_size, self._head_dim_padded),
+            (m_block, 0),
+        )
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
@@ -546,6 +552,7 @@ class FlashAttentionForwardAmpere:
                 cute.printf("[kernel] gQ shape: {}", gQ)
                 cute.printf("[kernel] gK shape (n_block dim): {}", gK)
                 cute.printf("[kernel] gV shape (n_block dim): {}", gV)
+                cute.printf("[kernel] gO shape: {}", gO)
                 cute.printf("")
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -590,6 +597,14 @@ class FlashAttentionForwardAmpere:
         # TV Layout Src:   (1,8):(0,1)
         # TV Layout Dst:   (1,8):(0,1)
         # Value type:      f16
+        #
+        # NOTE: partition_S/partition_D vs retile rule:
+        #   partition_S(tensor) — tensor has a real memory address (gmem/smem) → maps TV layout
+        #                         to actual addresses and cuts out this thread's source slice
+        #   partition_D(tensor) — same, but cuts out this thread's destination slice
+        #   retile(fragment)    — fragment lives in registers (no address) → only reshapes the
+        #                         existing layout to match the copy atom's value grouping
+        # Here both src (gmem) and dst (smem) have real addresses, so both use partition.
         gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_slice(tidx)
         
         # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),8192,64)
@@ -754,6 +769,9 @@ class FlashAttentionForwardAmpere:
         smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
         smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
         smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
+
+        # NOTE: partition_S/partition_D vs retile rule (same as gmem_thr_copy_QKV above):
+        #   src is smem (has address) → partition_S;  dst is rmem (no address) → retile
 
         # (LDM_src=(8,1), restM=2, restK=((2,2),2)):((1,0),4096,((16,32),8192))
         # LDM_src=(8,1):(1,0) — 8 smem ptrs per ldmatrix, stride-1 contiguous; inner 1 is broadcast
@@ -934,6 +952,8 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         # Softmax intermediate result: row_max and row_sum
         # ///////////////////////////////////////////////////////////////////////////////
+        
+        # Init row_max and row_sum
         # row_max = cute.make_fragment(
         row_max = cute.make_rmem_tensor( # shape: (atom_v_m * rest_m)
             (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
@@ -945,7 +965,7 @@ class FlashAttentionForwardAmpere:
         row_max.fill(-cutlass.Float32.inf) # -inf init for max
         row_sum.fill(0.0) # zero init for sum
 
-        # group parameters for compute_one_n_block
+        # Group parameters for compute_one_n_block
         basic_params = SimpleNamespace(
             m_block=m_block,
             n_block=n_block,
@@ -1040,47 +1060,135 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         # Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
-        # normalize acc_O by row_sum and calculate the lse
+        
+        # NOTE: Why R2S → S2R → R2G instead of writing acc_O directly to gmem?
+        #
+        # MMA C fragment layout (MMA_C=(2,2), restM=2, restN=16):((1,2),4,8) 
+        # is determined by the hardware mma.sync semantics: 
+        #   each thread holds 4 values scattered across 
+        #   non-adjacent (row, col) positions in the logical output matrix. 
+        # 
+        # These values map to non-contiguous gmem addresses, 
+        # so a direct R2G store can only issue scalar (32-bit) writes — no vectorization is possible.
+        #
+        # The smem roundtrip solves this in two steps:
+        #   Step 1  R2S  rO → sO  (st.shared, scalar/universal, per MMA_C element)
+        #           smem acts as a format-conversion buffer: the scatter layout of MMA
+        #           C regs is written into smem in row-major order, so smem now holds
+        #           a contiguous (blockM × blockHD) tile.
+        #
+        #   Step 2  S2R  sO → tOrO  (ld.shared 128-bit / cp.async style)
+        #           Re-read smem with the gmem_tiled_copy_O TV layout, which tiles
+        #           threads across M×HD with 8 bf16 (128 bits) per thread.
+        #           Now each thread has 8 consecutive bf16 values ready in registers.
+        #
+        #   Step 3  R2G  tOrO → tOgO  (st.global 128-bit)
+        #           One 16-byte store per thread per tile — full memory bandwidth.
+        
+        # Normalize acc_O by row_sum and calculate the lse
+        # acc_O: (MMA_C=(2,2), restM=2, restN=16):((1,2),4,8)
         self.normalize_softmax(acc_O, row_sum)
-        # store acc_O
+        
+        # Type cast acc_O to rO
+        # rO: ((2,2),2,16):((1,2),4,8)
         rO = cute.make_fragment_like(acc_O, self._dtype)
         rO.store(acc_O.load().to(self._dtype))
-        # reuse sQ's data iterator
+        
+        # Reuse sQ's data iterator to form sO
+        # sO: S<3,3,3> o 0 o ((8,16),(64,2)):((64,512),(1,8192))
         sO = cute.make_tensor(sQ.iterator, sO_layout)
+        
+        # ///////////////////////////////////////////////////////////////////////////////
+        # R2S copy from acc_O (in rmem) to sO (in smem)
+        # ///////////////////////////////////////////////////////////////////////////////
 
-        # smem copy atom for O
-        smem_copy_atom_O = cute.make_copy_atom(
+        # Smem copy atom for O (R2S)
+        # layout_src_tv: (1,1):(0,0) | layout_dst_tv: (1,1):(0,0)
+        smem_copy_atom_O = cute.make_copy_atom( # st.shared
             cute.nvgpu.CopyUniversalOp(), self._dtype
         )
-        # tiled copy atom for O
+        
+        # Tiled copy atom for O (R2S)
+        # layout_src_tv_tiled: ((4,8,4),(1,(2,2,2))):((128,1,16),(0,(64,8,512)))
+        # layout_dst_tv_tiled: ((4,8,4),(1,(2,2,2))):((128,1,16),(0,(64,8,512)))
         smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
+        
+        # NOTE: partition_S/partition_D vs retile rule (same as smem_thr_copy_Q/K/V above,
+        #       but direction reversed — this is R2S not S2R):
+        #   src is rmem (no address) → retile;  dst is smem (has address) → partition_D
+        
+        # Partition for R2S tiled copy
+        # taccOsO: (CPY_Atom=(1,(2,2,2)), restM=2, restN=((2,2),2)):((0,(1,512,8)),4096,((16,32),8192))
+        # 
+        # CPY_Atom=(1,(2,2,2))=8: outer 1=trivial (universal copy writes 1 elem at a time);
+        #   inner (2,2,2) decomposes 8 MMA_C vals in smem; strides (1,512,8) are smem offsets
+        # restM=2:4096           : 2 M-tiles; stride 4096 = 64 rows × 64 smem cols
+        # restN=((2,2),2):((16,32),8192) : 8 N-tiles split by swizzle boundary (same as sQ_parA restK)
+        #
+        # taccOrO: (CPY_Atom=(1,(4,2)), restM=2, restN=8):((0,(1,8)),4,16)
+        # 
+        # CPY_Atom=(1,(4,2))=8: outer 1=trivial; (4,2) merges MMA_C=4 vals × restN_inner=2;
+        #   strides (1,8): MMA_C vals consecutive (step 1), restN_inner step=8 (from rO.restN stride)
+        # restM=2:4    : 2 M-tiles; stride 4 (compact, same as rO.restM stride)
+        # restN=8:16   : 8 remaining N-tiles; stride 16 = restN_inner=2 × rO.restN stride=8
         smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
-        # copy acc O from rmem to smem with the smem copy atom
+        taccOrO = smem_thr_copy_O.retile(rO)
+        
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] acc_O (before copy to smem): {}", acc_O)
+                cute.printf("[kernel] rO (type casted from acc_O): {}", rO.layout)
+                cute.printf("[kernel] sO (shared with sQ): {}", sO.layout)
+                cute.printf("")
+                cute.printf("[kernel] smem_copy_atom_O: layout_src_tv: {} | layout_dst_tv: {}", smem_copy_atom_O.layout_src_tv, smem_copy_atom_O.layout_dst_tv)
+                cute.printf("[kernel] smem_tiled_copy_O: layout_src_tv_tiled: {} | layout_dst_tv_tiled: {}", smem_tiled_copy_O.layout_src_tv_tiled, smem_tiled_copy_O.layout_dst_tv_tiled)
+                cute.printf("")
+                cute.printf("[kernel] taccOrO (tiled copy src O retiled to MMA frag): {}", taccOrO)
+                cute.printf("[kernel] taccOsO (tiled copy dst O): {}", taccOsO)
+                cute.printf("")
+        
+        # Copy acc O with the smem copy atom (R2S)
         cute.copy(
             smem_copy_atom_O,
             taccOrO,
             taccOsO,
         )
-        gO = cute.local_tile(
-            mO[batch_size, None, num_head, None],
-            (self._m_block_size, self._head_dim_padded),
-            (m_block, 0),
-        )
-
+        
+        # ///////////////////////////////////////////////////////////////////////////////
+        # S2R copy from sO (in smem) to tOrO (in rmem)
+        # ///////////////////////////////////////////////////////////////////////////////
+        
+        # NOTE: partition_S/partition_D vs retile rule:
+        #   src is smem (has address) → partition_S;  dst is gmem (has address) → partition_D
+        #   tOrO is an intermediate register buffer created via make_fragment_like (already
+        #   shaped to match tOgO), so no retile needed — it's used first as S2R dst, then R2G src
+        
+        # tOsO: ((8,1),8,2):((1,0),1024,8192)
+        # tOgO: ((8,1),8,2):((1,0),8192,64)
+        # tOrO: ((8,1),8,2):((1,0),16,8)
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_copy_O.partition_S(sO)
         tOgO = gmem_thr_copy_O.partition_D(gO)
         tOrO = cute.make_fragment_like(tOgO, self._dtype)
-        # sync before all smem stores are done.
-        cute.arch.barrier()
-        # load acc O from smem to rmem for wider vectorization
+        
+        # Sync before all smem stores are done.
+        cute.arch.barrier() # same as cute.arch.sync_threads()
+        
+        # Load acc O from smem to rmem for wider vectorization (S2R)
         cute.copy(
             gmem_tiled_copy_O,
             tOsO,
             tOrO,
         )
+        
+        # ///////////////////////////////////////////////////////////////////////////////
+        # R2G copy from tOrO (in rmem) to tOgO (in gmem)
+        # ///////////////////////////////////////////////////////////////////////////////
+        
+        # Make predicate for O tile copy
+        # tOcO: (0,1920,0,0) o ((8,1),8,2):((1@3,0),16@1,64@3)
         mcO = cute.make_identity_tensor(mO.layout.shape)
         cO = cute.local_tile(
             mcO[batch_size, None, num_head, None],
@@ -1088,11 +1196,12 @@ class FlashAttentionForwardAmpere:
             (m_block, 0),
         )
         tOcO = gmem_thr_copy_O.partition_D(cO)
+        
         # tOpO = cute.make_fragment(
         tOpO = cute.make_rmem_tensor(
             cute.make_layout(
-                (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
-                stride=(tOgO.shape[2], 0, 1),
+                (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]), # (rest_v, rest_m, rest_n)
+                stride=(tOgO.shape[2], 0, 1), # (rest_n, 0, 1), broadcast rest_m
             ),
             cutlass.Boolean,
         )
@@ -1101,7 +1210,8 @@ class FlashAttentionForwardAmpere:
                 tOpO[rest_v, 0, rest_n] = cute.elem_less(
                     tOcO[(0, rest_v), 0, rest_n][3], mO.layout.shape[3]
                 )
-        # copy acc O from rmem to gmem
+        
+        # Copy acc O from rmem to gmem (R2G)
         for rest_m in cutlass.range_constexpr(cute.size(tOpO.shape[1])):
             if cute.elem_less(tOcO[0, rest_m, 0][1], mO.layout.shape[1]):
                 cute.copy(
@@ -1110,6 +1220,15 @@ class FlashAttentionForwardAmpere:
                     tOgO[None, rest_m, None],
                     pred=tOpO[None, rest_m, None],
                 )
+                
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] tOsO (smem copy src O): {}", tOsO)
+                cute.printf("[kernel] tOgO (smem copy dst O): {}", tOgO)
+                cute.printf("[kernel] tOrO (intermediate register buffer for O): {}", tOrO)
+                cute.printf("[kernel] tOcO (predicate for O tile copy): {}", tOcO)
+                cute.printf("")
 
     @cute.jit
     def compute_one_n_block(
