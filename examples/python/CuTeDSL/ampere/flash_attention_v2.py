@@ -603,12 +603,12 @@ class FlashAttentionForwardAmpere:
         # since copy_atom is (atomN16, atomK64=8x8), 
         # so CPY_N = blockN128 / atomN16 = 8, CPY_K = blockHD128 / atomK64 = 2
         tKgK = gmem_thr_copy_QKV.partition_S(gK)
-        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),1024,8192)
+        # (CPY_Atom=(8,1), CPY_N=8, CPY_K=2):((1,0),1024,8192)
         tKsK = gmem_thr_copy_QKV.partition_D(sK)
         
         # (CPY_Atom=(8,1), CPY_N=8, CPY_K=2, n_block=32):((1,0),8192,64,65536)
         tVgV = gmem_thr_copy_QKV.partition_S(gV)
-        # (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1,0),1024,8192)
+        # (CPY_Atom=(8,1), CPY_N=8, CPY_K=2):((1,0),1024,8192)
         tVsV = gmem_thr_copy_QKV.partition_D(sV)
 
         if cutlass.const_expr(self.debug_print):
@@ -803,34 +803,64 @@ class FlashAttentionForwardAmpere:
         # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
         # of tile_shape
         # ///////////////////////////////////////////////////////////////////////////////
-        # Construct identity layout for Q and KV
-        mcQ = cute.make_identity_tensor(mQ.layout.shape)
-        mcKV = cute.make_identity_tensor(mK.layout.shape)
+        
+        # Construct identity layout for last block of Q and KV
+        # mcQ: tensor((0,0,0,0) o (2,2048,4,128):(1@0,1@1,1@2,1@3)
+        # mcKV: tensor((0,0,0,0) o (2,4096,4,128):(1@0,1@1,1@2,1@3)
+        mcQ = cute.make_identity_tensor(shape=mQ.layout.shape)
+        mcKV = cute.make_identity_tensor(shape=mK.layout.shape)
         cQ = cute.local_tile(
             mcQ[batch_size, None, num_head, None],
             (self._m_block_size, self._head_dim_padded),
-            (m_block, 0),
+            (m_block, 0), # last m block
         )
         cKV = cute.local_tile(
             mcKV[batch_size, None, num_head, None],
             (self._n_block_size, self._head_dim_padded),
-            (n_block, 0),
+            (n_block, 0), # last n block, note n_block is calculated based on m_block for causal case
         )
 
         # Repeat the partitioning with identity layouts
+        # tQcQ: tensor((0,1920,0,0) o (CPY_Atom=(8,1), CPY_M=8, CPY_K=2):((1@3,0),16@1,64@3)
+        # tKVcKV: tensor((0,1920,0,0) o (CPY_Atom=(8,1), CPY_N=8, CPY_K=2):((1@3,0),16@1,64@3)
         tQcQ = gmem_thr_copy_QKV.partition_S(cQ)
         tKVcKV = gmem_thr_copy_QKV.partition_S(cKV)
+        
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] mcQ")
+                cute.print_tensor(mcQ)
+                cute.printf("")
+                cute.printf("[kernel] mcKV")
+                cute.print_tensor(mcKV)
+                cute.printf("")
+                cute.printf("[kernel] cQ")
+                cute.print_tensor(cQ)
+                cute.printf("")
+                cute.printf("[kernel] cKV")
+                cute.print_tensor(cKV)
+                cute.printf("")
+                cute.printf("[kernel] tQcQ (gmem copy src cQ)")
+                cute.print_tensor(tQcQ)
+                cute.printf("")
+                cute.printf("[kernel] tKVcKV (gmem copy src cKV)")
+                cute.print_tensor(tKVcKV)
+                cute.printf("")
+        
         # Allocate predicate tensors for m and n, here we only allocate the tile of k, and do special process for mn.
         # This is to reduce register pressure and gets 2-3% performance gain compared with allocating the whole tile.
         # tQpQ = cute.make_fragment(
-        tQpQ = cute.make_rmem_tensor(
+        tQpQ = cute.make_rmem_tensor( # (1,8,2):(2,0,1)
             cute.make_layout(
                 (
-                    tQsQ.shape[0][1],
-                    cute.size(tQsQ, mode=[1]),
-                    cute.size(tQsQ, mode=[2]),
+                    tQsQ.shape[0][1], # REST_V=1, all 8 elems in one 16B cp.async shares the same predicate
+                    cute.size(tQsQ, mode=[1]), # CPY_M = 8
+                    cute.size(tQsQ, mode=[2]), # CPY_K = 2
                 ),
-                stride=(cute.size(tQsQ, mode=[2]), 0, 1),
+                # NOTE: the stride for CPY_M is 0 to share the same K-only predicate 
+                # across the M dimension, and the M-dim OOB check will be done in the copy loop
+                stride=(cute.size(tQsQ, mode=[2]), 0, 1), # row-major for CPY_K
             ),
             cutlass.Boolean,
         )
@@ -838,68 +868,82 @@ class FlashAttentionForwardAmpere:
         tKVpKV = cute.make_rmem_tensor(
             cute.make_layout(
                 (
-                    tKsK.shape[0][1],
-                    cute.size(tKsK, mode=[1]),
-                    cute.size(tKsK, mode=[2]),
+                    tKsK.shape[0][1], # REST_V=1, all 8 elems in one 16B cp.async shares the same predicate
+                    cute.size(tKsK, mode=[1]), # CPY_N = 8
+                    cute.size(tKsK, mode=[2]), # CPY_K = 2
                 ),
-                stride=(cute.size(tKsK, mode=[2]), 0, 1),
+                # same stride logic as tQpQ
+                stride=(cute.size(tKsK, mode=[2]), 0, 1), # row-major for CPY_K
             ),
             cutlass.Boolean,
         )
+        
         # Set predicates for head_dim bounds, seqlen_q/k bounds is processed at the first tile.
+        # and if head_dim_padded == head_dim, then the predicate is always true.
         for rest_v in cutlass.range_constexpr(tQpQ.shape[0]):
             for rest_k in cutlass.range_constexpr(tQpQ.shape[2]):
                 tQpQ[rest_v, 0, rest_k] = cute.elem_less(
-                    tQcQ[(0, rest_v), 0, rest_k][3], mQ.layout.shape[3]
+                    tQcQ[(0, rest_v), 0, rest_k][3], # k coord
+                    mQ.layout.shape[3] # head_dim
                 )
         for rest_v in cutlass.range_constexpr(tKVpKV.shape[0]):
             for rest_k in cutlass.range_constexpr(tKVpKV.shape[2]):
                 tKVpKV[rest_v, 0, rest_k] = cute.elem_less(
-                    tKVcKV[(0, rest_v), 0, rest_k][3], mK.layout.shape[3]
+                    tKVcKV[(0, rest_v), 0, rest_k][3], # k coord
+                    mK.layout.shape[3] # head_dim
                 )
+                
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] tQpQ (predicate for Q tile copy): {}", tQpQ)
+                cute.print_tensor(tQpQ)
+                cute.printf("")
+                cute.printf("[kernel] tKVpKV (predicate for KV tile copy): {}", tKVpKV)
+                cute.print_tensor(tKVpKV)
+                cute.printf("")
+        
         # ///////////////////////////////////////////////////////////////////////////////
         # Prefetch Prologue
         # ///////////////////////////////////////////////////////////////////////////////
+        
         # Start async loads of the last mn-tile, where we take care of the mn residue
-        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-            if cute.elem_less(tQcQ[0, m, 0][1], mQ.layout.shape[1]):
+        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])): # CPY_M=8
+            if cute.elem_less(tQcQ[0, m, 0][1], mQ.layout.shape[1]): # q_idx < seqlen_q
                 cute.copy(
                     gmem_tiled_copy_QKV,
                     tQgQ[None, m, None],
                     tQsQ[None, m, None],
                     pred=tQpQ[None, m, None],
                 )
-            else:
-                # Clear the smem tiles to account for predicated off loads
+            else: # Clear the smem tiles to account for predicated off loads
                 tQsQ[None, m, None].fill(0)
-        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-            if cute.elem_less(tKVcKV[0, n, 0][1], mK.layout.shape[1]):
+        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])): # CPY_N=8
+            if cute.elem_less(tKVcKV[0, n, 0][1], mK.layout.shape[1]): # k_idx < seqlen_k
                 cute.copy(
                     gmem_tiled_copy_QKV,
                     tKgK[None, n, None, n_block],
                     tKsK[None, n, None],
                     pred=tKVpKV[None, n, None],
                 )
-            else:
-                # Clear the smem tiles to account for predicated off loads
+            else: # Clear the smem tiles to account for predicated off loads
                 tKsK[None, n, None].fill(0)
 
         cute.arch.cp_async_commit_group()
+        
         # ///////////////////////////////////////////////////////////////////////////////
         # Softmax intermediate result: row_max and row_sum
         # ///////////////////////////////////////////////////////////////////////////////
-        # shape: (atom_v_m * rest_m)
         # row_max = cute.make_fragment(
-        row_max = cute.make_rmem_tensor(
+        row_max = cute.make_rmem_tensor( # shape: (atom_v_m * rest_m)
             (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
         )
-        # shape: (atom_v_m * rest_m)
         # row_sum = cute.make_fragment(
-        row_sum = cute.make_rmem_tensor(
+        row_sum = cute.make_rmem_tensor( # shape: (atom_v_m * rest_m)
             (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
         )
-        row_max.fill(-cutlass.Float32.inf)
-        row_sum.fill(0.0)
+        row_max.fill(-cutlass.Float32.inf) # -inf init for max
+        row_sum.fill(0.0) # zero init for sum
 
         # group parameters for compute_one_n_block
         basic_params = SimpleNamespace(
