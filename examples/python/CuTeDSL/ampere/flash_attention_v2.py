@@ -1041,6 +1041,7 @@ class FlashAttentionForwardAmpere:
                         softmax_params,
                         is_first_n_block=(n_tile == 0),
                         in_mask_steps=True,
+                        is_print_thread=is_print_thread,
                     )
             else:
                 self.compute_one_n_block(
@@ -1051,6 +1052,7 @@ class FlashAttentionForwardAmpere:
                     softmax_params,
                     is_first_n_block=True,
                     in_mask_steps=True,
+                    is_print_thread=is_print_thread,
                 )
 
         # Start async loads of rest k-tiles in reverse order, no k-residue handling needed
@@ -1065,6 +1067,7 @@ class FlashAttentionForwardAmpere:
                 softmax_params,
                 is_first_n_block=False,
                 in_mask_steps=False,
+                is_print_thread=is_print_thread,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1250,6 +1253,7 @@ class FlashAttentionForwardAmpere:
         softmax_params: SimpleNamespace,
         is_first_n_block: cutlass.Constexpr,
         in_mask_steps: cutlass.Constexpr,
+        is_print_thread: bool,
     ):
         """Compute one n_block of S/O.
 
@@ -1268,7 +1272,12 @@ class FlashAttentionForwardAmpere:
         :type softmax_params: SimpleNamespace
         :param is_first_n_block: is first n block
         :type is_first_n_block: cutlass.Constexpr
+        :param in_mask_steps: whether in the steps that need masking on S
+        :type in_mask_steps: cutlass.Constexpr
+        :param is_print_thread: whether this thread should do debug print
+        :type is_print_thread: bool
         """
+        
         acc_shape_S = mma_params.thr_mma.partition_shape_C(
             (self._m_block_size, self._n_block_size)
         )
@@ -1279,11 +1288,12 @@ class FlashAttentionForwardAmpere:
         # wait for smem tile QK before mma calculation for S
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
-        # load smem tile V for O, special process for the first tile to avoid loading nan.
+        
+        # load smem tile V for O (G2S), special process for the first tile to avoid loading nan.
         # The `if` here is a constexpr, won't be generated in the IR.
         if is_first_n_block:
             for n in cutlass.range_constexpr(cute.size(gmem_copy_params.tVsV.shape[1])):
-                if cute.elem_less(
+                if cute.elem_less( # n_idx < seqlen_k
                     gmem_copy_params.tKVcKV[0, n, 0][1],
                     basic_params.mK.layout.shape[1],
                 ):
@@ -1304,10 +1314,12 @@ class FlashAttentionForwardAmpere:
             )
 
         cute.arch.cp_async_commit_group()
+        
         # ///////////////////////////////////////////////////////////////////////////////
         # S gemm calculation
         # ///////////////////////////////////////////////////////////////////////////////
-        # load first QK k-block from smem to rmem for mma
+        
+        # load first QK k-block from smem to rmem for mma (S2R)
         cute.copy(
             smem_copy_params.smem_tiled_copy_Q,
             smem_copy_params.tSsQ[None, None, 0],
@@ -1318,9 +1330,10 @@ class FlashAttentionForwardAmpere:
             smem_copy_params.tSsK[None, None, 0],
             smem_copy_params.tSrK_copy_view[None, None, 0],
         )
-        # mma for S
-        for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])):
-            # load next QK k-block from smem to rmem for mma
+        
+        # mma for S = QK.T of all k blocks in this n_block
+        for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])): # restK=((2,2),2)=8
+            # load next QK k-block from smem to rmem for mma (S2R)
             k_next = (k + 1) % cute.size(smem_copy_params.tSsQ.shape[2])
             cute.copy(
                 smem_copy_params.smem_tiled_copy_Q,
@@ -1332,6 +1345,8 @@ class FlashAttentionForwardAmpere:
                 smem_copy_params.tSsK[None, None, k_next],
                 smem_copy_params.tSrK_copy_view[None, None, k_next],
             )
+            
+            # mma for S of this k-block
             cute.gemm(
                 mma_params.tiled_mma,
                 acc_S,
@@ -1340,10 +1355,11 @@ class FlashAttentionForwardAmpere:
                 acc_S,
             )
 
-        # wait for smem tile V for O
+        # wait for smem tile V for O (G2S)
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
 
+        # load next n block of K (G2S)
         if basic_params.n_block > 0:
             cute.copy(
                 gmem_copy_params.gmem_tiled_copy_QKV,
@@ -1352,6 +1368,7 @@ class FlashAttentionForwardAmpere:
                 pred=gmem_copy_params.tKVpKV,
             )
             cute.arch.cp_async_commit_group()
+        
         # ///////////////////////////////////////////////////////////////////////////////
         # online softmax
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1362,13 +1379,16 @@ class FlashAttentionForwardAmpere:
             acc_S,
             is_first_n_block,
             in_mask_steps,
+            is_print_thread,
         )
 
         rP = cute.make_fragment_like(acc_S, self._dtype)
         rP.store(acc_S.load().to(self._dtype))
+        
         # ///////////////////////////////////////////////////////////////////////////////
         # O gemm calculation
         # ///////////////////////////////////////////////////////////////////////////////
+        
         # Convert layout of acc_S to gemm O accept layout.
         # Due to the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
@@ -1419,6 +1439,7 @@ class FlashAttentionForwardAmpere:
         acc_S: cute.Tensor,
         is_first_n_block: cutlass.Constexpr,
         in_mask_steps: cutlass.Constexpr,
+        is_print_thread: bool,
     ):
         """Apply online softmax and rescale acc_O.
 
@@ -1438,17 +1459,31 @@ class FlashAttentionForwardAmpere:
         :param in_mask_steps: in mask steps
         :type in_mask_steps: cutlass.Constexpr
         """
-        # Change acc_S to M,N layout view.
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Change acc_S/acc_O to M,N layout view.
+        # ///////////////////////////////////////////////////////////////////////////////
+        
+        # From acc_S: ((2,2),2,16):((1,2),4,8)
+        # To acc_S_mn: ((2,2),(2,16)):((2,4),(1,8))
         acc_S_mn = self._make_acc_tensor_mn_view(acc_S, False)
+        # From acc_O: ((2,2),2,16):((1,2),4,8)
+        # To acc_O_mn: ((2,2),(2,16)):((2,4),(1,8))
         acc_O_mn = self._make_acc_tensor_mn_view(mma_params.acc_O, False)
+        
+        # if it is not the first tile, 
+        # load the row r of previous row_max and compare with row_max_cur_row.
         row_max_prev = None
-        # if it is not the first tile, load the row r of previous row_max and compare with row_max_cur_row.
         if cutlass.const_expr(not is_first_n_block):
             row_max_prev = cute.make_fragment_like(
                 softmax_params.row_max, cutlass.Float32
             )
             cute.basic_copy(softmax_params.row_max, row_max_prev)
-        # if it is the first tile, create a mask for residual of S to -inf for softmax.
+        
+        # if it is the first tile, 
+        # create a mask for residual of S to -inf for softmax.
+        # From tScS: (0,1920,0,1920) o ((2,2),2,16):((1@3,8@1),64@1,8@3)
+        # To tScS_mn: (0,1920,0,1920) o ((2,2),(2,16)):((8@1,64@1),(1@3,8@3))
+        tScS = None
         tScS_mn = None
         if cutlass.const_expr(in_mask_steps):
             mcS = cute.make_identity_tensor(
@@ -1466,39 +1501,53 @@ class FlashAttentionForwardAmpere:
             )
             tScS = mma_params.thr_mma.partition_C(cS)
             tScS_mn = self._make_acc_tensor_mn_view(tScS, False)
+            
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Online softmax calculation and rescaling acc_O for this n_block
+        # ///////////////////////////////////////////////////////////////////////////////
 
         # Each iteration processes one row of acc_S
-        for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
-            # mask residual of S with -inf
+        for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)): # atomM2 x restM2 = 4 rows
+            # --- Mask residual of S with -inf ---
             if cutlass.const_expr(in_mask_steps):
                 if cutlass.const_expr(not self._is_causal):
                     # traverse column index.
-                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])): # atomN2 x restN16 = 32 columns
                         if cute.elem_less(
-                            basic_params.mK.shape[1], tScS_mn[0, c][3] + 1
-                        ):
+                            basic_params.mK.shape[1], 
+                            # only consider the column index, so the row index sets to 0.
+                            tScS_mn[0, c][3] + 1
+                        ): # OOB column index
                             acc_S_mn[r, c] = -cutlass.Float32.inf
                 else:
-                    # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
+                    # get the column index limit based on current row. 
+                    # Only consider the row index, so the column index sets to 0.
                     col_idx_limit = cutlass.min(
                         tScS_mn[r, 0][1] + 1, basic_params.mK.shape[1]
                     )
                     # traverse column index.
-                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                        # only consider the column index, so the row index sets to 0.
-                        if cute.elem_less(col_idx_limit, tScS_mn[0, c][3] + 1):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])): # atomN2 x restN16 = 32 columns
+                        if cute.elem_less(
+                            col_idx_limit, 
+                            # only consider the column index, so the row index sets to 0.
+                            tScS_mn[0, c][3] + 1
+                        ): # OOB column index
                             acc_S_mn[r, c] = -cutlass.Float32.inf
 
-            # (n_block_size)
-            acc_S_row = acc_S_mn[r, None].load()
+            # --- Update real row_max for this row ---
             # row_max_cur_row => f32
+            acc_S_row = acc_S_mn[r, None].load() # (n_block_size)
             row_max_cur_row = acc_S_row.reduce(
                 cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
             )
-            # quad reduction for row_max
+            
+            # quad reduction for row_max in 4 consecutive lanes that hold the same row, 
+            # to get the correct max value for this row.
             row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row)
             row_max_prev_row = None
-            # if it is not the first tile, load the row r of previous row_max and compare with row_max_cur_row.
+            
+            # if it is not the first tile, 
+            # load the row r of previous row_max and compare with row_max_cur_row.
             if cutlass.const_expr(not is_first_n_block):
                 row_max_prev_row = row_max_prev[r]
                 row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
@@ -1506,33 +1555,64 @@ class FlashAttentionForwardAmpere:
                 row_max_cur_row = (
                     0.0 if row_max_cur_row == -cutlass.Float32.inf else row_max_cur_row
                 )
+                
+            # --- Apply unnormalized stable softmax for this row ---
 
-            # compute exp(x - max) using exp2(x * log_2(e) - max * log_2(e))
+            # Compute unnormalized stable softmax: exp(x - max)
+            # using exp2(x * log_2(e) - max * log_2(e))
             acc_S_row_exp = cute.math.exp2(
                 acc_S_row * softmax_params.softmax_scale_log2
                 - row_max_cur_row * softmax_params.softmax_scale_log2,
                 fastmath=True,
             )
+            acc_S_mn[r, None] = acc_S_row_exp # unnormalized softmax value for this row
+            
+            # --- Update partial row_sum and rescale acc_O for this row ---
+            
+            # NOTE: different from row_max, which immediately reduces the max value across all 4 lanes for the same row, 
+            # we delay the quad reduction of row_sum until final `normalize_softmax` function
+            
             # acc_S_row_sum => f32
             acc_S_row_sum = acc_S_row_exp.reduce(
                 cute.ReductionOp.ADD, cutlass.Float32.zero, 0
             )
-            # if it is not the first tile, load the row r of previous row_max and minus row_max_cur_row to update row_sum.
+            
+            # if it is not the first tile, 
+            # load the row r of previous row_max and minus row_max_cur_row to update row_sum.
             if cutlass.const_expr(not is_first_n_block):
-                prev_minus_cur_exp = cute.math.exp2(
+                # Compute rescale factor for previous unnormalized stable softmax: 
+                # since: exp(x - cur_row_max) = exp(x - prev_row_max) * exp(prev_row_max - cur_row_max)
+                # thus: rescale_factor = exp(prev_row_max - cur_row_max)
+                rescale_factor = cute.math.exp2(
                     row_max_prev_row * softmax_params.softmax_scale_log2
                     - row_max_cur_row * softmax_params.softmax_scale_log2,
                     fastmath=True,
                 )
                 acc_S_row_sum = (
-                    acc_S_row_sum + softmax_params.row_sum[r] * prev_minus_cur_exp
+                    acc_S_row_sum + softmax_params.row_sum[r] * rescale_factor
                 )
-                acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_minus_cur_exp
+                acc_O_mn[r, None] = acc_O_mn[r, None].load() * rescale_factor
+            
             # update row_max, row_sum and acc_S
             softmax_params.row_max[r] = row_max_cur_row
             softmax_params.row_sum[r] = acc_S_row_sum
-            acc_S_mn[r, None] = acc_S_row_exp
-
+            
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] row_max after softmax: {}", softmax_params.row_max)
+                cute.printf("[kernel] row_sum after softmax: {}", softmax_params.row_sum)
+                cute.printf("")
+                cute.printf("[kernel] acc_S: {}", acc_S)
+                cute.printf("[kernel] acc_S_mn: {}", acc_S_mn)
+                cute.printf("")
+                cute.printf("[kernel] acc_O: {}", mma_params.acc_O)
+                cute.printf("[kernel] acc_O_mn (before normalization): {}", acc_O_mn)
+                cute.printf("")
+                cute.printf("[kernel] tScS: {}", tScS)
+                cute.printf("[kernel] tScS_mn: {}", tScS_mn)
+                cute.printf("")
+    
     @cute.jit
     def normalize_softmax(
         self,
