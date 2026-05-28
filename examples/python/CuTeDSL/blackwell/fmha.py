@@ -315,8 +315,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_tiler[1],
             mma_tiler[2],
         )
-        self.qk_mma_tiler = mma_tiler
-        self.pv_mma_tiler = (
+        self.qk_mma_tiler = mma_tiler # (M128, N128, K128)
+        self.pv_mma_tiler = ( # (M128, K128, N128)
             mma_tiler[0],
             mma_tiler[2],
             mma_tiler[1],
@@ -324,13 +324,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.cluster_shape_mn = (1, 1)
         self.is_persistent = is_persistent
         self.mask_type = mask_type
-        self.softmax0_warp_ids = (0, 1, 2, 3)
-        self.softmax1_warp_ids = (4, 5, 6, 7)
-        self.correction_warp_ids = (8, 9, 10, 11)
+        
+        self.softmax0_warp_ids = (0, 1, 2, 3) # warp group 0
+        self.softmax1_warp_ids = (4, 5, 6, 7) # warp group 1
+        self.correction_warp_ids = (8, 9, 10, 11) # warp group 2
+        
+        # warp group 3
         self.mma_warp_id = 12
         self.load_warp_id = 13
         self.epilogue_warp_id = 14
         self.empty_warp_id = 15
+        
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -374,6 +378,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             // num_warps_per_warpgroup
         )
         self.debug_print = debug_print
+        
+        if self.debug_print:
+            print()
+            print("Initialized BlackwellFusedMultiHeadAttentionForward with the following configuration:")
+            print(f"  qk_acc_dtype: {self.qk_acc_dtype}")
+            print(f"  pv_acc_dtype: {self.pv_acc_dtype}")
+            print(f"  mma_tiler: {self.qk_mma_tiler} for Q*K^T, {self.pv_mma_tiler} for P*V")
+            print(f"  mask_type: {self.mask_type}")
+            print(f"  threads_per_cta: {self.threads_per_cta}")
+            print(f"  softmax_warpgroup_count: {self.softmax_warpgroup_count}")
+            print()
+            
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
@@ -476,7 +492,16 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
         )
         o = cute.make_tensor(o_iter + qo_offset, o_layout)
-
+        
+        if cutlass.const_expr(self.debug_print):
+            cute.printf("")
+            cute.printf("Tensor configurations:")
+            cute.printf("q_layout: {}", q_layout)
+            cute.printf("k_layout: {}", k_layout)
+            cute.printf("v_layout: {}", v_layout)
+            cute.printf("o_layout: {}", o_layout)
+            cute.printf("")
+        
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
@@ -484,9 +509,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
 
         self.tile_sched_params, grid = self._compute_grid(
-            cute.shape((s_q, d, ((h_r, h_k), b))),
-            self.cta_tiler,
-            self.is_persistent,
+            o_shape=cute.shape((s_q, d, ((h_r, h_k), b))),
+            cta_tiler=self.cta_tiler, # (M128, K128)
+            is_persistent=self.is_persistent,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -506,62 +531,89 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if cutlass.const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        
         self._setup_attributes()
 
+        # Use 1 cta instead of 2
         cta_group = tcgen05.CtaGroup.ONE
-        # the intermediate tensor p is from tmem & k-major
+        
+        # NOTE: the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
+        
+        # Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+        # Permutation MNK: (_,_,_)
+        # MMA Atom
+        # ThrID:           1:0
+        # Shape MNK:       (128,128,16)
+        # TV Layout A:     (1,(128,16)):(128,(1,128))
+        # TV Layout B:     (1,(128,16)):(128,(1,128))
+        # TV Layout C:     (1,(128,128)):(128,(1,128))
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
-            cta_group,
-            self.qk_mma_tiler[:2],
+            cta_group=cta_group,
+            mma_tiler_mn=self.qk_mma_tiler[:2],
+            a_source=tcgen05.OperandSource.SMEM,
         )
+        
+        # Thr Layout VMNK: (1,1,1,1):(0,0,0,0)
+        # Permutation MNK: (_,_,_)
+        # MMA Atom
+        # ThrID:           1:0
+        # Shape MNK:       (128,128,16)
+        # TV Layout A:     (1,(128,16)):(128,(1,128))
+        # TV Layout B:     (1,(128,16)):(128,(1,128))
+        # TV Layout C:     (1,(128,128)):(128,(1,128))
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
             self.pv_acc_dtype,
-            cta_group,
-            self.pv_mma_tiler[:2],
-            p_source,
+            cta_group=cta_group,
+            mma_tiler_mn=self.pv_mma_tiler[:2], # (M128, K128)
+            a_source=p_source,
         )
 
-        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
+        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1) # (1, 1, 1)
+        self.cluster_layout_vmnk = cute.tiled_divide( # ((1),1,1,1):((0),0,0,0)
             cute.make_layout(self.cluster_shape_mnk),
             (qk_tiled_mma.thr_id.shape,),
         )
 
-        self.epi_tile = self.pv_mma_tiler[:2]
+        self.epi_tile = self.pv_mma_tiler[:2] # (M128, K128)
 
+        # sQ: S<3,4,3> o 0 o (MMA=(128,16), RestM1, RestK=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
         q_smem_layout_staged = sm100_utils.make_smem_layout_a(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.q_dtype,
             self.q_stage,
         )
+        # sK: S<3,4,3> o 0 o (MMA=(128,16), RestN1, RestK=(4,2), PipeKV2):((64,1),0,(16,8192),16384)
         k_smem_layout_staged = sm100_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.k_dtype,
             self.kv_stage,
         )
+        # stP: S<3,4,3> o 0 o (MMA=(128,16), RestM1, RestN=(4,2), PipeAcc1):((64,1),0,(16,8192),0)
         p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
             pv_tiled_mma,
             self.pv_mma_tiler,
             self.q_dtype,
             self.acc_stage,
         )
+        # sV: S<3,4,3> o 0 o (MMA=((64,2),16), RestK1, RestN8, PipeKV2):(((1,8192),64),0,1024,16384)
         v_smem_layout_staged = sm100_utils.make_smem_layout_b(
             pv_tiled_mma,
             self.pv_mma_tiler,
             self.v_dtype,
             self.kv_stage,
         )
+        # sO: S<3,4,3> o 0 o (MMA_M=(AtomM8, RestM16),(AtomK64, RestK2), PipeEPI=(1,2)):((64,512),(1,8192),(0,16384))
         o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.o_dtype,
             self.o_layout,
@@ -569,51 +621,60 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.epi_stage,
         )
 
-        # TMA load for Q
+        # TMA load op for QKV
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        
+        # TMA store op for O
         tma_store_op = cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()
 
+        # Make tma load atom/tensor for QKV
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
+        # tma_atom_q: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
+        # tma_tensor_q: (pM2048, pK128, nH&B=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            q,
-            q_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            op=tma_load_op,
+            gmem_tensor=q,
+            smem_layout=q_smem_layout,
+            mma_tiler_mnk=self.qk_mma_tiler,
+            tiled_mma=qk_tiled_mma,
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
         )
-
-        # TMA load for K
+        
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
+        # tma_atom_k: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
+        # tma_tensor_k: ((pN4096, pK128, nH&B=((1,4),2)):(1@1,1@0,((0,1@2),1@3))
         tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            k,
-            k_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for V
-        v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            v,
-            v_smem_layout,
-            self.pv_mma_tiler,
-            pv_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            op=tma_load_op,
+            gmem_tensor=k,
+            smem_layout=k_smem_layout,
+            mma_tiler_mnk=self.qk_mma_tiler,
+            tiled_mma=qk_tiled_mma,
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
         )
 
-        o_cta_v_layout = cute.composition(
-            cute.make_identity_layout(o.shape), self.epi_tile
+        v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
+        # tma_atom_v: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
+        # tma_tensor_v: (pK128, pN4096, nH&B=((1,4),2)):(1@0,1@1,((0,1@2),1@3))
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
+            op=tma_load_op,
+            gmem_tensor=v,
+            smem_layout=v_smem_layout,
+            mma_tiler_mnk=self.pv_mma_tiler,
+            tiled_mma=pv_tiled_mma,
+            cluster_shape_vmnk=self.cluster_layout_vmnk.shape,
+        )
+
+        o_cta_v_layout = cute.composition( # (128,128):(1@0,1@1)
+            cute.make_identity_layout(o.shape), self.epi_tile # (M128, K128)
         )
         o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
-
+        # tma_atom_o: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
+        # tma_tensor_o: (pM2048, pK128, nH&B=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
         tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
-            tma_store_op,
-            o,
-            o_smem_layout,
-            o_cta_v_layout,
+            op=tma_store_op,
+            gmem_tensor=o,
+            smem_layout=o_smem_layout,
+            cta_tiler=o_cta_v_layout,
         )
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
@@ -636,9 +697,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             corr_epi_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
             mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
+            
             # Tmem holding buffer
             tmem_holding_buf: Int32
-            # Smem tensors
+            
+            # Smem tensors Q/K/O
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -656,20 +719,32 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         if cutlass.const_expr(self.debug_print):
             print()
-            print(f"[__call__] q_dtype={self.q_dtype}  k_dtype={self.k_dtype}  o_dtype={self.o_dtype}")
-            print(f"[__call__] qk_acc_dtype={self.qk_acc_dtype}  pv_acc_dtype={self.pv_acc_dtype}")
-            print(f"[__call__] cta_tiler: {self.cta_tiler}")
-            print(f"[__call__] qk_mma_tiler: {self.qk_mma_tiler}  pv_mma_tiler: {self.pv_mma_tiler}")
-            print(f"[__call__] mask_type: {self.mask_type}  is_persistent: {self.is_persistent}")
+            print(f"[__call__] cluster_shape_mnk: {self.cluster_shape_mnk} | cluster_layout_vmnk: {self.cluster_layout_vmnk} | cta_group: {cta_group}")
+            print(f"[__call__] q_major_mode: {self.q_major_mode}  k_major_mode: {self.k_major_mode}  v_major_mode: {self.v_major_mode}  o_layout: {self.o_layout}")
             print(f"[__call__] q_smem_layout_staged: {q_smem_layout_staged}")
             print(f"[__call__] k_smem_layout_staged: {k_smem_layout_staged}")
+            print(f"[__call__] p_tmem_layout_staged: {p_tmem_layout_staged}")
             print(f"[__call__] v_smem_layout_staged: {v_smem_layout_staged}")
             print(f"[__call__] o_smem_layout_staged: {o_smem_layout_staged}")
-            print(f"[__call__] q_stage={self.q_stage}  kv_stage={self.kv_stage}  mma_softmax_stage={self.mma_softmax_stage}")
-            print(f"[__call__] grid: {grid}  block: [{self.threads_per_cta}, 1, 1]  cluster: {self.cluster_shape_mnk}")
-            print(f"[__call__] qk_tiled_mma: {qk_tiled_mma}")
-            print(f"[__call__] pv_tiled_mma: {pv_tiled_mma}")
+            print(f"[__call__] o_cta_v_layout: {o_cta_v_layout} | epi_tile: {self.epi_tile}")
+            print(f"[__call__] q_stage={self.q_stage}  kv_stage={self.kv_stage}  acc_stage={self.acc_stage}  mma_softmax_stage={self.mma_softmax_stage}")
+            print(f"[__call__] softmax_corr_stage={self.softmax_corr_stage}  mma_corr_stage={self.mma_corr_stage}  epi_stage={self.epi_stage}")
             print()
+            
+            cute.printf("")
+            cute.printf("[__call__] tma_atom_q: layout_src_tv={}, layout_dst_tv={}", tma_atom_q.layout_src_tv, tma_atom_q.layout_dst_tv)
+            cute.printf("[__call__] tma_tensor_q.layout: {}", tma_tensor_q.layout)
+            cute.printf("[__call__] tma_atom_k: layout_src_tv={}, layout_dst_tv={}", tma_atom_k.layout_src_tv, tma_atom_k.layout_dst_tv)
+            cute.printf("[__call__] tma_tensor_k.layout: {}", tma_tensor_k.layout)
+            cute.printf("[__call__] tma_atom_v: layout_src_tv={}, layout_dst_tv={}", tma_atom_v.layout_src_tv, tma_atom_v.layout_dst_tv)
+            cute.printf("[__call__] tma_tensor_v.layout: {}", tma_tensor_v.layout)
+            cute.printf("[__call__] tma_atom_o: layout_src_tv={}, layout_dst_tv={}", tma_atom_o.layout_src_tv, tma_atom_o.layout_dst_tv)
+            cute.printf("[__call__] tma_tensor_o.layout: {}", tma_tensor_o.layout)
+            cute.printf("")
+            cute.printf("[__call__] tma_copy_q_bytes: {}", self.tma_copy_q_bytes)
+            cute.printf("[__call__] tma_copy_kv_bytes: {}", self.tma_copy_kv_bytes)
+            cute.printf("[__call__] grid: {}", grid) # (min(num_sm, pM//tileM * nh * batch), 1, 1)
+            cute.printf("")
 
         # Launch the kernel synchronously
         self.kernel(
@@ -2415,9 +2490,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         tile_sched_params = create_fmha_static_tile_scheduler_params(
             is_persistent,
             (
-                cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-                cute.size(o_shape[2][0]),
-                cute.size(o_shape[2][1]),
+                cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]), # pM2048 // tileM128 = 16
+                cute.size(o_shape[2][0]), # h4
+                cute.size(o_shape[2][1]), # b2
             ),
         )
         grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
