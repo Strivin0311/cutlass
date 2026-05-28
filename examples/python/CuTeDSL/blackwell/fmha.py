@@ -265,10 +265,6 @@ class MaskType(enum.Enum):
     CAUSAL_MASK = enum.auto()
 
 
-def make_thread_cooperative_group(size: int):
-    return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
-
-
 class BlackwellFusedMultiHeadAttentionForward:
     def __init__(
         self,
@@ -315,8 +311,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_tiler[1],
             mma_tiler[2],
         )
-        self.qk_mma_tiler = mma_tiler # (M128, N128, K128)
-        self.pv_mma_tiler = ( # (M128, K128, N128)
+        self.qk_mma_tiler = mma_tiler # (tileQ128, tileK128, tileD128)
+        self.pv_mma_tiler = ( # (tileP128, tileD128, tileV128)
             mma_tiler[0],
             mma_tiler[2],
             mma_tiler[1],
@@ -335,6 +331,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.epilogue_warp_id = 14
         self.empty_warp_id = 15
         
+        # all columns to be allocated in tmem
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -354,6 +351,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.cta_sync_bar_id = 0
         self.tmem_alloc_sync_bar_id = 1
 
+        # tmem column offsets
         self.tmem_s0_offset = 0
         self.tmem_s1_offset = 128
         self.tmem_o0_offset = 256
@@ -365,6 +363,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_vec0_offset = 0
         self.tmem_vec1_offset = 128
 
+        # Set specific register usage for each warp role
         self.num_regs_softmax = 192
         self.num_regs_correction = 96
         self.num_regs_other = 32
@@ -585,35 +584,35 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.epi_tile = self.pv_mma_tiler[:2] # (M128, K128)
 
-        # sQ: S<3,4,3> o 0 o (MMA=(128,16), RestM1, RestK=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
+        # sQ: S<3,4,3> o 0 o (MMA_sA=(128,16), RestQ1, RestD=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
         q_smem_layout_staged = sm100_utils.make_smem_layout_a(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.q_dtype,
             self.q_stage,
         )
-        # sK: S<3,4,3> o 0 o (MMA=(128,16), RestN1, RestK=(4,2), PipeKV2):((64,1),0,(16,8192),16384)
+        # sK: S<3,4,3> o 0 o (MMA_sB=(128,16), RestK1, RestD=(4,2), PipeKV3):((64,1),0,(16,8192),16384)
         k_smem_layout_staged = sm100_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.k_dtype,
             self.kv_stage,
         )
-        # stP: S<3,4,3> o 0 o (MMA=(128,16), RestM1, RestN=(4,2), PipeAcc1):((64,1),0,(16,8192),0)
+        # tP: S<3,4,3> o 0 o (MMA_tA=(128,16), RestP1, RestD=(4,2), PipeAcc1):((64,1),0,(16,8192),0)
         p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
             pv_tiled_mma,
             self.pv_mma_tiler,
             self.q_dtype,
             self.acc_stage,
         )
-        # sV: S<3,4,3> o 0 o (MMA=((64,2),16), RestK1, RestN8, PipeKV2):(((1,8192),64),0,1024,16384)
+        # sV: S<3,4,3> o 0 o (MMA_sB=((64,2),16), RestV1, RestD8, PipeKV3):(((1,8192),64),0,1024,16384)
         v_smem_layout_staged = sm100_utils.make_smem_layout_b(
             pv_tiled_mma,
             self.pv_mma_tiler,
             self.v_dtype,
             self.kv_stage,
         )
-        # sO: S<3,4,3> o 0 o (MMA_M=(AtomM8, RestM16),(AtomK64, RestK2), PipeEPI=(1,2)):((64,512),(1,8192),(0,16384))
+        # sO: S<3,4,3> o 0 o (EPI_O=(8,16), EPI_D=(64,2), PipeEPI=(1,2)):((64,512),(1,8192),(0,16384))
         o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.o_dtype,
             self.o_layout,
@@ -630,7 +629,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Make tma load atom/tensor for QKV
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
         # tma_atom_q: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
-        # tma_tensor_q: (pM2048, pK128, nH&B=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
+        # tma_tensor_q: (pQ2048, pD128, HB=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
             op=tma_load_op,
             gmem_tensor=q,
@@ -642,7 +641,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
         # tma_atom_k: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
-        # tma_tensor_k: ((pN4096, pK128, nH&B=((1,4),2)):(1@1,1@0,((0,1@2),1@3))
+        # tma_tensor_k: ((pK4096, pD128, HB=((1,4),2)):(1@1,1@0,((0,1@2),1@3))
         tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
             op=tma_load_op,
             gmem_tensor=k,
@@ -654,7 +653,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
         # tma_atom_v: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
-        # tma_tensor_v: (pK128, pN4096, nH&B=((1,4),2)):(1@0,1@1,((0,1@2),1@3))
+        # tma_tensor_v: (pD128, pV4096, HB=((1,4),2)):(1@0,1@1,((0,1@2),1@3))
         tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
             op=tma_load_op,
             gmem_tensor=v,
@@ -669,7 +668,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
         # tma_atom_o: layout_src_tv=(1,8192):(0,1), layout_dst_tv=(1,8192):(0,1)
-        # tma_tensor_o: (pM2048, pK128, nH&B=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
+        # tma_tensor_o: (pO2048, pD128, HB=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
         tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op=tma_store_op,
             gmem_tensor=o,
@@ -701,7 +700,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             # Tmem holding buffer
             tmem_holding_buf: Int32
             
-            # Smem tensors Q/K/O
+            # Smem tensors Q/K/V/O
+            # NOTE: V shares the same smem buf with K
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -710,7 +710,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            sK: cute.struct.Align[
+            sK: cute.struct.Align[ # sK / sV
                 cute.struct.MemRange[self.k_dtype, cute.cosize(k_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
@@ -718,6 +718,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.shared_storage = SharedStorage
 
         if cutlass.const_expr(self.debug_print):
+            print()
+            print("[__call__] qk_tiled_mma: ", qk_tiled_mma)
+            print("[__call__] pv_tiled_mma: ", pv_tiled_mma)
             print()
             print(f"[__call__] cluster_shape_mnk: {self.cluster_shape_mnk} | cluster_layout_vmnk: {self.cluster_layout_vmnk} | cta_group: {cta_group}")
             print(f"[__call__] q_major_mode: {self.q_major_mode}  k_major_mode: {self.k_major_mode}  v_major_mode: {self.v_major_mode}  o_layout: {self.o_layout}")
@@ -867,114 +870,144 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
-                cute.printf("[kernel] warp_ids: load=%d mma=%d epi=%d softmax0=0..3 softmax1=4..7 corr=8..11\\n",
+                cute.printf("[kernel] warp_ids: load={} mma={} epi={} softmax0=0..3 softmax1=4..7 corr=8..11",
                             self.load_warp_id, self.mma_warp_id, self.epilogue_warp_id)
-                cute.printf("[kernel] scale_softmax_log2 = %f  scale_output = %f\\n",
+                cute.printf("[kernel] scale_softmax_log2 = {}  scale_output = {}",
                             scale_softmax_log2, scale_output)
                 cute.printf("")
 
-        #
+        # ///////////////////////////////////////////////////////////////////////////////
         # Prefetch tma desc
-        #
+        # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
 
-        # Alloc
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Alloc smem storage and fetch data
+        # ///////////////////////////////////////////////////////////////////////////////
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        load_q_mbar_ptr = storage.load_q_mbar_ptr.data_ptr()
+        load_kv_mbar_ptr = storage.load_kv_mbar_ptr.data_ptr()
+        mma_s0_mbar_ptr = storage.mma_s0_mbar_ptr.data_ptr()
+        mma_s1_mbar_ptr = storage.mma_s1_mbar_ptr.data_ptr()
+        s0_corr_mbar_ptr = storage.s0_corr_mbar_ptr.data_ptr()
+        s1_corr_mbar_ptr = storage.s1_corr_mbar_ptr.data_ptr()
+        s0_s1_sequence_mbar_ptr = storage.s0_s1_sequence_mbar_ptr.data_ptr()
+        corr_epi_mbar_ptr = storage.corr_epi_mbar_ptr.data_ptr()
+        mma_corr_mbar_ptr = storage.mma_corr_mbar_ptr.data_ptr()
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
 
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Make pipelines
+        # ///////////////////////////////////////////////////////////////////////////////
+        
+        # Load Q pipeline:
+        #   producer: load warp loading Q from gmem to smem with tma
+        #   consumer: mma warp loading Q from smem and do Q*K^T
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.q_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.load_warp_id])),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
             tx_count=self.tma_copy_q_bytes,
-            barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
+            barrier_storage=load_q_mbar_ptr,
         ).make_participants()
+        
+        # Load KV pipeline:
+        #   producer: load warp loading K/V from gmem to smem with tma
+        #   consumer: mma warp loading K/V from smem and do P*V
         load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.kv_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.load_warp_id])),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
             tx_count=self.tma_copy_kv_bytes,
-            barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
+            barrier_storage=load_kv_mbar_ptr,
         ).make_participants()
+        
+        # MMA_S=QK^T pipeline:
+        #   producer: mma warp doing tiled MMA for Q*K^T, write intermediate P to tmem
+        #   consumer: softmax warp group loading P from tmem, do softmax, write back to tmem
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.mma_softmax_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.softmax0_warp_ids)
-            ),
-            barrier_storage=storage.mma_s0_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax0_warp_ids)),
+            barrier_storage=mma_s0_mbar_ptr,
         ).make_participants()
         mma_s1_producer, mma_s1_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.mma_softmax_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.softmax1_warp_ids)
-            ),
-            barrier_storage=storage.mma_s1_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax1_warp_ids)),
+            barrier_storage=mma_s1_mbar_ptr,
         ).make_participants()
+        
+        # Softmax and correction pipeline:
+        #   producer: softmax warp group ...
+        #   consumer: correction warp group ...
         s0_corr_producer, s0_corr_consumer = pipeline.PipelineAsync.create(
             num_stages=self.softmax_corr_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.softmax0_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.correction_warp_ids)
-            ),
-            barrier_storage=storage.s0_corr_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax0_warp_ids)),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.correction_warp_ids)),
+            barrier_storage=s0_corr_mbar_ptr,
         ).make_participants()
         s1_corr_producer, s1_corr_consumer = pipeline.PipelineAsync.create(
             num_stages=self.softmax_corr_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.softmax1_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.correction_warp_ids)
-            ),
-            barrier_storage=storage.s1_corr_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax1_warp_ids)),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.correction_warp_ids)),
+            barrier_storage=s1_corr_mbar_ptr,
         ).make_participants()
+        
+        # Correction and epilogue pipeline:
+        #   producer: correction warp group ...
+        #   consumer: epilogue warp ...
         corr_epi_producer, corr_epi_consumer = pipeline.PipelineAsync.create(
             num_stages=self.epi_stage,
-            producer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.correction_warp_ids)
-            ),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len([self.epilogue_warp_id])
-            ),
-            barrier_storage=storage.corr_epi_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.correction_warp_ids)),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len([self.epilogue_warp_id])),
+            barrier_storage=corr_epi_mbar_ptr,
         ).make_participants()
+        
+        # MMA and correction pipeline:
+        #   producer: mma warp ...
+        #   consumer: correction warp group ...
         mma_corr_producer, mma_corr_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.mma_corr_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * len(self.correction_warp_ids)
-            ),
-            barrier_storage=storage.mma_corr_mbar_ptr.data_ptr(),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.correction_warp_ids)),
+            barrier_storage=mma_corr_mbar_ptr,
         ).make_participants()
+        
+        # Softmax sequencial execution pipeline
+        #  producer: softmax warp group 0 ...
+        #  consumer: softmax warp group 1 ...
         s0_s1_sequence_producer, s0_s1_sequence_consumer = (
             pipeline.PipelineAsync.create(
                 num_stages=1,
-                producer_group=make_thread_cooperative_group(
-                    self.threads_per_warp * len(self.softmax0_warp_ids)
-                ),
-                consumer_group=make_thread_cooperative_group(
-                    self.threads_per_warp * len(self.softmax1_warp_ids)
-                ),
-                barrier_storage=storage.s0_s1_sequence_mbar_ptr.data_ptr(),
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax0_warp_ids)),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax1_warp_ids)),
+                barrier_storage=s0_s1_sequence_mbar_ptr,
             ).make_participants()
         )
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
 
-        #  Correction & Epilogue & tmem barrier init
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Make tile scheduler
+        # ///////////////////////////////////////////////////////////////////////////////
+
+        tile_sched = create_fmha_static_tile_scheduler(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Tensor memory dealloc barrier init
+        # /////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.empty_warp_id:
             cute.arch.mbarrier_init(
                 tmem_dealloc_mbar_ptr,
-                self.threads_per_warp
+                cnt=self.threads_per_warp
                 * len(
-                    (
+                    ( # softmax warp group and correction warp group needs to arrive this mbar
                         *self.softmax0_warp_ids,
                         *self.softmax1_warp_ids,
                         *self.correction_warp_ids,
@@ -983,86 +1016,118 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         cute.arch.mbarrier_init_fence()
 
+        # /////////////////////////////////////////////////////////////////////////////
         #  Generate smem tensor Q/K/V/O
-        # (MMA, MMA_Q, MMA_D, PIPE)
+        # /////////////////////////////////////////////////////////////////////////////
+        
+        # sQ: S<3,4,3> o 0 o (MMA_sA=(128,16), RestQ1, RestD=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
         sQ = storage.sQ.get_tensor(
             q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
         )
-        # (MMA, MMA_K, MMA_D, PIPE)
+        # sK: S<3,4,3> o 0 o (MMA_sB=(128,16), RestK1, RestD=(4,2), PipeKV3):((64,1),0,(16,8192),16384)
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV_ptr = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
+        # sV: S<3,4,3> o 0 o (MMA_sB=((64,2),16), RestV1, RestD8, PipeKV3):(((1,8192),64),0,1024,16384)
+        sV_ptr = cute.recast_ptr(sK.iterator, swizzle_=v_smem_layout_staged.inner) # shared with sK
         sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
+        # sO: S<3,4,3> o 0 o (EPI_O=(8,16), EPI_D=(64,2), PipeEPI=(1,2)):((64,512),(1,8192),(0,16384))
         sO = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
-        qk_thr_mma = qk_tiled_mma.get_slice(0)  # default 1sm
-        pv_thr_mma = pv_tiled_mma.get_slice(0)  # default 1sm
+        
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Make tiled mma fragment
+        # /////////////////////////////////////////////////////////////////////////////
+        
+        cta_idx = 0 # default 1 cta
+        
+        # tSrQ: (MMA_sA1, RestQ=1, RestD=(4,2), PipeQ2):(0,0,(2,1024),2048)
+        # tSrK: (MMA_sB1, RestK=1, RestD=(4,2), PipeKV3):(0,0,(2,1024),2048)
+        # tStS/tStS0/tStS1: (MMA_TMEM_C=(Row128,Col128),1,1):((65536,1),0,0)
+        qk_thr_mma = qk_tiled_mma.get_slice(cta_idx)
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
         tSrK = qk_thr_mma.make_fragment_B(sK)
-        tOrV = pv_thr_mma.make_fragment_B(sV)
         qk_acc_shape = qk_thr_mma.partition_shape_C(
-            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+            (self.qk_mma_tiler[0], self.qk_mma_tiler[1]) # (tileM, tileN)
         )
         tStS = qk_thr_mma.make_fragment_C(qk_acc_shape)
+        
+        # tOrV: (MMA_sB1, RestV1, RestD8, PipeKV3):(0,0,128,2048)
+        # tOtO/tOtO0/tOtO1: (MMA_TMEM_C=(Row128,Col128),1,1):((65536,1),0,0)
+        pv_thr_mma = pv_tiled_mma.get_slice(cta_idx)
+        tOrV = pv_thr_mma.make_fragment_B(sV)
         pv_acc_shape = pv_thr_mma.partition_shape_C(
             (self.pv_mma_tiler[0], self.pv_mma_tiler[1])
         )
         tOtO = pv_thr_mma.make_fragment_C(pv_acc_shape)
 
-        tStS0 = cute.make_tensor(tStS.iterator + self.tmem_s0_offset, tStS.layout)
-        tStS1 = cute.make_tensor(tStS.iterator + self.tmem_s1_offset, tStS.layout)
-        tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout)
-        tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout)
+        # Shard tmem for double buffer of {S0, S1} and {O0, O1}
+        tStS0 = cute.make_tensor(tStS.iterator + self.tmem_s0_offset, tStS.layout) # 0~128
+        tStS1 = cute.make_tensor(tStS.iterator + self.tmem_s1_offset, tStS.layout) # 128~256
+        tOtO0 = cute.make_tensor(tOtO.iterator + self.tmem_o0_offset, tOtO.layout) # 256~384
+        tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout) # 384~512
 
+        # Reuse the same tmem buffer of tS for tP
+        # tP: (MMA_tA=(128,16), RestP1, RestD(4,2), PipeAcc1):((64,1),0,(16,8192),0)
+        # tOrP/tOrP0/tOrP1: (MMA_tA=(128,16), RestP1, RestD(4,2)):((65536,1),0,(16,64))
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
         tOrP0 = cute.make_tensor(
             tOrP.iterator
-            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p0_offset,
+            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p0_offset, # 2 * 32 = 64
             tOrP.layout,
         )
         tOrP1 = cute.make_tensor(
             tOrP.iterator
-            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p1_offset,
+            + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p1_offset, # 2 * 160 = 320
             tOrP.layout,
         )
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
                 cute.printf("")
-                cute.printf("[kernel] sQ: {}\\n", sQ)
-                cute.printf("[kernel] sK: {}\\n", sK)
-                cute.printf("[kernel] sO: {}\\n", sO)
-                cute.printf("[kernel] tStS (QK acc, tmem): {}\\n", tStS)
-                cute.printf("[kernel] tOtO (PV acc, tmem): {}\\n", tOtO)
-                cute.printf("[kernel] tOrP0 (P0 tmem frag): {}\\n", tOrP0)
+                cute.printf("[kernel] sQ: {}", sQ)
+                cute.printf("[kernel] sK: {}", sK)
+                cute.printf("[kernel] sV: {}", sV)
+                cute.printf("[kernel] sO: {}", sO)
+                cute.printf("")
+                cute.printf("[kernel] tSrQ.layout: {}", tSrQ.layout)
+                cute.printf("[kernel] tSrK.layout: {}", tSrK.layout)
+                cute.printf("[kernel] tOrV.layout: {}", tOrV.layout)
+                cute.printf("")
+                cute.printf("[kernel] tStS.layout (QK acc, tmem): {}", tStS.layout)
+                cute.printf("[kernel] tOtO.layout (PV acc, tmem): {}", tOtO.layout)
+                cute.printf("")
+                cute.printf("[kernel] tP.layout: {}", tP.layout)
+                cute.printf("[kernel] tOrP.layout: {}", tOrP.layout)
+                cute.printf("[kernel] tOrP0.layout (P0 tmem frag): {}", tOrP0.layout)
+                cute.printf("[kernel] tOrP1.layout (P1 tmem frag): {}", tOrP1.layout)
                 cute.printf("")
 
-        cute.arch.barrier(
+        # /////////////////////////////////////////////////////////////////////////////
+        #  Wait before tensor memory alloc
+        # /////////////////////////////////////////////////////////////////////////////
+        cute.arch.barrier( # equals to `__syncthreads()` here
             barrier_id=self.cta_sync_bar_id,
             number_of_threads=self.threads_per_cta,
         )
+        
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
+        #  EMPTY Warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_empty) # deprecated
+            cute.arch.setmaxregister_decrease(self.num_regs_empty) # 24
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  LOAD
+        #  LOAD Warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_other) # deprecated
+            cute.arch.setmaxregister_decrease(self.num_regs_other) # 32
 
-            tile_sched = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             work_tile = tile_sched.initial_work_tile_info()
-
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
@@ -1228,10 +1293,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 # End of persistent scheduler loop
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  MMA
+        #  MMA Warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_other) # deprecated
+            cute.arch.setmaxregister_decrease(self.num_regs_other) # 32
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
@@ -1240,11 +1306,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 barrier_id=self.tmem_alloc_sync_bar_id,
                 number_of_threads=self.threads_per_warp,
             )
-            tile_sched = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
 
+            work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
@@ -1497,15 +1560,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Epilogue
+        #  Epilogue Warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.epilogue_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-            tile_sched = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_other) # deprecated
+            cute.arch.setmaxregister_decrease(self.num_regs_other) # 32
 
+            work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
@@ -1581,11 +1642,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             # End of persistent scheduler loop
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Softmax0
+        #  Softmax WarpGroup 0
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.softmax1_warp_ids[0]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            # cute.arch.warpgroup_reg_alloc(self.num_regs_softmax) # deprecated
+            cute.arch.setmaxregister_increase(self.num_regs_softmax) # 192
 
             self.softmax(
                 stage=0,
@@ -1600,19 +1662,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                 si_corr_producer=s0_corr_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
-                tile_sched_params=tile_sched_params,
+                tile_sched=tile_sched,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Softmax1
+        #  Softmax WarpGroup 1
         # ///////////////////////////////////////////////////////////////////////////////
         if (
             warp_idx < self.correction_warp_ids[0]
             and warp_idx >= self.softmax1_warp_ids[0]
         ):
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            # cute.arch.warpgroup_reg_alloc(self.num_regs_softmax) # deprecated
+            cute.arch.setmaxregister_increase(self.num_regs_softmax) # 192
 
             self.softmax(
                 stage=1,
@@ -1627,15 +1690,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                 si_corr_producer=s1_corr_producer,
                 s0_s1_sequence_consumer=s0_s1_sequence_consumer,
                 s0_s1_sequence_producer=s0_s1_sequence_producer,
-                tile_sched_params=tile_sched_params,
+                tile_sched=tile_sched,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Correction
+        #  Correction WarpGroup
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_correction) # deprecated
+            cute.arch.setmaxregister_decrease(self.num_regs_correction) # 96
 
             cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
             tScS = qk_thr_mma.partition_C(cS)
@@ -1665,11 +1729,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_LOAD_VECtS1 = thr_tmem_load_vec.partition_S(tStS_vec1)
             tTMEM_LOAD_VECcS = thr_tmem_load_vec.partition_D(tScS_vec)
 
-            tile_sched = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
             work_tile = tile_sched.initial_work_tile_info()
-
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]
@@ -1702,7 +1762,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         # wait for vec0 (row_wise current max & previous max)
                         vec0_handle = s0_corr_consumer.wait_and_advance()
-                        tTMEM_LOAD_VECrS = cute.make_fragment(
+                        # tTMEM_LOAD_VECrS = cute.make_fragment( # deprecated
+                        tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                             tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                         )
                         cute.copy(
@@ -1739,7 +1800,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     # wait for vec0 (row_wise global sum)
                     vec0_handle = s0_corr_consumer.wait_and_advance()
-                    tTMEM_LOAD_VECrS = cute.make_fragment(
+                    # tTMEM_LOAD_VECrS = cute.make_fragment( # deprecated
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                         tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                     )
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
@@ -1778,7 +1840,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 work_tile = tile_sched.get_current_work()
             # End of persistent scheduler loop
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
-        return
 
     @cute.jit
     def softmax_step(
@@ -1869,7 +1930,10 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Wait for Si
         si_handle = mma_si_consumer.wait_and_advance()
-        tTMEM_LOADrS = cute.make_fragment(tTMEM_LOADcS.shape, self.qk_acc_dtype)
+        # tTMEM_LOADrS = cute.make_fragment(tTMEM_LOADcS.shape, self.qk_acc_dtype) # deprecated
+        tTMEM_LOADrS = cute.make_rmem_tensor(
+            tTMEM_LOADcS.shape, self.qk_acc_dtype
+        )
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             self.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, seqlen_k)
@@ -1879,7 +1943,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         row_max_safe = row_max
         if row_max == -cutlass.Float32.inf:
             row_max_safe = 0.0
-        tTMEM_STORE_VECrS = cute.make_fragment(
+        # tTMEM_STORE_VECrS = cute.make_fragment( # deprecated
+        tTMEM_STORE_VECrS = cute.make_rmem_tensor(
             tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
         )
         tTMEM_STORE_VECrS[0] = old_row_max
@@ -1889,7 +1954,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Notify correction wg that row_max is ready
         vec_i_handle.commit()
 
-        tTMEM_STORErS_x4 = cute.make_fragment(tTMEM_STOREcS.shape, self.qk_acc_dtype)
+        # tTMEM_STORErS_x4 = cute.make_fragment(tTMEM_STOREcS.shape, self.qk_acc_dtype) # deprecated
+        tTMEM_STORErS_x4 = cute.make_rmem_tensor(
+            tTMEM_STOREcS.shape, self.qk_acc_dtype
+        )
         tTMEM_STORErS_x4_e = cute.make_tensor(
             cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
             tTMEM_LOADrS.layout,
@@ -1994,7 +2062,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         si_corr_producer: pipeline.PipelineProducer,
         s0_s1_sequence_consumer: pipeline.PipelineConsumer,
         s0_s1_sequence_producer: pipeline.PipelineProducer,
-        tile_sched_params: FmhaStaticTileSchedulerParams,
+        tile_sched: FmhaStaticTileScheduler,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2082,11 +2150,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
         tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P)
 
-        tile_sched = create_fmha_static_tile_scheduler(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-        )
         work_tile = tile_sched.initial_work_tile_info()
-
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
             batch_coord = curr_block_coord[2][1]
@@ -2199,7 +2263,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tensor_args,
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
-                tTMEM_STORE_VECrS = cute.make_fragment(
+                # tTMEM_STORE_VECrS = cute.make_fragment( # deprecated
+                tTMEM_STORE_VECrS = cute.make_rmem_tensor(
                     tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
                 )
                 tTMEM_STORE_VECrS[0] = row_sum
@@ -2281,7 +2346,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i)
 
-        tTMrO = cute.make_fragment(
+        # tTMrO = cute.make_fragment( # deprecated
+        tTMrO = cute.make_rmem_tensor(
             (tTMEM_LOADcO.shape, 128 // corr_tile_size), self.pv_acc_dtype
         )
         for i in range(self.cta_tiler[2] // corr_tile_size):
@@ -2379,7 +2445,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
-            tTMrO = cute.make_fragment(
+            # tTMrO = cute.make_fragment( # deprecated
+            tTMrO = cute.make_rmem_tensor(
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
@@ -2388,7 +2455,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
-            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            # tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype) # deprecated
+            tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
