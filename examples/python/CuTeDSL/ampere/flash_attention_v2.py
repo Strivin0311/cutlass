@@ -1372,7 +1372,7 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         # online softmax
         # ///////////////////////////////////////////////////////////////////////////////
-        self.softmax_rescale_O(
+        self.softmax_rescale_O( # acc_S -> acc_P, acc_O_prev -> acc_O_cur
             basic_params,
             mma_params,
             softmax_params,
@@ -1382,16 +1382,23 @@ class FlashAttentionForwardAmpere:
             is_print_thread,
         )
 
-        rP = cute.make_fragment_like(acc_S, self._dtype)
+        # Type cast acc_P to rP for the following gemm calculation for O.
+        # rP: ((2,2),2,16):((1,2),4,8)
+        rP = cute.make_fragment_like(acc_S, self._dtype) # here acc_S stores acc_P after unnormalized softmax
         rP.store(acc_S.load().to(self._dtype))
         
         # ///////////////////////////////////////////////////////////////////////////////
         # O gemm calculation
         # ///////////////////////////////////////////////////////////////////////////////
         
-        # Convert layout of acc_S to gemm O accept layout.
-        # Due to the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-        # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
+        # Convert layout of rP to gemm O accept layout.
+        # Due to the mma instruction shape is m16n8k16,
+        # we need to convert from C layout => (m16n8) => ((2,2), MMA_M, MMA_N)
+        # to A layout => (m16k16) => ((2, 2), MMA_M, MMA_N / 2), then to (((2,2),2), MMA_M, MMA_N / 2)
+        
+        # rP: ((2,2),2,16):((1,2),4,8)
+        # rP_layout_divided: ((2,2),2,(2,8)):((1,2),4,(8,16))
+        # rP_mma_view: (((2,2),2),2,8):(((1,2),8),4,16)
         rP_layout_divided = cute.logical_divide(rP.layout, (None, None, 2))
         rP_mma_view = cute.make_layout(
             (
@@ -1406,22 +1413,35 @@ class FlashAttentionForwardAmpere:
             ),
         )
         tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
+        
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] acc_S (after softmax, before type cast): {}", acc_S)
+                cute.printf("[kernel] rP (type casted from acc_S): {}", rP.layout)
+                cute.printf("[kernel] rP_layout_divided: {}", rP_layout_divided)
+                cute.printf("[kernel] rP_mma_view: {}", rP_mma_view)
+                cute.printf("[kernel] tOrS (rP with layout converted for O gemm): {}", tOrS.layout)
+                cute.printf("")
 
-        # load first V k-block from smem to rmem for mma
+        # load first V k-block from smem to rmem for mma (S2R)
         cute.copy(
             smem_copy_params.smem_tiled_copy_V,
             smem_copy_params.tOsVt[None, None, 0],
             smem_copy_params.tOrVt_copy_view[None, None, 0],
         )
-        # mma for O
-        for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
-            # load next V k-block from smem to rmem for mma
+        
+        # mma for O = PV of all k blocks in this n_block
+        for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])): # restN=8
+            # load next V k-block from smem to rmem for mma (S2R)
             k_next = (k + 1) % cute.size(tOrS.shape[2])
             cute.copy(
                 smem_copy_params.smem_tiled_copy_V,
                 smem_copy_params.tOsVt[None, None, k_next],
                 smem_copy_params.tOrVt_copy_view[None, None, k_next],
             )
+            
+            # mma for O of this k-block
             cute.gemm(
                 mma_params.tiled_mma,
                 mma_params.acc_O,
