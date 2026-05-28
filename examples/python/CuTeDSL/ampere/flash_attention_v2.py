@@ -685,8 +685,17 @@ class FlashAttentionForwardAmpere:
         # total regs: 4 * 16 * 8 = 512 bf16 values per thread
         tOrVt = thr_mma.make_fragment_B(sVt_parB)
         
-        # (MMA_C=(2,2), restM=2, restN=16):((1,2),4,8)
-        # MMA_C=(2,2)=4: per-thread vals from atom TV Layout C
+        # (MMA_C=(atomN=2, atomM=2), restM=2, restN=16):((1,2),4,8)
+        # MMA_C=(atomN=2, atomM=2)=4: per-thread vals from atom TV Layout C
+        #   PTX m16n8k16 assigns thread t's 4 f32 regs as:
+        #     reg[0]: row=t>>2,     col=(t&3)*2     ┐ stride-1 between them → col (N) = atomN
+        #     reg[1]: row=t>>2,     col=(t&3)*2+1   ┘
+        #     reg[2]: row=(t>>2)+8, col=(t&3)*2     ┐ stride-2 between them → row (M) = atomM
+        #     reg[3]: row=(t>>2)+8, col=(t&3)*2+1   ┘
+        #   shape[0][0]=atomN=2 (stride=1): N/col direction
+        #   shape[0][1]=atomM=2 (stride=2): M/row direction
+        #   M-count per thread = atomM * restM = shape[0][1] * shape[1] = 2 * 2 = 4 rows
+        #   N-count per thread = atomN * restN = shape[0][0] * shape[2] = 2 * 16 = 32 cols
         # restM=2      : blockM128 / tile_M64 = 2
         # restN=16     : blockHD128 / atom_N8 = 16  (2nd GEMM N = head_dim)
         # total regs: 4 * 2 * 16 = 128 f32 values per thread
@@ -954,13 +963,14 @@ class FlashAttentionForwardAmpere:
         # ///////////////////////////////////////////////////////////////////////////////
         
         # Init row_max and row_sum
+        # shape = atomM * restM = acc_O.shape[0][1] * acc_O.shape[1] = 2 * 2 = 4 rows per thread
         # row_max = cute.make_fragment(
-        row_max = cute.make_rmem_tensor( # shape: (atom_v_m * rest_m)
-            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
+        row_max = cute.make_rmem_tensor( # shape: (atomM * restM = 4 rows)
+            (acc_O.shape[0][1] * acc_O.shape[1]), cutlass.Float32
         )
         # row_sum = cute.make_fragment(
-        row_sum = cute.make_rmem_tensor( # shape: (atom_v_m * rest_m)
-            (acc_O.shape[0][0] * acc_O.shape[1]), cutlass.Float32
+        row_sum = cute.make_rmem_tensor( # shape: (atomM * restM = 4 rows)
+            (acc_O.shape[0][1] * acc_O.shape[1]), cutlass.Float32
         )
         row_max.fill(-cutlass.Float32.inf) # -inf init for max
         row_sum.fill(0.0) # zero init for sum
@@ -1087,7 +1097,7 @@ class FlashAttentionForwardAmpere:
         
         # Normalize acc_O by row_sum and calculate the lse
         # acc_O: (MMA_C=(2,2), restM=2, restN=16):((1,2),4,8)
-        self.normalize_softmax(acc_O, row_sum)
+        self.normalize_softmax(acc_O, row_sum, is_print_thread)
         
         # Type cast acc_O to rO
         # rO: ((2,2),2,16):((1,2),4,8)
@@ -1429,8 +1439,8 @@ class FlashAttentionForwardAmpere:
         :type in_mask_steps: cutlass.Constexpr
         """
         # Change acc_S to M,N layout view.
-        acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
-        acc_O_mn = self._make_acc_tensor_mn_view(mma_params.acc_O)
+        acc_S_mn = self._make_acc_tensor_mn_view(acc_S, False)
+        acc_O_mn = self._make_acc_tensor_mn_view(mma_params.acc_O, False)
         row_max_prev = None
         # if it is not the first tile, load the row r of previous row_max and compare with row_max_cur_row.
         if cutlass.const_expr(not is_first_n_block):
@@ -1455,7 +1465,7 @@ class FlashAttentionForwardAmpere:
                 (basic_params.m_block, basic_params.n_block),
             )
             tScS = mma_params.thr_mma.partition_C(cS)
-            tScS_mn = self._make_acc_tensor_mn_view(tScS)
+            tScS_mn = self._make_acc_tensor_mn_view(tScS, False)
 
         # Each iteration processes one row of acc_S
         for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
@@ -1528,6 +1538,7 @@ class FlashAttentionForwardAmpere:
         self,
         acc_O: cute.Tensor,
         row_sum: cute.Tensor,
+        is_print_thread: bool,
     ):
         """Normalize acc_O by row_sum.
 
@@ -1535,30 +1546,55 @@ class FlashAttentionForwardAmpere:
         :type acc_O: cute.Tensor
         :param row_sum: row_sum tensor
         :type row_sum: cute.Tensor
+        :param is_print_thread: flag to indicate if the thread is for printing
         """
-        # do quad reduction for row_sum.
-        acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
-        for r in cutlass.range_constexpr(cute.size(row_sum)):
+        # Quad reduction for row_sum.
+        # From acc_O: ((atomN2, atomM2), restM2, restN16):((1,2),4,8)
+        # to acc_O_mn: ((atomM2, restM2),(atomN2, restN16)):((2,4),(1,8))
+        acc_O_mn = self._make_acc_tensor_mn_view(acc_O, is_print_thread)
+        for r in cutlass.range_constexpr(cute.size(row_sum)): # atomM2 x restM2 = 4 rows
+            # NOTE: for C in m16n8k16 mma, the thr layout is (8,4):(4,1), and the val layout is (2,2)
+            # which indicates 4 consective lanes in a warp hold one same row of acc_O_mn (T0:{c0,c1}, T1:{c0,c1}, T2:{c0,c1}, T3:{c0,c1})
+            # we need to reduce the row_sum across these 4 lanes to get the correct sum for normalization
             row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
+            
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
 
             scale = (
-                1.0 if acc_O_mn_row_is_zero_or_nan else cute.arch.rcp_approx(row_sum[r])
+                1.0 
+                if acc_O_mn_row_is_zero_or_nan 
+                # `rcp.approx.f32`: better way than division (rcp + mul)
+                else cute.arch.rcp_approx(row_sum[r])
             )
 
+            # NOTE: we cannot write `acc_O_mn[r, None] *= scale`
+            # since it raises an error: `unsupported operand type(s) for *=: '_Tensor' and 'Float32'`
             acc_O_mn[r, None] = acc_O_mn[r, None].load() * scale
+            
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] row_sum after reduction: {}", row_sum)
+                cute.printf("[kernel] acc_O_mn after normalization: {}", acc_O_mn)
+                cute.printf("")
 
-    def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
+    @cute.jit
+    def _make_acc_tensor_mn_view(self, acc: cute.Tensor, is_print_thread: bool) -> cute.Tensor:
         """make acc tensor as mn layout view
 
         :param acc: input tensor
         :type acc: cute.Tensor
+        :param is_print_thread: flag to indicate if the thread is for printing
+        :type is_print_thread: bool
         :return: acc tensor mn layout view
         :rtype: cute.Tensor
         """
+        # ((atomN2, atomM2), restM2, restN16):((1,2),4,8)
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
-        acc_layout_mn = cute.make_layout(
+        
+        # ((atomM2, restM2),(atomN2, restN16)):((2,4),(1,8))
+        acc_layout_mn_ = cute.make_layout(
             (
                 (
                     acc_layout_col_major.shape[0][1],
@@ -1580,8 +1616,21 @@ class FlashAttentionForwardAmpere:
                 ),  # MMA_N
             ),
         )
-        acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
-        return cute.make_tensor(acc.iterator, acc_layout_mn)
+        
+        # ((2,2),(2,16)):((2,4),(1,8))
+        acc_layout_mn = cute.composition(acc.layout, acc_layout_mn_)
+        acc_mn = cute.make_tensor(acc.iterator, acc_layout_mn)
+        
+        if cutlass.const_expr(self.debug_print):
+            if is_print_thread:
+                cute.printf("")
+                cute.printf("[kernel] acc_layout_col_major: {}", acc_layout_col_major)
+                cute.printf("[kernel] acc_layout_mn_: {}", acc_layout_mn_)
+                cute.printf("[kernel] acc_layout_mn: {}", acc_layout_mn)
+                cute.printf("[kernel] acc_mn: {}", acc_mn)
+                cute.printf("")
+        
+        return acc_mn
 
     def _threadquad_reduce(self, val: cutlass.Float32, op: Callable) -> cutlass.Float32:
         """thread quad reduction
@@ -1593,13 +1642,15 @@ class FlashAttentionForwardAmpere:
         :return: reduced value
         :rtype: cutlass.Float32
         """
+        # Reduce val for 4 consecutive lanes in a warp (thread quad) together, 
+        # using butterfly shuffles.
         val = op(
             val,
-            cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31),
+            cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31), # tid XOR (tid + 2)
         )
         val = op(
             val,
-            cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31),
+            cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31), # tid XOR (tid + 1)
         )
         return val
 
