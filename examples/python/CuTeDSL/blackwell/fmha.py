@@ -201,20 +201,21 @@ class FmhaStaticTileScheduler:
 
     def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
         is_valid = (
-            self._current_work_linear_idx < self._num_blocks
+            self._current_work_linear_idx < self._num_blocks # idx < m * b * h
             if self._is_persistent
             else self._is_first_block
         )
 
         blk_coord = (0, 0, 0)
         if self._is_persistent:
+            # de-linearize the block idx to get the actual tile coordinate (midx, hidx, bidx)
             blk_coord = self._problem_shape_mbh.get_hier_coord(
                 self._current_work_linear_idx, loc=loc, ip=ip
             )
         else:
             blk_coord = self._blk_coord
 
-        # cur_tile_coord is (mid, 0, (bid, hid))
+        # cur_tile_coord is (midx, 0, (hidx, bidx)), 0 for dummy nidx
         cur_tile_coord = (
             blk_coord[0],
             0,
@@ -480,6 +481,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         k = cute.make_tensor(k_iter + kv_offset, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
+        # NOTE: we transpose V to Vt here to align O = PV = umma(P, Vt)
         v_layout = cute.make_layout(
             (d, s_k, ((h_r, h_k), b_kv)),
             stride=(1, d * h_k, ((0, d), stride_b_kv)),
@@ -522,7 +524,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise RuntimeError("The layout of q is not supported")
         if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN): # NOTE: here is actually Vt
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -856,16 +858,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        # coord inside cta
+        
+        # intra CTA coord
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+        
+        # inter CTA coord
+        # dummy coord/layout since we do not use TMA multicast or 2-CTA cooperative
+        # for this example
+        cta_coord = 0
+        cta_layout = cute.make_layout(1)
 
-        # is_print_thread: only load warp, thread 0 in block (0,0,0) prints
-        is_print_thread = (
-            (warp_idx == self.load_warp_id)
-            and (tidx % self.threads_per_warp == 0)
-            and (bidx == 0) and (bidy == 0) and (bidz == 0)
-        )
+        # used only for debug print
+        is_print_block = (bidx == 0) and (bidy == 0) and (bidz == 0) # first block
+        is_print_thread = (tidx == 127) and is_print_block # the last thread in first warp
 
         if cutlass.const_expr(self.debug_print):
             if is_print_thread:
@@ -996,7 +1002,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
 
         tile_sched = create_fmha_static_tile_scheduler(
-            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            tile_sched_params, 
+            blk_coord=cute.arch.block_idx(), 
+            grid_shape=cute.arch.grid_dim()
         )
 
         # /////////////////////////////////////////////////////////////////////////////
@@ -1020,15 +1028,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Generate smem tensor Q/K/V/O
         # /////////////////////////////////////////////////////////////////////////////
         
-        # sQ: S<3,4,3> o 0 o (MMA_sA=(128,16), RestQ1, RestD=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
+        # sQ: S<3,4,3> o 0 o (MMA_sA=(128,16), MMA_Q1, MMA_D=(4,2), PipeQ2):((64,1),0,(16,8192),16384)
         sQ = storage.sQ.get_tensor(
             q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
         )
-        # sK: S<3,4,3> o 0 o (MMA_sB=(128,16), RestK1, RestD=(4,2), PipeKV3):((64,1),0,(16,8192),16384)
+        # sK: S<3,4,3> o 0 o (MMA_sB=(128,16), MMA_K1, MMA_D=(4,2), PipeKV3):((64,1),0,(16,8192),16384)
         sK = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        # sV: S<3,4,3> o 0 o (MMA_sB=((64,2),16), RestV1, RestD8, PipeKV3):(((1,8192),64),0,1024,16384)
+        # sV: S<3,4,3> o 0 o (MMA_sB=((64,2),16), MMA_V1, MMA_D8, PipeKV3):(((1,8192),64),0,1024,16384)
         sV_ptr = cute.recast_ptr(sK.iterator, swizzle_=v_smem_layout_staged.inner) # shared with sK
         sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
         # sO: S<3,4,3> o 0 o (EPI_O=(8,16), EPI_D=(64,2), PipeEPI=(1,2)):((64,512),(1,8192),(0,16384))
@@ -1042,8 +1050,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         
         cta_idx = 0 # default 1 cta
         
-        # tSrQ: (MMA_sA1, RestQ=1, RestD=(4,2), PipeQ2):(0,0,(2,1024),2048)
-        # tSrK: (MMA_sB1, RestK=1, RestD=(4,2), PipeKV3):(0,0,(2,1024),2048)
+        # tSrQ: (MMA_sA1, MMA_Q=1, MMA_D=(4,2), PipeQ2):(0,0,(2,1024),2048)
+        # tSrK: (MMA_sB1, MMA_K=1, MMA_D=(4,2), PipeKV3):(0,0,(2,1024),2048)
         # tStS/tStS0/tStS1: (MMA_TMEM_C=(Row128,Col128),1,1):((65536,1),0,0)
         qk_thr_mma = qk_tiled_mma.get_slice(cta_idx)
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
@@ -1053,7 +1061,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         tStS = qk_thr_mma.make_fragment_C(qk_acc_shape)
         
-        # tOrV: (MMA_sB1, RestV1, RestD8, PipeKV3):(0,0,128,2048)
+        # tOrV: (MMA_sB1, MMA_V1, MMA_D8, PipeKV3):(0,0,128,2048)
         # tOtO/tOtO0/tOtO1: (MMA_TMEM_C=(Row128,Col128),1,1):((65536,1),0,0)
         pv_thr_mma = pv_tiled_mma.get_slice(cta_idx)
         tOrV = pv_thr_mma.make_fragment_B(sV)
@@ -1069,8 +1077,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         tOtO1 = cute.make_tensor(tOtO.iterator + self.tmem_o1_offset, tOtO.layout) # 384~512
 
         # Reuse the same tmem buffer of tS for tP
-        # tP: (MMA_tA=(128,16), RestP1, RestD(4,2), PipeAcc1):((64,1),0,(16,8192),0)
-        # tOrP/tOrP0/tOrP1: (MMA_tA=(128,16), RestP1, RestD(4,2)):((65536,1),0,(16,64))
+        # tP: (MMA_tA=(128,16), MMA_P1, MMA_D=(4,2), PipeAcc1):((64,1),0,(16,8192),0)
+        # tOrP/tOrP0/tOrP1: (MMA_tA=(128,16), MMA_P1, MMA_D=(4,2)):((65536,1),0,(16,64))
         tP = cute.make_tensor(tStS.iterator, p_tmem_layout_staged.outer)
         tOrP = pv_thr_mma.make_fragment_A(tP)[None, None, None, 0]
         tOrP0 = cute.make_tensor(
@@ -1127,23 +1135,28 @@ class BlackwellFusedMultiHeadAttentionForward:
             # cute.arch.warpgroup_reg_dealloc(self.num_regs_other) # deprecated
             cute.arch.setmaxregister_decrease(self.num_regs_other) # 32
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = work_tile.tile_idx # (midx, 0, (hidx, bidx))
                 batch_coord = curr_block_coord[2][1]
-                continue_cond = False
+                continue_cond = False # to simulate `continue` in python loop
                 cuseqlen_q = Int32(0)
                 seqlen_q = mQ_qdl.shape[0]
-                if cutlass.const_expr(cum_seqlen_q is not None):
+                
+                if cutlass.const_expr(cum_seqlen_q is not None): # varlen case
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
                     continue_cond = (
-                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.cta_tiler[0],
-                            curr_block_coord[0],
-                            seqlen_q,
+                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q( # tileM * midx < seqlen_q
+                            q_tiler=self.cta_tiler[0], # tileM
+                            current_idx=curr_block_coord[0], # midx
+                            seqlen_q=seqlen_q,
                         )
                     )
+                
                 if not continue_cond:
                     mQ_qdl_ = mQ_qdl
                     mK_kdl_ = mK_kdl
@@ -1152,105 +1165,170 @@ class BlackwellFusedMultiHeadAttentionForward:
                     curr_block_coord_q = curr_block_coord
                     curr_block_coord_kv = curr_block_coord
 
+                    # Offset mQ/mK/mV for varlen case
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         logical_offset_mQ = (
-                            mQ_qdl.shape[0] - seqlen_q,
-                            0,
-                            (0, cuseqlen_q + seqlen_q),
+                            mQ_qdl.shape[0] - seqlen_q, # offset in Q dimension
+                            0, # no offset in D dimension
+                            (0, cuseqlen_q + seqlen_q), # offset in batch dimension
                         )
-                        mQ_qdl_ = cute.domain_offset(logical_offset_mQ, mQ_qdl)
+                        mQ_qdl_ = cute.domain_offset(coord=logical_offset_mQ, tensor=mQ_qdl)
                         curr_block_coord_q = (
-                            curr_block_coord[0],
-                            curr_block_coord[1],
-                            (curr_block_coord[2][0], Int32(0)),
+                            curr_block_coord[0], # midx
+                            curr_block_coord[1], # nidx = 0
+                            (curr_block_coord[2][0], Int32(0)), # (hidx, 0)
                         )
 
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                         logical_offset_mK = (
-                            mK_kdl.shape[0] - seqlen_k,
-                            0,
-                            (0, cuseqlen_k + seqlen_k),
+                            mK_kdl.shape[0] - seqlen_k, # offset in K dimension
+                            0, # no offset in D dimension
+                            (0, cuseqlen_k + seqlen_k), # offset in batch dimension
                         )
                         logical_offset_mV = (
-                            0,
-                            mK_kdl.shape[0] - seqlen_k,
-                            (0, cuseqlen_k + seqlen_k),
+                            0,  # no offset in D dimension
+                            mK_kdl.shape[0] - seqlen_k, # offset in K dimension
+                            (0, cuseqlen_k + seqlen_k), # offset in batch dimension
                         )
                         mK_kdl_ = cute.domain_offset(logical_offset_mK, mK_kdl)
                         mV_dkl_ = cute.domain_offset(logical_offset_mV, mV_dkl)
                         curr_block_coord_kv = (
-                            curr_block_coord[0],
-                            curr_block_coord[1],
-                            (curr_block_coord[2][0], Int32(0)),
+                            curr_block_coord[0], # midx
+                            curr_block_coord[1], # nidx = 0
+                            (curr_block_coord[2][0], Int32(0)), # (hidx, 0)
                         )
 
-                    # Local tile partition global tensors
-                    # (bM, bK, loopM, loopK, loopL)
-                    gQ_qdl = cute.flat_divide(
-                        mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2])
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  TMA partition Q/K/V
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    
+                    # mQ_qdl_: (Q2048, D128, HB=((1,4),2)):(1@1,1@0,((1@2,1@3),1@4))
+                    # gQ_qdl: (tileQ128, tileD128, restQ16, restD1, HB=((1,4),2)):(1@1,1@0,128@1,128@0,((1@2,1@3),1@4))
+                    # tSgQ_qdl: (MMA_sA=(128,16), MMA_Q1, MMA_D8, restQ16, restD1, HB=((1,4),2)):((1@1,1@0),0,16@0,128@1,128@0,((1@2,1@3),1@4))
+                    # tQgQ_qdl: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restQ16, restD1, HB=((1,4),2)):(((1@0,1@1),64@0),128@1,128@0,((1@2,1@3),1@4))
+                    # tQgQ: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restQ16):(((1@0,1@1),64@0),128@1)
+                    # tQsQ: (TMA_atom=(TMA_atomV=8192, TMA_restV=2), PipeQ2):((1,8192),16384)
+                    gQ_qdl = cute.local_tile(
+                        mQ_qdl_,
+                        tiler=cute.select(self.qk_mma_tiler, mode=[0, 2]), # (tileQ, tileD)
+                        coord=(None, None, None)
                     )
                     tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
-                        0,  # no multicast
-                        cute.make_layout(1),
-                        cute.group_modes(sQ, 0, 3),
-                        cute.group_modes(tSgQ_qdl, 0, 3),
+                        cta_coord=cta_coord,
+                        cta_layout=cta_layout,
+                        smem_tensor=cute.group_modes(sQ, 0, 3), # group MMA dims
+                        gmem_tensor=cute.group_modes(tSgQ_qdl, 0, 3), # group MMA dims
                     )
+                    # since tileD == D, we slice out the dummy restD dim, and the current HB batch as well
                     tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord_q[2]]
 
-                    gK_kdl = cute.flat_divide(
-                        mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                    # mK_kdl_: (K4096, D128, HB=((1,4),2)):(1@1,1@0,((0,1@2),1@3))
+                    # gK_kdl: (tileK128, tileD128, restK32, restD1, HB=((1,4),2)):(1@1,1@0,128@1,128@0,((0,1@2),1@3))
+                    # tSgK_kdl: (MMA_sB=(128,16), MMA_K1, MMA_D8, restK32, restD1, HB=((1,4),2)):((1@1,1@0),0,16@0,128@1,128@0,((0,1@2),1@3))
+                    # tKgK_kdl: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restK32, restD1, HB=((1,4),2)):(((1@0,1@1),64@0),128@1,128@0,((0,1@2),1@3))
+                    # tKgK: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restK32):(((1@0,1@1),64@0),128@1)
+                    # tKsK: (TMA_atom=(TMA_atomV=8192, TMA_restV=2), PipeKV3):((1,8192),16384)
+                    gK_kdl = cute.local_tile(
+                        mK_kdl_, 
+                        tiler=cute.select(self.qk_mma_tiler, mode=[1, 2]), # (tileK, tileD)
+                        coord=(None, None, None),
                     )
                     tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                     tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_k,
-                        0,  # no multicast
-                        cute.make_layout(1),
-                        cute.group_modes(sK, 0, 3),
-                        cute.group_modes(tSgK_kdl, 0, 3),
+                        cta_coord=cta_coord,
+                        cta_layout=cta_layout,
+                        smem_tensor=cute.group_modes(sK, 0, 3), # group MMA dims
+                        gmem_tensor=cute.group_modes(tSgK_kdl, 0, 3), # group MMA dims
                     )
+                    # since tileD == D, we slice out the dummy restD dim, and the current HB batch as well
                     tKgK = tKgK_kdl[None, None, 0, curr_block_coord_kv[2]]
 
-                    gV_dkl = cute.flat_divide(
-                        mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
+                    # mV_dkl_: (D128, K4096, HB=((1,4),2)):(1@0,1@1,((0,1@2),1@3))
+                    # gV_dkl: (tileD128, tileK128, restD1, restK32, HB=((1,4),2)):(1@0,1@1,128@0,128@1,((0,1@2),1@3))
+                    # tSgV_dkl: (MMA_sB=(128,16), MMA_D1, MMA_K8, restD1, restK32, HB=((1,4),2)):((1@0,1@1),0,16@1,128@0,128@1,((0,1@2),1@3))
+                    # tVgV_dkl: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restD1, restK32, HB=((1,4),2)):(((1@0,1@1),64@0),128@0,128@1,((0,1@2),1@3))
+                    # tVgV: (TMA_atom=(TMA_atomV=(64,128), TMA_restV=2), restK32):(((1@0,1@1),64@0),128@1)
+                    # tVsV: (TMA_atom=(TMA_atomV=8192, TMA_restV=2), PipeKV3):((1,8192),16384)
+                    gV_dkl = cute.local_tile(
+                        mV_dkl_,
+                        tiler=cute.select(self.pv_mma_tiler, mode=[1, 2]), # (tileD, tileV)
+                        coord=(None, None, None),
                     )
                     tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
                     tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_v,
-                        0,  # no multicast
-                        cute.make_layout(1),
-                        cute.group_modes(sV, 0, 3),
-                        cute.group_modes(tSgV_dkl, 0, 3),
+                        cta_coord=cta_coord,
+                        cta_layout=cta_layout,
+                        smem_tensor=cute.group_modes(sV, 0, 3), # group MMA dims
+                        gmem_tensor=cute.group_modes(tSgV_dkl, 0, 3), # group MMA dims
                     )
                     tVgV = tVgV_dkl[None, 0, None, curr_block_coord_kv[2]]
-
+                    
+                    if cutlass.const_expr(self.debug_print):
+                        is_first_work_tile = (curr_block_coord[0] == 0) and (curr_block_coord[1] == 0) and (curr_block_coord[2] == (0,0))
+                        if (tidx == 32 * self.load_warp_id) and is_print_block and is_first_work_tile:
+                            cute.printf("")
+                            cute.printf("[kernel] After TMA partition, before TMA copy")
+                            cute.printf("[kernel] curr_block_coord_q: {}", curr_block_coord_q)
+                            cute.printf("[kernel] curr_block_coord_kv: {}", curr_block_coord_kv)
+                            cute.printf("")
+                            cute.printf("[kernel] mQ_qdl_.layout: {}", mQ_qdl_.layout)
+                            cute.printf("[kernel] mK_kdl_.layout: {}", mK_kdl_.layout)
+                            cute.printf("[kernel] mV_dkl_.layout: {}", mV_dkl_.layout)
+                            cute.printf("")
+                            cute.printf("[kernel] gQ_qdl.layout: {}", gQ_qdl.layout)
+                            cute.printf("[kernel] gK_kdl.layout: {}", gK_kdl.layout)
+                            cute.printf("[kernel] gV_dkl.layout: {}", gV_dkl.layout)
+                            cute.printf("")
+                            cute.printf("[kernel] tSgQ_qdl.layout: {}", tSgQ_qdl.layout)
+                            cute.printf("[kernel] tSgK_kdl.layout: {}", tSgK_kdl.layout)
+                            cute.printf("[kernel] tSgV_dkl.layout: {}", tSgV_dkl.layout)
+                            cute.printf("")
+                            cute.printf("[kernel] tQsQ layout: {}", tQsQ.layout)
+                            cute.printf("[kernel] tKsK layout: {}", tKsK.layout)
+                            cute.printf("[kernel] tVsV layout: {}", tVsV.layout)
+                            cute.printf("")
+                            cute.printf("[kernel] tQgQ_qdl layout: {}", tQgQ_qdl.layout)
+                            cute.printf("[kernel] tKgK_kdl layout: {}", tKgK_kdl.layout)
+                            cute.printf("[kernel] tVgV_dkl layout: {}", tVgV_dkl.layout)
+                            cute.printf("")
+                            cute.printf("[kernel] tQgQ layout: {}", tQgQ.layout)
+                            cute.printf("[kernel] tKgK layout: {}", tKgK.layout)
+                            cute.printf("[kernel] tVgV layout: {}", tVgV.layout)
+                            cute.printf("")
+                    
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  TMA copy Q/K/V
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    
                     # Q0
-                    q0_coord = 2 * curr_block_coord_q[0]
-                    q0_handle = load_q_producer.acquire_and_advance()
+                    q0_handle = load_q_producer.acquire_and_advance() # NOTE: the returned handler stores the state before advancing
+                    q0_midx = 2 * curr_block_coord_q[0] # 2 * midx
                     cute.copy(
                         tma_atom_q,
-                        tQgQ[None, q0_coord],
+                        tQgQ[None, q0_midx],
                         tQsQ[None, q0_handle.index],
                         tma_bar_ptr=q0_handle.barrier,
                     )
                     # K0
-                    kv_coord = 0  # seqlen_kv_loop
                     k_handle = load_kv_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_k,
-                        tKgK[None, kv_coord],
+                        tKgK[None, 0],
                         tKsK[None, k_handle.index],
                         tma_bar_ptr=k_handle.barrier,
                     )
                     # Q1
-                    q1_coord = q0_coord + 1
                     q1_handle = load_q_producer.acquire_and_advance()
+                    q1_midx = q0_midx + 1
                     cute.copy(
                         tma_atom_q,
-                        tQgQ[None, q1_coord],
+                        tQgQ[None, q1_midx],
                         tQsQ[None, q1_handle.index],
                         tma_bar_ptr=q1_handle.barrier,
                     )
@@ -1258,22 +1336,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                     v_handle = load_kv_producer.acquire_and_advance()
                     cute.copy(
                         tma_atom_v,
-                        tVgV[None, kv_coord],
+                        tVgV[None, 0],
                         tVsV[None, v_handle.index],
                         tma_bar_ptr=v_handle.barrier,
                     )
-                    kv_coord += 1
 
+                    # Loop over remaining K/V tiles to load
                     seqlen_kv_loop_steps = (
                         self.get_trip_count(curr_block_coord, self.cta_tiler, seqlen_k)
-                        - 1
                     )
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                    for kv_nidx in cutlass.range(1, seqlen_kv_loop_steps, unroll=1):
                         # Ki
                         k_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_k,
-                            tKgK[None, kv_coord],
+                            tKgK[None, kv_nidx],
                             tKsK[None, k_handle.index],
                             tma_bar_ptr=k_handle.barrier,
                         )
@@ -1281,16 +1358,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                         v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
-                            tVgV[None, kv_coord],
+                            tVgV[None, kv_nidx],
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
-                        kv_coord += 1
-                    # End of seqlen_kv loop
 
+                # Advance to next Q tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-                # End of persistent scheduler loop
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA Warp
@@ -2557,7 +2632,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
         tile_sched_params = create_fmha_static_tile_scheduler_params(
             is_persistent,
-            (
+            problem_shape_mbh=( # actually is (m, h, b)
                 cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]), # pM2048 // tileM128 = 16
                 cute.size(o_shape[2][0]), # h4
                 cute.size(o_shape[2][1]), # b2
