@@ -685,7 +685,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         @cute.struct
         class SharedStorage:
-            # Pipeline barriers
+            # Pipeline mbarriers
             load_q_mbar_ptr: cute.struct.MemRange[Int64, self.q_stage * 2]
             load_kv_mbar_ptr: cute.struct.MemRange[Int64, self.kv_stage * 2]
             mma_s0_mbar_ptr: cute.struct.MemRange[Int64, self.mma_softmax_stage * 2]
@@ -697,10 +697,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             ]
             corr_epi_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
             mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
-            tmem_dealloc_mbar_ptr: cute.struct.MemRange[Int64, 1]
             
-            # Tmem holding buffer
-            tmem_holding_buf: Int32
+            # Tmem dealloc mbarrier
+            # the mbar ptr to synchronize all threads in the CTA before issuing tmem deallocation
+            tmem_dealloc_mbar_ptr: Int64
+            
+            # Tmem holding buffer ptr
+            # the smem buffer ptr to hold the allocated tmem address
+            tmem_holding_smem_buf: Int32
             
             # Smem tensors Q/K/V/O
             # NOTE: V shares the same smem buf with K
@@ -905,7 +909,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         s0_s1_sequence_mbar_ptr = storage.s0_s1_sequence_mbar_ptr.data_ptr()
         corr_epi_mbar_ptr = storage.corr_epi_mbar_ptr.data_ptr()
         mma_corr_mbar_ptr = storage.mma_corr_mbar_ptr.data_ptr()
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
+        tmem_holding_smem_buf = storage.tmem_holding_smem_buf
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Make pipelines
@@ -1303,7 +1308,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             cute.printf("")
                     
                     # ///////////////////////////////////////////////////////////////////////////////
-                    #  TMA copy Q/K/V
+                    #  Prologue: TMA copy Q0/Q1/K0/V0
                     # ///////////////////////////////////////////////////////////////////////////////
                     
                     # Q0
@@ -1340,6 +1345,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tVsV[None, v_handle.index],
                         tma_bar_ptr=v_handle.barrier,
                     )
+                    
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  Mainloop: TMA copy Ki/Vi
+                    # ///////////////////////////////////////////////////////////////////////////////
 
                     # Loop over remaining K/V tiles to load
                     seqlen_kv_loop_steps = (
@@ -1376,12 +1385,18 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
+            cute.arch.alloc_tmem(
+                num_columns=tmem_alloc_cols,
+                smem_ptr_to_write_address=tmem_holding_smem_buf
+            )
             cute.arch.barrier(
                 barrier_id=self.tmem_alloc_sync_bar_id,
-                number_of_threads=self.threads_per_warp,
+                number_of_threads=self.threads_per_warp, # only mma warp need to access the tmem
             )
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
@@ -1392,9 +1407,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
                     continue_cond = (
                         not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.cta_tiler[0],
-                            curr_block_coord[0],
-                            seqlen_q,
+                            q_tiler=self.cta_tiler[0],
+                            curr_block_coord=curr_block_coord[0],
+                            seqlen_q=seqlen_q,
                         )
                     )
 
@@ -1403,71 +1418,87 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                        
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  Prologue: GEMM Q0K0, GEMM Q1K0, GEMM P0V0
+                    # ///////////////////////////////////////////////////////////////////////////////
 
-                    # GEMM_QK00 (Q0 * K0 -> S0)
-                    # 1. wait for Q0
+                    # --- GEMM_Q0K0 (Q0 * K0 -> S0) ---
+                    # 1. wait for Q0 to be full
                     q0_handle = load_q_consumer.wait_and_advance()
                     tSrQ0 = tSrQ[None, None, None, q0_handle.index]
-                    # 2. wait for K0
+                    # 2. wait for K0 to be full
                     k_handle = load_kv_consumer.wait_and_advance()
                     tSrK0 = tSrK[None, None, None, k_handle.index]
-                    # 3. acquire empty S0 buffer
+                    # 3. acquire S0 to be empty
                     s0_handle = mma_s0_producer.acquire_and_advance()
-                    # 4. gemm
-                    num_kphases = cute.size(tSrQ0, mode=[2])
+                    # 4. gemm over MMA_D dim
+                    num_kphases = cute.size(tSrQ0, mode=[2]) # MMA_D=(4,2) -> 8 phases
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                         kphase_coord_0 = (None, None, kphase_idx)
-                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                        cute.gemm(
-                            qk_tiled_mma,
-                            tStS0,
-                            tSrQ0[kphase_coord_0],
-                            tSrK0[kphase_coord_0],
-                            tStS0,
+                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0) # only the first kphase doesn't need to accumulate
+                        cute.gemm( # Issuing UMMA
+                            atom=qk_tiled_mma,
+                            d=tStS0,
+                            a=tSrQ0[kphase_coord_0],
+                            b=tSrK0[kphase_coord_0],
+                            c=tStS0,
                         )
-                    # 5. release S0
+                    # 5. commit S0 to be full
                     s0_handle.commit()
-                    # End of GEMM (Q0 * K0 -> S0)
+                    
+                    # NOTE: K0 will be used in the GEMM_Q1K0 below, 
+                    # so we need to keep it until then before release
 
-                    # GEMM_QK10 (Q1 * K0 -> S1), K0 is ready in GEMM_QK00
-                    # 1. wait for Q1
+                    # --- GEMM_Q1K0 (Q1 * K0 -> S1) ---
+                    # 1. wait for Q1 to be full
+                    # NOTE: K0 is ready in GEMM_Q0K0, so no need to wait
                     q1_handle = load_q_consumer.wait_and_advance()
                     tSrQ1 = tSrQ[None, None, None, q1_handle.index]
-                    # 2. acquire empty S1
+                    # 2. acquire S1 to be empty
                     s1_handle = mma_s1_producer.acquire_and_advance()
-                    # 3. gemm
+                    # 3. gemm over MMA_D dim
                     num_kphases = cute.size(tSrQ1, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                         kphase_coord_1 = (None, None, kphase_idx)
-                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                        cute.gemm(
+                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0) # only the first kphase doesn't need to accumulate
+                        cute.gemm( # Issuing UMMA
                             qk_tiled_mma,
                             tStS1,
                             tSrQ1[kphase_coord_1],
                             tSrK0[kphase_coord_1],
                             tStS1,
                         )
-                    # 4. release S1
+                    # 4. commit S1 to be full
+                    # Arrive the full mbar with `tcgen05.commit.mbarrier::arrive::one`
+                    # the same across all producer commit in the whole example
                     s1_handle.commit()
-                    # 5. release K0
+                    # 5. release K0 to be empty
+                    # Arrive the empty mbar with `tcgen05.commit.mbarrier::arrive::one`
+                    # the same across all consumer release in the whole example
                     k_handle.release()
-                    # End of GEMM (Q1 * K0 -> S1)
-                    # Note: Q0 & Q1 are still needed in the seqlen_kv loop
-                    # so we need to release them after the seqlen_kv loop
 
-                    # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
-                    # 1. wait for V0
+                    # NOTE: Q0 & Q1 are still needed in the whole seqlen_kv loop
+                    # so we need to release them after the whole seqlen_kv loop done
+
+                    # --- GEMM_P0V0 (P0 * V0 -> O0_partial) ---
+                    # NOTE: O0 needs to be accumulated in the seqlen_kv loop
+                    # 1. wait for V0 to be full
                     v_handle = load_kv_consumer.wait_and_advance()
                     tOrVi = tOrV[None, None, None, v_handle.index]
-                    # 2. acquire corrected O0_partial
-                    # Note: acquire corr first to take it out of the critical
-                    # path since softmax takes longer
+                    # 2. acquire corrected O0_partial to be empty
+                    # NOTE: acquire corr first to take it out of the critical path since softmax takes longer
                     o0_handle = mma_corr_producer.acquire_and_advance()
-                    # 3. acquire P0
-                    # this acquire returns the ownership of all of S0 to the mma warp
-                    # including the P0 part (inplaced in S0)
+                    # 3. acquire S0 to be empty => P0 to be full
+                    # NOTE: 
+                    #   1. this acquire returns the ownership of all of S0 to the mma warp
+                    #       including the P0 part (inplaced in S0)
+                    #   2. actually, the MMA warp is the producer of `S=QK => p = softmax(S)` pipeline
+                    #       while the consumer of `P = softmax(S) => O_partial = PV` pipeline
+                    #       so this second `acquire S0 to be empty` is been reusing to say `wait P0 to be full`
+                    #       avoiding to add extra pipeline for `softmax => GEMM_PV`
                     s0_handle = mma_s0_producer.acquire_and_advance()
-                    # 4. gemm
+                    # 4. gemm over MMA_D dim
                     num_kphases = cute.size(tOrP0, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                         kphase_coord_2 = (None, None, kphase_idx)
@@ -1479,28 +1510,31 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tOrVi[kphase_coord_2],
                             tOtO0,
                         )
-                    # 5. release accumulated O0_partial
+                    # 5. commit accumulated O0_partial to be full
                     o0_handle.commit()
-                    # End of GEMM_PV00 (P0 * V0 -> O0_partial)
+                    
+                    # NOTE: V0 will be used in the GEMM_P1V(i-1) in the first iter of the mainloop below, 
+                    # so we don't release it here
 
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  Mainloop: GEMM Q0Ki, GEMM P1V(i-1), GEMM Q1Ki, GEMM P0Vi
+                    # ///////////////////////////////////////////////////////////////////////////////
                     seqlen_kv_loop_steps = (
                         self.get_trip_count(curr_block_coord, self.cta_tiler, seqlen_k)
-                        - 1
                     )
-
-                    # O1 hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
+                    # NOTE: since O0,O1 need to be accumulated across the mainloop, we need to set a global flag
                     pv_whether_acc = False
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        # GEMM_QK0i (Q0 * Ki -> S0)
-                        # 1. wait for Ki
+                    for i in cutlass.range(1, seqlen_kv_loop_steps, unroll=1):
+                        # --- GEMM_Q0Ki (Q0 * Ki -> S0) ---
+                        # 1. wait for Ki to be full
                         k_handle = load_kv_consumer.wait_and_advance()
                         tSrKi = tSrK[None, None, None, k_handle.index]
-                        # 2. gemm
+                        # 2. gemm over MMA_D dim
                         inner_num_kphases = cute.size(tSrQ0, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
+                        for kphase_idx in cutlass.range(inner_num_kphases, unroll_full=True):
                             kphase_coord_3 = (None, None, kphase_idx)
+                            # NOTE: since P0 is shared with S0, and consumed in the GEMM_P0V(i-1) in previous iter, 
+                            # we need to override it for S0 in the first phase
                             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
                             cute.gemm(
                                 qk_tiled_mma,
@@ -1509,23 +1543,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrKi[kphase_coord_3],
                                 tStS0,
                             )
-                        # 3. release S0
+                        # 3. commit S0 to be full => release P0 to be empty
                         s0_handle.commit()
-                        # End of GEMM_QK0i (Q0 * Ki -> S0)
+                        
+                        # NOTE: Ki will be used in the GEMM_Q1Ki below, so we don't release it here
 
-                        # GEMM_PV1(i-1) (P1 * V(i-1) -> O1_partial), V(i-1) is ready in GEMM_PV0(i-1)
-                        # 1. acquire corrected O1_partial
+                        # --- GEMM_P1V(i-1) (P1 * V(i-1) -> O1_partial) ---
+                        # NOTE: V(i-1) is ready in GEMM_P0V(i-1) in the previous iter
+                        # 1. acquire corrected O1_partial to be empty
                         o1_handle = mma_corr_producer.acquire_and_advance()
-                        # 2. acquire P1
+                        # 2. acquire S1 to be empty => wait P1 to be full
                         s1_handle = mma_s1_producer.acquire_and_advance()
-                        # 3. gemm
+                        # 3. gemm over MMA_D dim
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
+                        for kphase_idx in cutlass.range(inner_num_kphases, unroll_full=True):
                             kphase_coord_4 = (None, None, kphase_idx)
                             pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
-                            cute.gemm(
+                            cute.gemm( 
                                 pv_tiled_mma,
                                 tOtO1,
                                 tOrP1[kphase_coord_4],
@@ -1533,19 +1567,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tOtO1,
                             )
                             pv_whether_acc = True
-                        # 4. release accumulated O1_partial
+                        # 4. commit accumulated O1_partial to be full
                         o1_handle.commit()
-                        # 5. release V(i-1)
+                        # 5. release V(i-1) to be empty
                         v_handle.release()
-                        # End of GEMM_PV1(i-1) (P1 * V(i-1) -> O1_partial)
 
-                        # GEMM_QK1i (Q1 * Ki -> S1), Q1 is ready in GEMM_QK10; Ki is ready in GEMM_QK0i
-                        # 1. gemm
+                        # --- GEMM_Q1Ki (Q1 * Ki -> S1) ---
+                        # NOTE: Q1 is ready in GEMM_Q1K0; Ki is ready in GEMM_Q0Ki
+                        # 1. gemm over MMA_D dim
                         inner_num_kphases = cute.size(tSrQ1, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
+                        for kphase_idx in cutlass.range(inner_num_kphases, unroll_full=True):
                             kphase_coord_5 = (None, None, kphase_idx)
+                            # NOTE: since P1 is shared with S1, and consumed in the GEMM_P1V(i-1) above, 
+                            # we need to override it for S1 in the first phase
                             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
                             cute.gemm(
                                 qk_tiled_mma,
@@ -1554,24 +1588,22 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrKi[kphase_coord_5],
                                 tStS1,
                             )
+                        # 2. commit S1 to be full => release P1 to be empty
                         s1_handle.commit()
-                        # 2. release Ki
+                        # 3. release Ki to be empty
                         k_handle.release()
-                        # End of GEMM_QK1i (Q1 * Ki -> S1)
 
-                        # GEMM_PV0i (P0 * Vi -> O0_partial)
-                        # 1. wait for Vi
+                        # --- GEMM_P0Vi (P0 * Vi -> O0_partial) ---
+                        # 1. wait for Vi to be full
                         v_handle = load_kv_consumer.wait_and_advance()
                         tOrVi = tOrV[None, None, None, v_handle.index]
-                        # 2. acquire corrected O0_partial
+                        # 2. acquire corrected O0_partial to be empty
                         o0_handle = mma_corr_producer.acquire_and_advance()
-                        # 3. acquire P0
+                        # 3. acquire S0 to be empty => wait P0 to be full
                         s0_handle = mma_s0_producer.acquire_and_advance()
-                        # 4. gemm
+                        # 4. gemm over MMA_D dim
                         inner_num_kphases = cute.size(tOrP0, mode=[2])
-                        for kphase_idx in cutlass.range(
-                            inner_num_kphases, unroll_full=True
-                        ):
+                        for kphase_idx in cutlass.range(inner_num_kphases, unroll_full=True):
                             kphase_coord_6 = (None, None, kphase_idx)
                             pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                             cute.gemm(
@@ -1581,21 +1613,25 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tOrVi[kphase_coord_6],
                                 tOtO0,
                             )
-                        # 5. release accumulated O0_partial
+                        # 5. commit accumulated O0_partial to be full
                         o0_handle.commit()
-                        # End of GEMM_PV0i (P0 * Vi -> O0_partial)
-                    # End of seqlen_kv loop
+                        
+                        # NOTE: Vi will be used in the GEMM_P1V(i-1) in the next iter, so we don't release it here 
 
-                    # release Q0 & Q1
+                    # release Q0 & Q1 to be empty for next Q tile
                     q0_handle.release()
                     q1_handle.release()
+                    
+                    # ///////////////////////////////////////////////////////////////////////////////
+                    #  Epilogue: GEMM P1V(i_end)
+                    # ///////////////////////////////////////////////////////////////////////////////
 
-                    # GEMM_PV1(i_end) (P1 * Vi_end -> O1)
-                    # 1. acquire corrected O1_partial
+                    # --- GEMM_P1V(i_end) (P1 * V(i_end) -> O1_partial) ---
+                    # 1. acquire corrected O1_partial to be empty
                     o1_handle = mma_corr_producer.acquire_and_advance()
-                    # 2. acquire P1
+                    # 2. acquire S1 to be empty => wait P1 to be full
                     s1_handle = mma_s1_producer.acquire_and_advance()
-                    # 3. gemm
+                    # 3. gemm over MMA_D dim
                     num_kphases = cute.size(tOrP1, mode=[2])
                     for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                         kphase_coord_7 = (None, None, kphase_idx)
@@ -1607,30 +1643,33 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tOrVi[kphase_coord_7],
                             tOtO1,
                         )
-                    # 4. commit accumulated O1
+                    # 4. commit accumulated O1_partial to be full
                     o1_handle.commit()
-                    # 5. release Vi_end
+                    # 5. release V(i_end) to be empty
                     v_handle.release()
-                    # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
-                    # Commit S0 and S1
+                    # Commit S0 and S1 to be full => release P0/P1 to be empty
+                    # NOTE: this commit is counter-intuitive but necessary,
+                    # since the MMA warp is the consumer of the `softmax => GEMM_PV` pipeline,
+                    # so to begin with the next tile, the softmax producer will acquire for P0/P1 to be empty, 
+                    #   reusing the signal of `consumer wait S0/S1 to be full`,
+                    # and it will hang there if we don't release P0/P1 to be empty here,
+                    #   reusing the signal of `producer commit S0/S1 to be full`
                     s0_handle.commit()
                     s1_handle.commit()
 
-                # Advance to next tile
+                # Advance to next Q tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            # End of persistent scheduler loop
 
-            # dealloc tmem buffer
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+            # Dealloc tmem buffer
+            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
+            cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0) # wait for softmax/correction warp group to finish using tmem
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            #  Retrieving tmem ptr and make acc
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
                 Float32,
                 alignment=16,
-                ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                ptr_to_buffer_holding_addr=tmem_holding_smem_buf,
             )
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
@@ -1641,6 +1680,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             # cute.arch.warpgroup_reg_dealloc(self.num_regs_other) # deprecated
             cute.arch.setmaxregister_decrease(self.num_regs_other) # 32
 
+            # /////////////////////////////////////////////////////////////////////////////
+            #  Persistent tile scheduling loop
+            # /////////////////////////////////////////////////////////////////////////////
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
@@ -1714,7 +1756,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            # End of persistent scheduler loop
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax WarpGroup 0
