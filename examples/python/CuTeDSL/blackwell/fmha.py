@@ -2023,88 +2023,151 @@ class BlackwellFusedMultiHeadAttentionForward:
                     vec0_handle = s0_corr_consumer.wait_and_advance()
                     vec0_handle.release()
                     vec1_handle = s1_corr_consumer.wait_and_advance()
+                    
+                    # NOTE: the first vec1 signal is ignored in the first iter below
+                    
                     seqlen_kv_loop_steps = (
                         self.get_trip_count(curr_block_coord, self.cta_tiler, seqlen_k)
-                        - 1
                     )
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        # wait for vec0 (row_wise current max & previous max)
+                    for i in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
+                        # Wait for vec0 (old_row_max, new_row_max) to be full by softmax warp group 0
                         vec0_handle = s0_corr_consumer.wait_and_advance()
+                        
+                        # T2R copy vec0 from tmem to rmem
                         # tTMEM_LOAD_VECrS = cute.make_fragment( # deprecated
                         tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                             tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                         )
                         cute.copy(
-                            tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
+                            tiled_tmem_load_vec, 
+                            tTMEM_LOAD_VECtS0,
+                            tTMEM_LOAD_VECrS
                         )
+                        
+                        # Compute rescale factor = exp2((new_row_max - old_row_max) * scale_softmax_log2)
                         scale_ = scale_softmax_log2 * (
                             tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                         )
                         scale = cute.math.exp2(scale_, fastmath=True)
-                        # wait for o0
+                        
+                        # Wait for O0 to be full by MMA warp
                         o0_handle = mma_corr_consumer.wait_and_advance()
+                        
+                        # Rescale the O0 partial result in-place in tmem
                         self.correction_rescale(pv_thr_mma, tOtO0, scale)
-                        # release vec1 & o0
+                        
+                        # Release vec1
                         vec1_handle.release()
-                        cute.arch.fence_view_async_tmem_store()
+                        
+                        # Release O0 after rescaling to let MMA warp to start new O_partial=PV
+                        # NOTE: we need to use `tcgen05.wait::st` to ensure the store of rescaled tO is finished
+                        # before we notify MMA warp
+                        cute.arch.fence_view_async_tmem_op(kind="store")
                         o0_handle.release()
 
-                        # wait for vec1 (row_wise current max & previous max)
+                        # Wait for vec1 (old_row_max, new_row_max) to be full by softmax warp group 1
                         vec1_handle = s1_corr_consumer.wait_and_advance()
+                        
+                        # T2R copy vec1 from tmem to rmem
                         cute.copy(
-                            tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
+                            tiled_tmem_load_vec, 
+                            tTMEM_LOAD_VECtS1,
+                            tTMEM_LOAD_VECrS
                         )
+                        
+                        # Compute rescale factor = exp2((new_row_max - old_row_max) * scale_softmax_log2)
                         scale_ = scale_softmax_log2 * (
                             tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
                         )
                         scale = cute.math.exp2(scale_, fastmath=True)
+                        
+                        # Wait for O1 to be full by MMA warp
                         o1_handle = mma_corr_consumer.wait_and_advance()
+                        
+                        # Rescale the O1 partial result in-place in tmem
                         self.correction_rescale(pv_thr_mma, tOtO1, scale)
+                        
+                        # Release vec0
                         vec0_handle.release()
-                        cute.arch.fence_view_async_tmem_store()
+                        
+                        # Release O1 after rescaling to let MMA warp to start new O_partial=PV
+                        cute.arch.fence_view_async_tmem_op(kind="store")
                         o1_handle.release()
 
+                    # Release vec1
                     vec1_handle.release()
 
-                    # wait for vec0 (row_wise global sum)
+                    # Wait for final vec0 (global_row_sum, global_row_max)
+                    # to be full by softmax warp group 0
                     vec0_handle = s0_corr_consumer.wait_and_advance()
+                    
+                    # T2R copy final vec0 from tmem to rmem
                     # tTMEM_LOAD_VECrS = cute.make_fragment( # deprecated
                     tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                         tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                     )
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
-                    cute.arch.fence_view_async_tmem_load()
+                    
+                    # Release final vec0 after we ensure the tmem is finished and ready for next iter ???
+                    cute.arch.fence_view_async_tmem_op(kind="load")
                     vec0_handle.release()
-                    # wait for o0
+                    
+                    # Wait for final tO0 to be full by MMA warp
                     o0_handle = mma_corr_consumer.wait_and_advance()
+                    
+                    # Acquire sO0 to be empty
                     o0_final_handle = corr_epi_producer.acquire_and_advance()
+                    
+                    # Scale final tO0 by T2R copying to rO0
+                    # and then R2S copy to sO0
                     self.correction_epilog(
                         pv_thr_mma,
                         tOtO0,
-                        scale_output / tTMEM_LOAD_VECrS[0],
-                        sO[None, None, 0],
+                        scale=scale_output / tTMEM_LOAD_VECrS[0], # scale with inv_row_sum
+                        sO=sO[None, None, 0],
                     )
+                    
+                    # Release final tO0 after writing to sO0
                     o0_handle.release()
+                    
+                    # Commit sO0 to be full
+                    # to let epilogue warp to copy sO0 to gmem
                     o0_final_handle.commit()
 
-                    # wait for vec1 (row_wise global sum)
+                    # Wait for final vec1 (global_row_sum, global_row_max) 
+                    # to be full by softmax warp group 1
                     vec1_handle = s1_corr_consumer.wait_and_advance()
+                    
+                    # T2R copy final vec1 from tmem to rmem
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS)
-                    cute.arch.fence_view_async_tmem_load()
+                    
+                    # Release final vec1 after we ensure the tmem is finished and ready for next iter ???
+                    cute.arch.fence_view_async_tmem_op(kind="load")
                     vec1_handle.release()
-                    # wait for o1
+                    
+                    # Wait for final tO1 to be full by MMA warp
                     o1_handle = mma_corr_consumer.wait_and_advance()
+                    
+                    # Acquire sO1 to be empty
                     o1_final_handle = corr_epi_producer.acquire_and_advance()
+                    
+                    # Scale final tO1 by T2R copying to rO1
+                    # and then R2S copy to sO1
                     self.correction_epilog(
                         pv_thr_mma,
                         tOtO1,
                         scale_output / tTMEM_LOAD_VECrS[0],
                         sO[None, None, 1],
                     )
+                    
+                    # Release final tO1 after writing to sO1
                     o1_handle.release()
+                    
+                    # Commit sO1 to be full
+                    # to let epilogue warp to copy sO1 to gmem
                     o1_final_handle.commit()
                 
-                # Advance to next tile
+                # Advance to next Q tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -2693,8 +2756,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 cS = cute.domain_offset(logical_offset, cS_base)
                 
+                # Acquire final vec in last iter to be consumed by correction WG
                 vec_i_handle = si_corr_producer.acquire_and_advance()
                 
+                # Unmasked softmax iterations
                 unmask_count = self.get_unmasked_trip_count(
                     curr_block_coord,
                     self.cta_tiler,
@@ -2719,7 +2784,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         s0_s1_sequence_producer,
                     ) = self.softmax_step(
                         stage,
-                        False,
+                        False, # need_apply_mask = False for unmasked iterations
                         iter_args,
                         value_args,
                         pipeline_args,
@@ -2731,6 +2796,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             and (curr_block_coord[0] == 0) and (curr_block_coord[1] == 0) and (curr_block_coord[2] == (0,0)),
                     )
                 
+                # Masked softmax iterations
                 mask_count = self.get_masked_trip_count(
                     curr_block_coord,
                     self.cta_tiler,
@@ -2758,7 +2824,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         s0_s1_sequence_producer,
                     ) = self.softmax_step(
                         stage,
-                        True,
+                        True, # need_apply_mask = True for masked iterations
                         iter_args,
                         value_args,
                         pipeline_args,
@@ -2770,21 +2836,30 @@ class BlackwellFusedMultiHeadAttentionForward:
                             and (curr_block_coord[0] == 0) and (curr_block_coord[1] == 0) and (curr_block_coord[2] == (0,0)),
                     )
                 
+                # Wait for MMA final commit ???
                 si_handle = mma_si_consumer.wait_and_advance()
                 
-                
+                # Final store (final_row_sum, final_row_max) vec to tmem for correction WG
                 # tTMEM_STORE_VECrS = cute.make_fragment( # deprecated
                 tTMEM_STORE_VECrS = cute.make_rmem_tensor(
                     tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
                 )
                 tTMEM_STORE_VECrS[0] = row_sum
                 tTMEM_STORE_VECrS[1] = row_max
+                
+                # R2T copy with `tcgen05.st.aligned.32x32b.x2` from rmem to tmem
                 cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
-                cute.arch.fence_view_async_tmem_store()
+                
+                # Final commit vec to be full for correction WG
+                # NOTE: we have to use `tcgen05.wait::st` to ensure the R2T store is finished and tmem is ready,
+                # before we notify the correction WG
+                cute.arch.fence_view_async_tmem_op(kind="store")
                 vec_i_handle.commit()
+                
+                # Wait for correction WG to finish consuming the final vec ???
                 si_corr_producer.acquire()
                 
-                # Empty step to sync against pipe s
+                # Release Si to be empty ???
                 si_handle.release()
 
             # Advance to next Q tile
@@ -2941,8 +3016,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         tiled_tmem_load = tcgen05.make_tmem_copy(
             tmem_copy_atom, tOtO_i[(None, None), 0]
         )
-
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+        
         smem_copy_atom = sm100_utils.get_smem_store_op(
             self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
         )
@@ -2953,6 +3028,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         tTMEM_LOADoO = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
 
         for i in range(self.cta_tiler[2] // corr_tile_size):
+            # T2R copy O from tmem to rmem in fp32
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
             # tTMrO = cute.make_fragment( # deprecated
@@ -2960,18 +3036,24 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+            
+            # Rescale the output with the inv_row_sum scale factor in fp32
             for j in range(0, cute.size(tTMrO), 2):
                 tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
+                
+            # Convert the output to the desired output type (bf16)
             # tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype) # deprecated
             tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
+            
+            # R2S copy the rescaled output from rmem to smem
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
 
-        # fence view async shared
+        # fence view async shared to let the R2S copy visible to epilogue's TMA S2G store
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
             space=cute.arch.SharedSpace.shared_cta,
