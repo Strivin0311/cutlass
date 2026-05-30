@@ -2262,7 +2262,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         
         # Commit row_max to be full for correction WG
         # TODO(REVIEW): we have to use `tcgen05.wait::st` 
-        # to ensure the R2T store is finished and tmem is ready, before we notify the correction WG
+        # to ensure the R2T store is finished and tmem is ready, 
+        # before we notify the correction WG
         cute.arch.fence_view_async_tmem_op(kind="store")
         vec_i_handle.commit()
         
@@ -2339,10 +2340,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             # Release s1 to be finished
             sequence_consumer_handle.release()
         
-        # R2T copy fp32-view of rP to tP with `tcgen05.st.aligned.32x32b.x32`
+        # R2T copy fp32-view of bf16 rP to tP with `tcgen05.st.aligned.32x32b.x32`
         cute.copy(tiled_tmem_store, tTMEM_STORErS_x4, tTMEM_STOREtS_x4)
         
         # Release Si to be empty => commit Pi to be full for MMA warp
+        # NOTE: we have to use `tcgen05.wait::st` to ensure the R2T store is finished and tmem is ready, 
+        # before we notify the MMA warp
         cute.arch.fence_view_async_tmem_op(kind="store")
         si_handle.release()
         
@@ -2350,37 +2353,48 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Update row_sum
         # /////////////////////////////////////////////////////////////////////////////
 
-        # Acquire row_sum to be used by correction WG 
-        # and allowed to update
+        # Acquire old_row_sum to be consumed by correction WG and allowed to update
         vec_i_handle = si_corr_producer.acquire_and_advance()
         
-        # Rescale row_sum
+        # Rescale old_row_sum with the factor = exp(old_row_max * scale - new_row_max * scale)
         acc_scale_ = scale * (old_row_max - row_max_safe)
+        # NOTE: we need to scale to 1/2 since the `local_row_sum_0` below 
+        # splits the `old_row_sum` to a packed tuple
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
         row_sum *= acc_scale
+        
+        # Prepare reduction unrolled row-sum rmem buffer
+        reduction_unroll = 4
+        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll # 128 fp32 / 4 = 32 fp32 per fragment for reduction
         local_row_sum_0 = (row_sum, row_sum)
         local_row_sum_1 = (0.0, 0.0)
         local_row_sum_2 = (0.0, 0.0)
         local_row_sum_3 = (0.0, 0.0)
 
-        reduction_unroll = 4
-        frg_tile = cute.size(tTMEM_LOADrS) // reduction_unroll
+        # Reduce row_sum for the row this register holds
+        # tTMEM_LOADrS_frg: (32,4):(1,32) => 128 fp32 rS to reduce
         tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
 
-        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
+        # Reduce within fragment
+        for j in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2): # for each 2-fp32 elem in one 32 fragment
+            # unroll 0
             local_row_sum_0 = cute.arch.add_packed_f32x2(
                 local_row_sum_0, (tTMEM_LOADrS_frg[j, 0], tTMEM_LOADrS_frg[j + 1, 0])
             )
+            # unroll 1
             local_row_sum_1 = cute.arch.add_packed_f32x2(
                 local_row_sum_1, (tTMEM_LOADrS_frg[j, 1], tTMEM_LOADrS_frg[j + 1, 1])
             )
+            # unroll 2
             local_row_sum_2 = cute.arch.add_packed_f32x2(
                 local_row_sum_2, (tTMEM_LOADrS_frg[j, 2], tTMEM_LOADrS_frg[j + 1, 2])
             )
+            # unroll 3
             local_row_sum_3 = cute.arch.add_packed_f32x2(
                 local_row_sum_3, (tTMEM_LOADrS_frg[j, 3], tTMEM_LOADrS_frg[j + 1, 3])
             )
 
+        # Reduce across fragments
         local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_1)
         local_row_sum_2 = cute.arch.add_packed_f32x2(local_row_sum_2, local_row_sum_3)
         local_row_sum_0 = cute.arch.add_packed_f32x2(local_row_sum_0, local_row_sum_2)
