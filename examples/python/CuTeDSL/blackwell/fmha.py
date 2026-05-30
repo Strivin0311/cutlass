@@ -1825,6 +1825,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             (curr_block_coord[2][0], 0),
                         )
 
+                    # TMA partition sO/gO
                     o0_coord = 2 * curr_block_coord_o[0]
                     o1_coord = o0_coord + 1
                     gO_qdl = cute.flat_divide(
@@ -1833,32 +1834,35 @@ class BlackwellFusedMultiHeadAttentionForward:
                     gO = gO_qdl[None, None, None, 0, curr_block_coord_o[2]]
                     tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_o,
-                        0,
-                        cute.make_layout(1),
+                        cta_coord,
+                        cta_layout,
                         cute.group_modes(sO, 0, 2),
                         cute.group_modes(gO, 0, 2),
                     )
 
-                    # O0 O1 using the same pipeline
-                    # wait from corr, issue tma store on smem
+                    # O0/O1 using the same pipeline
+                    # wait from correction warp to copy final scaled O from tO -> rO -> sO, 
+                    # and them issue tma store (S2G) from sO -> gO
                     
                     # O0
-                    # 1. wait for O0 final
+                    # 1. wait for final sO0
                     o0_handle = corr_epi_consumer.wait_and_advance()
-                    # 2. copy O0 to gmem (S2G)
+                    # 2. copy sO0 to gmem (S2G)
                     cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
                     cute.arch.cp_async_bulk_commit_group()
+                    
                     # O1
-                    # 1. wait for O1 final
+                    # 1. wait for final sO1
                     o1_handle = corr_epi_consumer.wait_and_advance()
-                    # 2. copy O1 to gmem (S2G)
+                    # 2. copy sO1 to gmem (S2G)
                     cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
                     cute.arch.cp_async_bulk_commit_group()
 
-                    # Ensure O0 buffer is ready to be released
+                    # Ensure sO0 buffer is ready before releasing it
                     cute.arch.cp_async_bulk_wait_group(1, read=True)
                     o0_handle.release()
-                    # Ensure O1 buffer is ready to be released
+                    
+                    # Ensure sO1 buffer is ready before releasing it
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                     o1_handle.release()
 
