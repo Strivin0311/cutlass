@@ -308,7 +308,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
         self.cta_tiler = (
-            2 * mma_tiler[0],  # 2 Q tile per CTA
+            2 * mma_tiler[0],  # 2 Q tile per CTA (Q0, Q1)
             mma_tiler[1],
             mma_tiler[2],
         )
@@ -915,10 +915,91 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         # Make pipelines
         # ///////////////////////////////////////////////////////////////////////////////
-        
+        #
+        # Pipeline overview (7 pipelines coordinating 5 warp roles):
+        #
+        #   load_warp ──[load_q]──► mma_warp ──[mma_s0]──► softmax0_wg
+        #   load_warp ──[load_kv]──► mma_warp ──[mma_s1]──► softmax1_wg
+        #                            mma_warp ──[mma_corr]──► correction_wg
+        #   softmax0_wg ──[s0_corr]──► correction_wg
+        #   softmax1_wg ──[s1_corr]──► correction_wg
+        #   softmax0_wg ──[s0_s1_sequence]──► softmax1_wg
+        #   correction_wg ──[corr_epi]──► epilogue_warp
+        #
+        # Pipeline semantics (full/empty mbar meaning):
+        #
+        #   load_q  (TmaUmma):
+        #     full  = "sQ[stage] written by TMA, mma_warp can issue UMMA reading sQ"
+        #     empty = "mma_warp finished reading sQ[stage], load_warp can overwrite"
+        #
+        #   load_kv  (TmaUmma):
+        #     full  = "sK[stage]/sV[stage] written by TMA, mma_warp can issue UMMA"
+        #     empty = "mma_warp finished reading sK/sV[stage], load_warp can overwrite"
+        #
+        #   mma_s0/s1  (UmmaAsync):
+        #     full  = "tmem S0/S1 ready (UMMA Q*K done), softmax0/1 can T2R load and process"
+        #     empty = "softmax0/1 finished R2T store P0/P1, mma_warp can do P*V using tmem"
+        #
+        #   s0/s1_corr  (Async, multi-stage):
+        #     full  = "vec0/vec1 in tmem written by softmax (old_max+new_max or row_sum+global_max),
+        #              correction_wg can T2R load the vec and compute rescale factor"
+        #     empty = "correction_wg finished reading vec, softmax can reuse this vec slot"
+        #     NOTE:   each softmax_step produces 2 commits per KV-block:
+        #               commit-1: old_max + new_max (before exp2, unblocks correction rescale)
+        #               commit-2: row_sum + global_max (after all KV-blocks, unblocks epilog)
+        #
+        #   mma_corr  (UmmaAsync):
+        #     full  = "tmem O0/O1 partial result written by UMMA (P*V done),
+        #              correction_wg can T2T rescale tOtO in-place"
+        #     empty = "correction_wg finished rescale, mma_warp can accumulate next P*V"
+        #
+        #   corr_epi  (Async):
+        #     full  = "sO[stage] written by correction epilog, epilogue_warp can TMA store"
+        #     empty = "epilogue_warp finished TMA store, correction can reuse sO slot"
+        #
+        #   s0_s1_sequence  (Async, 1-stage):
+        #     full  = "softmax0 finished exp2 for current KV-block, softmax1 can start exp2"
+        #     empty = "softmax1 finished exp2, softmax0 can proceed to next KV-block exp2"
+        #     NOTE:   serializes exp2+R2T-store between softmax0 and softmax1 to avoid
+        #             contention on tmem write port bandwidth
+        #
+        # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+        # Data-flow timeline. Time flows left → right. Vertical alignment = same point in time. Sub-tasks of one step wrap downward under their column.
+        # Notation: [op]=op  (p.↑)=commit(full)  (p.↓)=release(empty)  >>p=wait-full  <<p=wait-empty
+        # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+        #
+        #               ◄───────────── PROLOGUE ──────────────────────────────────────────────────────►◄─────────── MAINLOOP (per KV-block i≥1) ──────────────────────────────────────────────────────────►◄──────────────── EPILOGUE ─────────────────────►
+        #
+        #  load_warp:   <<[TMA Q0→sQ]─(lq.↑Q0)  ──>  <<[TMA Q1→sQ]─(lq.↑Q1)                          <<[TMA Ki→sK]─(lkv.↑Ki)                                                                             (advance tile scheduler)
+        #                             <<[TMA K0→sK]─(lkv.↑K0)       <<[TMA V0→sV]─(lkv.↑V0)                              <<[TMA Vi→sV]─(lkv.↑Vi)
+        #
+        #  mma_warp:    >>(lq.Q0,lkv.K0)              >>(lq.Q1)                   >>(lkv.V0,ms0.↓)     >>(lkv.Ki)          >>(lkv.V(i-1),mc.↓)         >>(lkv.Vi,mc.↓)                                    [Q0*Klast→S0]─(ms0.↑)
+        #               [Q0*K0→S0]─(ms0.↑)─(lq.↓Q0)  [Q1*K0→S1]─(ms1.↑)         [P0*V0→O0]─(mc.↑O0)  [Q0*Ki→S0]─(ms0.↑) [P1*V(i-1)→O1]─(mc.↑O1)    [P0*Vi→O0]─(mc.↑O0)─(lkv.↓)                       [Q1*Klast→S1]─(ms1.↑)
+        #                                              ─(lq.↓Q1,lkv.↓K0)          ─(lkv.↓V0)                               [Q1*Ki→S1]─(ms1.↑)                                                              s0_handle.commit / s1_handle.commit
+        #
+        #  softmax0:                                                                                     >>(ms0)             >>(s0s1.acq)                (hold sc0 slot, accumulate row_sum)                 [R2T vec0=(sum,gmax)]─(sc0.↑#2)
+        #                                                                                                [T2R S0]─[row_max]  [exp2]─[→bf16]─(s0s1.↑)                                                        sc0.acq(empty step) ── ms0.↓last
+        #                                                                                                [R2T vec0=(old,new)]─(sc0.↑#1)  [R2T P0]─(fence)─(ms0.↓)
+        #
+        #  softmax1:                                                                                     >>(ms1)             >>(s0s1, wait smx0 exp2)    (hold sc1 slot, accumulate row_sum)                 [R2T vec1=(sum,gmax)]─(sc1.↑#2)
+        #                                                                                                [T2R S1]─[row_max]  [exp2]─[→bf16]─(s0s1.↓)
+        #                                                                                                [R2T vec1=(old,new)]─(sc1.↑#1)  [R2T P1]─(fence)─(ms1.↓)
+        #
+        #  correction:  >>(sc0#1, skip)                                                                 >>(sc0#1)           >>(mc.O0)                    >>(sc1#1)           >>(mc.O1)                       >>(sc0#2) / >>(mc.O0)
+        #               >>(sc1#1, hold vec1_handle)                                                     [T2R vec0]          [T2R O0, O0*=s0, R2T O0]     [T2R vec1]          [T2R O1, O1*=s1, R2T O1]        [T2R O0,O0*=(sout/sum0),R2T→sO0]─(ce.↑O0)
+        #               >>(mc.O0, skip rescale)                                                         scale0=exp2(Δmax0)  ─(sc1_prev.↓, mc_O0.↓)       scale1=exp2(Δmax1)  ─(sc0_curr.↓, mc_O1.↓)         >>(sc1#2) / >>(mc.O1)
+        #                                                                                                                                                                                                      [T2R O1,O1*=(sout/sum1),R2T→sO1]─(ce.↑O1)
+        #
+        #  epilogue:                                                                                                                                                                                           >>(ce.O0)─[TMA sO0→gmem]─(ce.↓)
+        #                                                                                                                                                                                                      >>(ce.O1)─[TMA sO1→gmem]─(ce.↓)
+        #
+        # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
         # Load Q pipeline:
         #   producer: load warp loading Q from gmem to smem with tma
         #   consumer: mma warp loading Q from smem and do Q*K^T
+        #   full  = sQ[stage] written by TMA
+        #   empty = mma_warp finished reading sQ[stage]
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.q_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.load_warp_id])),
@@ -929,7 +1010,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         
         # Load KV pipeline:
         #   producer: load warp loading K/V from gmem to smem with tma
-        #   consumer: mma warp loading K/V from smem and do P*V
+        #   consumer: mma warp loading K/V from smem and do Q*K^T / P*V
+        #   full  = sK[stage]/sV[stage] written by TMA
+        #   empty = mma_warp finished reading sK/sV[stage]
         load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.kv_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.load_warp_id])),
@@ -938,9 +1021,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=load_kv_mbar_ptr,
         ).make_participants()
         
-        # MMA_S=QK^T pipeline:
-        #   producer: mma warp doing tiled MMA for Q*K^T, write intermediate P to tmem
-        #   consumer: softmax warp group loading P from tmem, do softmax, write back to tmem
+        # MMA_S0/S1 = Q*K^T pipeline:
+        #   producer: mma warp writing S0/S1 to tmem via UMMA Q*K^T
+        #   consumer: softmax0/1 warpgroup T2R-loading S, doing softmax, R2T-storing P
+        #   full  = tmem S0/S1 ready (UMMA done), softmax can T2R load
+        #   empty = tmem P0/P1 ready (softmax R2T store done), mma can do P*V
         mma_s0_producer, mma_s0_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.mma_softmax_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
@@ -954,9 +1039,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=mma_s1_mbar_ptr,
         ).make_participants()
         
-        # Softmax and correction pipeline:
-        #   producer: softmax warp group ...
-        #   consumer: correction warp group ...
+        # Softmax-to-correction vec pipeline (s0_corr / s1_corr):
+        #   producer: softmax0/1 warpgroup R2T-storing row-wise stats into tmem vec region
+        #   consumer: correction warpgroup T2R-loading vec to compute rescale factor
+        #   full  = tmem vec0/vec1 written by softmax (old_max+new_max, or row_sum+global_max)
+        #   empty = correction finished reading vec, softmax can reuse this slot
+        #   NOTE: each softmax_step commits twice per KV-block:
+        #           commit-1 (before exp2): old_max + new_max  -> unblocks correction_rescale
+        #           commit-2 (after all KV-blocks): row_sum + global_max -> unblocks epilog
         s0_corr_producer, s0_corr_consumer = pipeline.PipelineAsync.create(
             num_stages=self.softmax_corr_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.softmax0_warp_ids)),
@@ -970,9 +1060,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=s1_corr_mbar_ptr,
         ).make_participants()
         
-        # Correction and epilogue pipeline:
-        #   producer: correction warp group ...
-        #   consumer: epilogue warp ...
+        # Correction-to-epilogue pipeline:
+        #   producer: correction warpgroup writing final O0/O1 (fp16/bf16) into smem sO
+        #   consumer: epilogue warp TMA-storing sO to gmem
+        #   full  = sO[0/1] ready in smem, epilogue can TMA store
+        #   empty = epilogue finished TMA store, correction can reuse sO slot
         corr_epi_producer, corr_epi_consumer = pipeline.PipelineAsync.create(
             num_stages=self.epi_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=self.threads_per_warp * len(self.correction_warp_ids)),
@@ -980,9 +1072,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=corr_epi_mbar_ptr,
         ).make_participants()
         
-        # MMA and correction pipeline:
-        #   producer: mma warp ...
-        #   consumer: correction warp group ...
+        # MMA-to-correction O pipeline:
+        #   producer: mma warp writing partial O0/O1 to tmem via UMMA P*V
+        #   consumer: correction warpgroup T2T-rescaling tOtO in-place
+        #   full  = tmem O0/O1 partial result written by UMMA (P*V done), correction can rescale
+        #   empty = correction finished rescale, mma can accumulate next P*V into tOtO
         mma_corr_producer, mma_corr_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.mma_corr_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, size=len([self.mma_warp_id])),
@@ -990,9 +1084,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=mma_corr_mbar_ptr,
         ).make_participants()
         
-        # Softmax sequencial execution pipeline
-        #  producer: softmax warp group 0 ...
-        #  consumer: softmax warp group 1 ...
+        # Softmax sequence pipeline (s0_s1_sequence):
+        #   producer: softmax0 warpgroup signals after finishing exp2+type-convert for one KV-block
+        #   consumer: softmax1 warpgroup waits before starting exp2 for the same KV-block
+        #   full  = softmax0 finished exp2, softmax1 can start exp2
+        #   empty = softmax1 finished exp2+R2T-store, softmax0 can proceed to next block
+        #   NOTE: serializes exp2+R2T-store between softmax0 and softmax1 to avoid
+        #         contention on the tmem write port (both write to different P0/P1 regions
+        #         but share the same physical tmem write bandwidth)
         s0_s1_sequence_producer, s0_s1_sequence_consumer = (
             pipeline.PipelineAsync.create(
                 num_stages=1,
@@ -2085,9 +2184,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_STOREtS_x4,
         ) = tensor_args
 
-        tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width
+        vec_layout = cute.make_layout((128, 2))
+        tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.o_dtype.width # tileK128 // 2 = 64
         tScS = qk_thr_mma.partition_C(cS)
-        tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((128, 2)))
+        tScS_vec_layout = cute.composition(tScS.layout, vec_layout)
         tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
 
         tScS_P_layout = cute.composition(
@@ -2141,14 +2241,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
         else:
             sequence_consumer_handle = s0_s1_sequence_consumer.wait_and_advance()
+        
         frg_cnt = 4
         frg_tile = cute.size(tTMEM_LOADrS) // frg_cnt
         tTMEM_LOADrS_frg = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(frg_tile))
         tTMEM_STORErS_x4_e_frg = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(frg_tile)
         )
+        
+        # Apply unnormalized stable softmax: exp(x * scale - row_max * scale)
         for j in range(frg_cnt):
             for k in range(0, cute.size(tTMEM_LOADrS_frg, mode=[0]), 2):
+                # f = x * softmax_scale + (-row_max * softmax_scale)
                 tTMEM_LOADrS_frg[k, j], tTMEM_LOADrS_frg[k + 1, j] = (
                     cute.arch.fma_packed_f32x2(
                         (tTMEM_LOADrS_frg[k, j], tTMEM_LOADrS_frg[k + 1, j]),
@@ -2156,7 +2260,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         (minus_row_max_scale, minus_row_max_scale),
                     )
                 )
-                tTMEM_LOADrS_frg[k, j] = cute.math.exp2(
+                # exp(f)
+                tTMEM_LOADrS_frg[k, j] = cute.math.exp2( 
                     tTMEM_LOADrS_frg[k, j], fastmath=True
                 )
                 tTMEM_LOADrS_frg[k + 1, j] = cute.math.exp2(
@@ -2422,9 +2527,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
                 continue_cond = (
                     not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.cta_tiler[0],
-                        curr_block_coord[0],
-                        seqlen_q,
+                        q_tiler=self.cta_tiler[0],
+                        current_idx=curr_block_coord[0],
+                        seqlen_q=seqlen_q,
                     )
                 )
 
@@ -2432,8 +2537,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_k is not None):
                     cuseqlen_k = cum_seqlen_k[batch_coord]
                     seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                
+                # Init vec
                 row_max = -Float32.inf
                 row_sum = 0.0
+                
+                # Prepare args
                 value_args = (seqlen_k_, scale_softmax_log2)
                 atom_args = (
                     qk_thr_mma,
@@ -2451,11 +2560,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
 
                 logical_offset = (
-                    curr_block_coord[0] * self.cta_tiler[0]
-                    + stage * self.qk_mma_tiler[0],
-                    0,
+                    curr_block_coord[0] * self.cta_tiler[0] # qidx
+                    + stage * self.qk_mma_tiler[0], # q0 / q1
+                    0, # kidx
                 )
                 cS = cute.domain_offset(logical_offset, cS_base)
+                
                 vec_i_handle = si_corr_producer.acquire_and_advance()
                 unmask_count = self.get_unmasked_trip_count(
                     curr_block_coord,
@@ -2522,7 +2632,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                         atom_args,
                         tensor_args,
                     )
+                
                 si_handle = mma_si_consumer.wait_and_advance()
+                
+                
                 # tTMEM_STORE_VECrS = cute.make_fragment( # deprecated
                 tTMEM_STORE_VECrS = cute.make_rmem_tensor(
                     tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
@@ -2533,10 +2646,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.arch.fence_view_async_tmem_store()
                 vec_i_handle.commit()
                 si_corr_producer.acquire()
+                
                 # Empty step to sync against pipe s
                 si_handle.release()
 
-            # Advance to next tile
+            # Advance to next Q tile
             tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
 
