@@ -1756,12 +1756,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     v_handle.release()
 
                     # Commit S0 and S1 to be full => release P0/P1 to be empty
-                    # NOTE: this commit is counter-intuitive but necessary,
-                    # since the MMA warp is the consumer of the `softmax => GEMM_PV` pipeline,
-                    # so to begin with the next tile, the softmax producer will acquire for P0/P1 to be empty, 
-                    #   reusing the signal of `consumer wait S0/S1 to be full`,
-                    # and it will hang there if we don't release P0/P1 to be empty here,
-                    #   reusing the signal of `producer commit S0/S1 to be full`
                     s0_handle.commit()
                     s1_handle.commit()
 
@@ -2033,8 +2027,41 @@ class BlackwellFusedMultiHeadAttentionForward:
                     seqlen_kv_loop_steps = (
                         self.get_trip_count(curr_block_coord, self.cta_tiler, seqlen_k)
                     )
+                    # Pipeline overlap design: softmax warp CUDA-core ops ⟷ correction warp tmem ld/st ops
+                    #
+                    # Each iteration processes one O0 block then one O1 block.
+                    # The vec releases are deliberately "cross-paired" to create overlap:
+                    #
+                    #   [O0 block of iter i]
+                    #     wait  vec0(i)            ← correction reads new_max/old_max for S0
+                    #     T2R   vec0(i) → rmem
+                    #     wait  O0(i)
+                    #     correction_rescale(O0)   ← correction busy: tmem T2T (ld+st)
+                    #     vec1_handle.release()    ← CROSS-RELEASE: free vec1(i-1), unblock softmax_wg1
+                    #                                  → softmax_wg1 immediately: reduce → commit vec1(i)
+                    #                                  → then softmax_wg1 goes on to do rS1→rP1 (CUDA core exp/mul)
+                    #     o0_handle.release()
+                    #
+                    #   [O1 block of iter i]
+                    #     wait  vec1(i)            ← correction reads new_max/old_max for S1
+                    #     T2R   vec1(i) → rmem     ← while softmax_wg1 is doing rS1→rP1: OVERLAP!
+                    #     wait  O1(i)
+                    #     correction_rescale(O1)   ← correction busy: tmem T2T (ld+st)
+                    #     vec0_handle.release()    ← CROSS-RELEASE: free vec0(i), unblock softmax_wg0
+                    #                                  → softmax_wg0 immediately: reduce → commit vec0(i+1)
+                    #                                  → then softmax_wg0 goes on to do rS0→rP0 (CUDA core exp/mul)
+                    #     o1_handle.release()
+                    #
+                    #   [O0 block of iter i+1]
+                    #     wait  vec0(i+1)          ← while softmax_wg0 is doing rS0→rP0: OVERLAP!
+                    #     ...
+                    #
+                    # In short: releasing vec_{1-x}(i-1) right after correction_rescale(O{x}) gives
+                    # the corresponding softmax warpgroup a head start on its CUDA-core softmax work
+                    # (rS→rP), so that work runs in parallel with the next correction warp tmem op.
                     for i in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
-                        # Wait for vec0 (old_row_max, new_row_max) to be full by softmax warp group 0
+                        # Wait for cur vec0 (old_row_max, new_row_max) 
+                        # to be full by softmax warp group 0
                         vec0_handle = s0_corr_consumer.wait_and_advance()
                         
                         # T2R copy vec0 from tmem to rmem
@@ -2043,7 +2070,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                         )
                         cute.copy(
-                            tiled_tmem_load_vec, 
+                            tiled_tmem_load_vec,
                             tTMEM_LOAD_VECtS0,
                             tTMEM_LOAD_VECrS
                         )
@@ -2054,22 +2081,24 @@ class BlackwellFusedMultiHeadAttentionForward:
                         )
                         scale = cute.math.exp2(scale_, fastmath=True)
                         
-                        # Wait for O0 to be full by MMA warp
+                        # Wait for tO0 to be full by MMA warp
                         o0_handle = mma_corr_consumer.wait_and_advance()
                         
-                        # Rescale the O0 partial result in-place in tmem
+                        # Rescale the tO0 with rescale factor in-place (tO -> rO -> tO)
                         self.correction_rescale(pv_thr_mma, tOtO0, scale)
                         
-                        # Release vec1
+                        # Release prev vec1 to let softmax warp group 1 to 
+                        # reduce the cur vec1 (old_row_max, new_row_max) for cur iter below
                         vec1_handle.release()
                         
-                        # Release O0 after rescaling to let MMA warp to start new O_partial=PV
+                        # Release tO0 after rescaling to let MMA warp to start new O_partial=PV
                         # NOTE: we need to use `tcgen05.wait::st` to ensure the store of rescaled tO is finished
                         # before we notify MMA warp
                         cute.arch.fence_view_async_tmem_op(kind="store")
                         o0_handle.release()
 
-                        # Wait for vec1 (old_row_max, new_row_max) to be full by softmax warp group 1
+                        # Wait for cur vec1 (old_row_max, new_row_max) 
+                        # to be full by softmax warp group 1
                         vec1_handle = s1_corr_consumer.wait_and_advance()
                         
                         # T2R copy vec1 from tmem to rmem
@@ -2091,14 +2120,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                         # Rescale the O1 partial result in-place in tmem
                         self.correction_rescale(pv_thr_mma, tOtO1, scale)
                         
-                        # Release vec0
+                        # Release cur vec0 to let softmax warp group 0 to
+                        # reduce the next vec0 (old_row_max, new_row_max) for next iter
                         vec0_handle.release()
                         
                         # Release O1 after rescaling to let MMA warp to start new O_partial=PV
                         cute.arch.fence_view_async_tmem_op(kind="store")
                         o1_handle.release()
 
-                    # Release vec1
+                    # Release final vec1
                     vec1_handle.release()
 
                     # Wait for final vec0 (global_row_sum, global_row_max)
@@ -2356,7 +2386,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale = scale_softmax_log2
         minus_row_max_scale = (0.0 - row_max_safe) * scale
 
-        # Sequence barrier wait
+        # Inter softmax WG sequence barrier wait
         if cutlass.const_expr(stage == 0): # s0
             # Acquire s1 to be finished
             sequence_producer_handle = s0_s1_sequence_producer.acquire_and_advance()
@@ -2399,7 +2429,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             s_vec = tTMEM_LOADrS_frg[None, j].load()
             tTMEM_STORErS_x4_e_frg[None, j].store(s_vec.to(self.q_dtype))
         
-        # Sequence barrier arrive
+        # Inter softmax WG sequence barrier arrive
         if cutlass.const_expr(stage == 0): # s0
             # Commit s0 to be finished
             sequence_producer_handle.commit()
@@ -2952,12 +2982,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_STOREtO.iterator + i * corr_tile_size, tTMEM_STOREtO.layout
             )
 
+            # T2R copy tO to rO in fp32
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO_i)
             for j in range(0, cute.size(tTMrO_i), 2):
+                # Rescale rO with the rescaling factor in fp32
                 tTMrO_i[j], tTMrO_i[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO_i[j], tTMrO_i[j + 1]),
                     (scale, scale),
                 )
+            # R2T copy the rescaled rO back to tO in fp32
             cute.copy(tiled_tmem_store, tTMrO_i, tTMEM_STOREtO_i)
 
     @cute.jit
