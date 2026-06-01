@@ -1485,7 +1485,8 @@ class BlockScaledDenseGemmPersistentKernelSm100:
                         )
 
                         # S2T-Copy SFA/SFB from smem to tmem using `tcgen05.cp.cta_group::2.32x128b.warpx4`
-                        # NOTE: since tcgen05.cp => tcgen05.mma will form implicit pipeline, so no need to explicitly fence
+                        # NOTE: since tcgen05.cp => tcgen05.mma within different threads will form "implicit pipeline", so no explicit waiting mechanism is needed but proper synchronization between threads is needed,
+                        # according to https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-canonical-sync-patterns-pipelined-diff-thread
                         # tCsSFA_compact_s2t / tCsSFB_compact_s2t: ((ATOM_V, REST_V)=((32,1,1),4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4,STAGE=7):((((1,1,1),0),0),0,0,32,128)
                         # tCtSFA_compact_s2t/tCtSFB_compact_s2t: ((ATOM_V, REST_V)=((32,16,4),1), Rest_Tiler=1,MMA_M=1,MMA_K=4):(((262144,1,8388608),0),0,0,16)
                         s2t_stage_coord = (None, None, None, None, ab_consumer_state.index)
@@ -1841,7 +1842,7 @@ class BlockScaledDenseGemmPersistentKernelSm100:
         tCtSF_compact = cute.filter_zeros(tSF)
 
         # Make S2T CopyAtom and tiledCopy
-        # Cp4x32x128bOp: 32x128bit SMEM to TMEM Copy Operation, with with warpx4 broadcast enabled,
+        # Cp4x32x128bOp: 32x128bit SMEM to TMEM Copy Operation, with warpx4 broadcast enabled,
         # i.e. each warp moves 512 fp8 (32 x 128/8) SF from smem to tmem to form 32lanes x 16columns (M4K4=16 fp8 SFs, all 128bit) 
         # and the same smem will be broadcasted to 4 warps in the WG, 32lanes each
         copy_op = tcgen05.Cp4x32x128bOp(self.cta_group)

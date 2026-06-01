@@ -2091,7 +2091,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         # reduce the cur vec1 (old_row_max, new_row_max) for cur iter below
                         vec1_handle.release()
                         
-                        # Release tO0 after rescaling to let MMA warp to start new O_partial=PV
+                        # Release tO0 after rescaling => commit rescaled tO0 to be full for MMA warp
                         # NOTE: we need to use `tcgen05.wait::st` to ensure the store of rescaled tO is finished
                         # before we notify MMA warp
                         cute.arch.fence_view_async_tmem_op(kind="store")
@@ -2124,7 +2124,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         # reduce the next vec0 (old_row_max, new_row_max) for next iter
                         vec0_handle.release()
                         
-                        # Release O1 after rescaling to let MMA warp to start new O_partial=PV
+                        # Release tO1 after rescaling => commit rescaled tO1 to be full for MMA warp
                         cute.arch.fence_view_async_tmem_op(kind="store")
                         o1_handle.release()
 
@@ -2142,7 +2142,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
                     
-                    # Release final vec0 after we ensure the tmem is finished and ready for next iter ???
+                    # Release final vec0 after we ensure the tmem is finished and ready for next iter
                     cute.arch.fence_view_async_tmem_op(kind="load")
                     vec0_handle.release()
                     
@@ -2175,7 +2175,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # T2R copy final vec1 from tmem to rmem
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS)
                     
-                    # Release final vec1 after we ensure the tmem is finished and ready for next iter ???
+                    # Release final vec1 after we ensure the tmem is finished and ready for next iter
                     cute.arch.fence_view_async_tmem_op(kind="load")
                     vec1_handle.release()
                     
@@ -2322,6 +2322,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         
         # T2R copy tS to rS with `tcgen05.ld.sync.aligned.32x32b.x32`
+        # NOTE: we don't have to wait for the T2R load to be finished to start the applying mask and reduce row_max, 
+        # due to "intra-thread ordering through true register dependency will be respected"
+        # according to https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-canonical-sync-patterns-reg-dependency-same-thread
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         
         # Apply softmax mask
@@ -2358,8 +2361,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
         
         # Commit row_max to be full for correction WG
-        # TODO(REVIEW): we have to use `tcgen05.wait::st` 
-        # to ensure the R2T store is finished and tmem is ready, 
+        # NOTE: we have to use `tcgen05.wait::st` to ensure the R2T store is finished and tmem is ready, 
         # before we notify the correction WG
         cute.arch.fence_view_async_tmem_op(kind="store")
         vec_i_handle.commit()
@@ -2903,7 +2905,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
     ):
@@ -2926,7 +2928,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param scale: Scaling factor to apply to the partial results
         :type scale: Float32
         """
-        pv_tiled_mma_shape = (
+        tidx, _, _ = cute.arch.thread_idx()
+        thread_idx = tidx % (self.threads_per_warp * len(self.correction_warp_ids))
+        
+        pv_tiled_mma_shape = ( # (tileQ128, tileK128)
             self.pv_mma_tiler[0],
             self.pv_mma_tiler[1],
         )
@@ -2934,11 +2939,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         tOcO = thr_mma.partition_C(cO)
 
         corr_tile_size = 16  # tuneable parameter
-        tmem_load_atom = cute.make_copy_atom(
+        tmem_load_atom = cute.make_copy_atom( # `tcgen05.ld.sync.aligned.32x32b.x16`
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
             self.pv_acc_dtype,
         )
-        tmem_store_atom = cute.make_copy_atom(
+        tmem_store_atom = cute.make_copy_atom( # `tcgen05.st.sync.aligned.32x32b.x16`
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
             self.pv_acc_dtype,
         )
@@ -2954,27 +2959,30 @@ class BlackwellFusedMultiHeadAttentionForward:
         tOcO_i = cute.make_tensor(tOcO.iterator, tOcO_i_layout)
 
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i)
-        tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i)
-        tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * len(self.correction_warp_ids))
         thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
-        thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
-
         tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_i)
         tTMEM_LOADcO = thr_tmem_load.partition_D(tOcO_i)
-
-        tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i)
-
         # tTMrO = cute.make_fragment( # deprecated
         tTMrO = cute.make_rmem_tensor(
             (tTMEM_LOADcO.shape, 128 // corr_tile_size), self.pv_acc_dtype
         )
+        
+        tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i)
+        thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
+        tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i)
+
+        # NOTE: in the `T2R O -> rescale O in rmem -> R2T O` flow below,
+        # it seems no need to add explicit wait for `tcgen05::ld/st` in between,
+        # but only add one `tcgen05::wait::st` after the final `tcgen05.st` 
+        # to ensure all stores are finished before committing the MMA WG to start the next O=PV,
+        # thanks to the true register dependencies which can ensure the correct order of execution (I guess)
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMrO_i_ = tTMrO[None, i]
             tTMrO_i_layout = cute.composition(
                 tTMrO_i_.layout, cute.make_layout(tTMrO.shape[0])
             )
             tTMrO_i = cute.make_tensor(tTMrO_i_.iterator, tTMrO_i_layout)
+            
             tTMEM_LOADtO_i = cute.make_tensor(
                 tTMEM_LOADtO.iterator + i * corr_tile_size, tTMEM_LOADtO.layout
             )
@@ -2984,12 +2992,14 @@ class BlackwellFusedMultiHeadAttentionForward:
 
             # T2R copy tO to rO in fp32
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO_i)
+            
+            # Rescale rO with the rescaling factor in fp32
             for j in range(0, cute.size(tTMrO_i), 2):
-                # Rescale rO with the rescaling factor in fp32
                 tTMrO_i[j], tTMrO_i[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO_i[j], tTMrO_i[j + 1]),
                     (scale, scale),
                 )
+            
             # R2T copy the rescaled rO back to tO in fp32
             cute.copy(tiled_tmem_store, tTMrO_i, tTMEM_STOREtO_i)
 
