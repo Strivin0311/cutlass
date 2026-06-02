@@ -1755,7 +1755,18 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # 5. release V(i_end) to be empty
                     v_handle.release()
 
-                    # Commit S0 and S1 to be full => release P0/P1 to be empty
+                    # Commit S0 and S1: mandatory epilogue protocol for two reasons.
+                    # 1. Pipeline invariant: every acquire_and_advance() must be paired with a commit().
+                    #    s0_handle was acquired for GEMM_P0V(last) ("wait P0 full"), and
+                    #    s1_handle was acquired for GEMM_P1V(i_end) ("wait P1 full"); both are
+                    #    still un-committed when the loop exits because the normal commit site is
+                    #    the *start* of the next mainloop iteration, which no longer exists.
+                    # 2. These commits send the final FULL signal on mma_s0 / mma_s1 pipelines that
+                    #    the softmax WG is blocked on (mma_si_consumer.wait_and_advance() below the
+                    #    softmax loop).  That wait is softmax's synchronization barrier before it is
+                    #    safe to write the final (row_max, row_sum) vec into the S0/S1 tmem region
+                    #    (vec0/vec1 offsets overlap S0/S1 in tmem).  Without these commits, the
+                    #    softmax WG would hang indefinitely on that wait.
                     s0_handle.commit()
                     s1_handle.commit()
 
@@ -2872,7 +2883,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                             and (curr_block_coord[0] == 0) and (curr_block_coord[1] == 0) and (curr_block_coord[2] == (0,0)),
                     )
                 
-                # Wait for MMA final commit ???
+                # Wait for MMA warp's final commit on mma_s0/s1 pipeline.
+                # This is NOT to read another S tile — the softmax loop has already consumed all
+                # N QK tiles.  Instead, this serves as a cross-warp synchronization barrier:
+                # the MMA warp commits s0/s1_handle in the epilogue only after it has finished
+                # reading P0/P1 from the S0/S1 tmem region (GEMM_P0Vi and GEMM_P1V(i_end) done).
+                # Because vec0/vec1 overlap with S0/S1 in tmem, softmax must not write the final
+                # (row_max, row_sum) vec to that region until MMA has cleared it.
                 si_handle = mma_si_consumer.wait_and_advance()
                 
                 # Final store (final_row_sum, final_row_max) vec to tmem for correction WG
@@ -2892,10 +2909,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.arch.fence_view_async_tmem_op(kind="store")
                 vec_i_handle.commit()
                 
-                # Wait for correction WG to finish consuming the final vec ???
+                # Wait for correction WG to finish reading the final vec from S0/S1 tmem region.
+                # vec0/vec1 data physically reside inside the S0/S1 tmem region (same physical
+                # columns), so releasing si_handle before correction WG is done would let the MMA
+                # warp (next Q tile, persistent kernel) overwrite S0/S1 while correction WG is
+                # still reading vec data — silent data corruption.
+                # acquire() advances the producer phase and waits for the correction WG to release
+                # this pipeline slot (i.e., correction WG has called release() after reading vec).
                 si_corr_producer.acquire()
                 
-                # Release Si to be empty ???
+                # Release Si (S0 or S1) tmem region back to the mma_s0/s1 pipeline.
+                # Only safe now that both MMA warp (guarded by wait_and_advance above) and
+                # correction WG (guarded by si_corr_producer.acquire above) have finished
+                # accessing this tmem region.  For persistent kernels, this unblocks the MMA warp's
+                # acquire_and_advance() for the next Q tile so it can write new QK results.
                 si_handle.release()
 
             # Advance to next Q tile
