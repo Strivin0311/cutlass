@@ -1234,7 +1234,21 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY Warp
+        #  EMPTY Warp  (warp 15, the 4th warp of WG3)
+        #
+        #  SM100 UMMA instructions require the issuing warpgroup to consist of exactly
+        #  4 consecutive warps.  WG3 contains warp 12 (mma), 13 (load), 14 (epilogue),
+        #  and 15 (this empty warp).  Without warp 15, WG3 would be an illegal 3-warp
+        #  group and the mma_warp could not issue tcgen05.mma instructions.
+        #
+        #  Register budget: The SM allocates registers per warpgroup.  To avoid warp 15
+        #  from consuming unnecessary register budget that could otherwise be used by its
+        #  WG3 peers, we aggressively reduce its register count to the minimum (24) via
+        #  setmaxregister_decrease.  This maximises occupancy for the active warps.
+        #
+        #  The only real work warp 15 performs is initialising tmem_dealloc_mbar_ptr
+        #  (done earlier before the CTA-wide barrier), which has no natural owner among
+        #  the specialised warps and is cheaply delegated here.
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.empty_warp_id:
             # cute.arch.warpgroup_reg_dealloc(self.num_regs_empty) # deprecated
