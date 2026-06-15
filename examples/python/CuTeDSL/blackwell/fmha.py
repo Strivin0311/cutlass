@@ -2374,7 +2374,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             # to get `(-inf)` as the result instead of NaN
             row_max_safe = 0.0
         
-        # R2S copy (old_row_max, row_max_safe) vec 
+        # R2T copy (old_row_max, row_max_safe) vec 
         # from rS to tS with `tcgen05.st.aligned.32x32b.x2`
         # tTMEM_STORE_VECrS: ((2,1),1,1):((1,0),0,0)
         # tTMEM_STORE_VECrS = cute.make_fragment( # deprecated
